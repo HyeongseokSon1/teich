@@ -103,14 +103,31 @@ def _reasoning_summary(payload: dict[str, Any]) -> str | None:
     return result or None
 
 
+def _normalize_json_like_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _normalize_json_like_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_normalize_json_like_value(item) for item in value]
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    if not stripped or stripped[0] not in "[{":
+        return value
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        return value
+    return _normalize_json_like_value(parsed)
+
+
 def _parse_function_arguments(arguments: Any) -> Any:
     if not isinstance(arguments, str):
-        return arguments if arguments is not None else {}
+        return _normalize_json_like_value(arguments) if arguments is not None else {}
     stripped = arguments.strip()
     if not stripped:
         return {}
     try:
-        return json.loads(stripped)
+        return _normalize_json_like_value(json.loads(stripped))
     except json.JSONDecodeError:
         return arguments
 

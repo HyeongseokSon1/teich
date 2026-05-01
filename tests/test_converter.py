@@ -188,6 +188,50 @@ def test_convert_trace_uses_reasoning_text_when_summary_is_empty(tmp_path: Path)
     assert example.messages[-1]["reasoning_content"] == "This is a simple factorial task."
 
 
+def test_convert_trace_normalizes_nested_json_encoded_tool_arguments(tmp_path: Path):
+    trace_file = tmp_path / "codex-nested-tool-args.jsonl"
+    events = [
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Apply these edits"}],
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "str_replace_editor",
+                "call_id": "call_1",
+                "arguments": json.dumps(
+                    {
+                        "path": "/workspace/file.txt",
+                        "edits": json.dumps(
+                            [
+                                {"oldText": "alpha", "newText": "beta"},
+                                {"oldText": "gamma", "newText": "delta"},
+                            ]
+                        ),
+                    }
+                ),
+            },
+        },
+    ]
+    trace_file.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+
+    example = convert_trace_to_training_example(trace_file)
+
+    assert example.messages[-1]["tool_calls"][0]["function"]["arguments"] == {
+        "path": "/workspace/file.txt",
+        "edits": [
+            {"oldText": "alpha", "newText": "beta"},
+            {"oldText": "gamma", "newText": "delta"},
+        ],
+    }
+
+
 def test_convert_pi_trace_uses_thinking_blocks_and_tool_results(tmp_path: Path):
     trace_file = tmp_path / "pi-trace.jsonl"
     events = [

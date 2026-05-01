@@ -46,4 +46,4 @@ def load_traces(
         if split and traces_dir == root:
             raise ValueError(f"No trace files found in {location} for split '{split}'.")
         raise ValueError(f"No trace files found in {location}.")
-    return Dataset.from_list(rows)
+    return Dataset.from_list(rows, on_mixed_types="use_json")
