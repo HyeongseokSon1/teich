@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from difflib import SequenceMatcher
+import re
 from typing import Any
 
 from datasets import Dataset
@@ -80,6 +82,13 @@ def _initial_prefix_length(
     return len(prefix_ids), prefix_ids
 
 
+def _chat_template_supports_assistant_mask(renderer: Any) -> bool:
+    template = getattr(renderer, "chat_template", None)
+    if not isinstance(template, str):
+        return False
+    return bool(re.search(r"\{%-?\s*generation\s*-?%\}", template))
+
+
 def _extract_token_sequence(values: Any) -> list[int] | None:
     if values is None:
         return None
@@ -90,6 +99,26 @@ def _extract_token_sequence(values: Any) -> list[int] | None:
     return list(values)
 
 
+def _update_labels_with_diff(
+    previous_ids: list[int],
+    previous_labels: list[int],
+    current_ids: list[int],
+    supervise_current_message: bool,
+) -> list[int]:
+    labels: list[int] = []
+    matcher = SequenceMatcher(a=previous_ids, b=current_ids, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            labels.extend(previous_labels[i1:i2])
+            continue
+        if tag in {"replace", "insert"}:
+            if supervise_current_message:
+                labels.extend(current_ids[j1:j2])
+            else:
+                labels.extend([-100] * (j2 - j1))
+    return labels
+
+
 def _fast_mask_row(
     renderer: Any,
     text_tokenizer: Any,
@@ -98,6 +127,8 @@ def _fast_mask_row(
     chat_template_kwargs: dict[str, Any],
     max_length: int | None,
 ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    if not _chat_template_supports_assistant_mask(renderer):
+        return None
     render_kwargs: dict[str, Any] = {
         "tokenize": True,
         "add_generation_prompt": False,
@@ -145,6 +176,65 @@ def _fast_mask_row(
     )
 
 
+def _mask_row(
+    row: dict[str, Any],
+    renderer: Any,
+    text_tokenizer: Any,
+    messages_column: str,
+    tools_column: str,
+    chat_template_kwargs: dict[str, Any],
+    max_length: int | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    messages = row.get(messages_column)
+    if not isinstance(messages, list):
+        raise TypeError(f"Row is missing a list-valued '{messages_column}' column")
+    tools = row.get(tools_column) or []
+    if not isinstance(tools, list):
+        raise TypeError(f"Row is missing a list-valued '{tools_column}' column")
+
+    fast_path = _fast_mask_row(renderer, text_tokenizer, messages, tools, chat_template_kwargs, max_length)
+    if fast_path is not None:
+        return fast_path
+
+    formatted_text = _render_chat(renderer, messages, tools, chat_template_kwargs)
+    input_ids, attention_mask = _tokenize_text(text_tokenizer, formatted_text)
+    _, current_ids = _initial_prefix_length(renderer, text_tokenizer, tools, chat_template_kwargs)
+    labels = [-100] * len(current_ids)
+
+    for index, message in enumerate(messages, start=1):
+        prefix_text = _render_chat(renderer, messages[:index], tools, chat_template_kwargs)
+        prefix_ids, _ = _tokenize_text(text_tokenizer, prefix_text)
+        supervise_current_message = isinstance(message, dict) and message.get("role") == "assistant"
+        labels = _update_labels_with_diff(current_ids, labels, prefix_ids, supervise_current_message)
+        current_ids = prefix_ids
+
+    if current_ids != input_ids:
+        raise ValueError("Unable to align masked token sequence with final chat template output.")
+
+    assistant_masks = [0 if label == -100 else 1 for label in labels]
+
+    if max_length is not None:
+        input_ids = input_ids[:max_length]
+        attention_mask = attention_mask[:max_length]
+        assistant_masks = assistant_masks[:max_length]
+        labels = labels[:max_length]
+
+    return (
+        {
+            "text": formatted_text,
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "assistant_masks": assistant_masks,
+            "labels": labels,
+        },
+        {
+            "text": formatted_text,
+            "input_ids": input_ids,
+            "labels": labels,
+        },
+    )
+
+
 def _is_prefix(prefix_ids: list[int], full_ids: list[int]) -> bool:
     return len(prefix_ids) <= len(full_ids) and full_ids[: len(prefix_ids)] == prefix_ids
 
@@ -171,74 +261,6 @@ def _build_preview(text_tokenizer: Any, input_ids: list[int], labels: list[int])
     if masked:
         parts.append("\033[0m")
     return "".join(parts)
-
-
-def _mask_row(
-    row: dict[str, Any],
-    renderer: Any,
-    text_tokenizer: Any,
-    messages_column: str,
-    tools_column: str,
-    chat_template_kwargs: dict[str, Any],
-    max_length: int | None,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    messages = row.get(messages_column)
-    if not isinstance(messages, list):
-        raise TypeError(f"Row is missing a list-valued '{messages_column}' column")
-    tools = row.get(tools_column) or []
-    if not isinstance(tools, list):
-        raise TypeError(f"Row is missing a list-valued '{tools_column}' column")
-
-    fast_path = _fast_mask_row(renderer, text_tokenizer, messages, tools, chat_template_kwargs, max_length)
-    if fast_path is not None:
-        return fast_path
-
-    formatted_text = _render_chat(renderer, messages, tools, chat_template_kwargs)
-    input_ids, attention_mask = _tokenize_text(text_tokenizer, formatted_text)
-    assistant_masks = [0] * len(input_ids)
-    labels = [-100] * len(input_ids)
-    previous_length, base_prefix_ids = _initial_prefix_length(renderer, text_tokenizer, tools, chat_template_kwargs)
-
-    if previous_length and not _is_prefix(base_prefix_ids, input_ids):
-        previous_length = 0
-
-    for index, message in enumerate(messages, start=1):
-        prefix_text = _render_chat(renderer, messages[:index], tools, chat_template_kwargs)
-        prefix_ids, _ = _tokenize_text(text_tokenizer, prefix_text)
-        if not _is_prefix(prefix_ids, input_ids):
-            role = message.get("role") if isinstance(message, dict) else None
-            raise ValueError(
-                "Unable to align chat template output with message boundaries "
-                f"for role {role!r} at message index {index - 1}."
-            )
-        prefix_length = len(prefix_ids)
-        if isinstance(message, dict) and message.get("role") == "assistant":
-            for token_index in range(previous_length, prefix_length):
-                if token_index < len(input_ids):
-                    assistant_masks[token_index] = 1
-                    labels[token_index] = input_ids[token_index]
-        previous_length = prefix_length
-
-    if max_length is not None:
-        input_ids = input_ids[:max_length]
-        attention_mask = attention_mask[:max_length]
-        assistant_masks = assistant_masks[:max_length]
-        labels = labels[:max_length]
-
-    return (
-        {
-            "text": formatted_text,
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "assistant_masks": assistant_masks,
-            "labels": labels,
-        },
-        {
-            "text": formatted_text,
-            "input_ids": input_ids,
-            "labels": labels,
-        },
-    )
 
 
 def format_and_mask(

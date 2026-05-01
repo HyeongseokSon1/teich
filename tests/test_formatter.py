@@ -73,6 +73,8 @@ class FakeProcessor:
 
 
 class FastMaskTokenizer(FakeTokenizer):
+    chat_template = "{% generation %}{{ message }}{% endgeneration %}"
+
     def apply_chat_template(
         self,
         messages,
@@ -115,6 +117,50 @@ class FastMaskTokenizer(FakeTokenizer):
                 output["assistant_masks"] = assistant_masks
             return output
         return encoded["input_ids"]
+
+
+class NonPrefixStableTokenizer(FakeTokenizer):
+    def apply_chat_template(
+        self,
+        messages,
+        *,
+        tokenize=False,
+        add_generation_prompt=False,
+        tools=None,
+        **kwargs,
+    ):
+        if kwargs:
+            raise AssertionError(f"Unexpected chat template kwargs: {kwargs}")
+        tool_prefix = ""
+        if tools:
+            tool_names = ",".join(tool["function"]["name"] for tool in tools)
+            tool_prefix = f"<tools>{tool_names}</tools>"
+        parts: list[str] = [tool_prefix]
+        for index, message in enumerate(messages):
+            role = message["role"]
+            segment = f"<{role}>"
+            if role == "assistant":
+                if message.get("reasoning_content"):
+                    segment += f"<think>{message['reasoning_content']}</think>"
+                tool_calls = message.get("tool_calls") or []
+                for tool_call in tool_calls:
+                    segment += f"<tool_call>{tool_call['function']['name']}</tool_call>"
+                if message.get("content"):
+                    segment += str(message["content"])
+                next_role = messages[index + 1]["role"] if index + 1 < len(messages) else None
+                if next_role is not None:
+                    segment += f"</{role}>"
+            else:
+                if message.get("content"):
+                    segment += str(message["content"])
+                segment += f"</{role}>"
+            parts.append(segment)
+        if add_generation_prompt:
+            parts.append("<assistant>")
+        rendered = "".join(parts)
+        if tokenize:
+            return self(rendered)
+        return rendered
 
 
 def test_format_and_mask_supervises_only_assistant_turns_across_multi_turn_conversation():
@@ -265,3 +311,50 @@ def test_format_and_mask_uses_fast_assistant_mask_path_when_supported():
     assert row["assistant_masks"] == [0] * len("<user>hello</user>") + [1] * len("<assistant><think>think</think>world</assistant>")
     supervised_text = tokenizer.decode([token for token in row["labels"] if token != -100])
     assert supervised_text == "<assistant><think>think</think>world</assistant>"
+
+
+def test_format_and_mask_handles_non_prefix_stable_templates_around_tool_turns():
+    tokenizer = NonPrefixStableTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": "think",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "bash", "arguments": {"command": "ls"}},
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call_1", "name": "bash", "content": "file_a.py"},
+                    {"role": "assistant", "content": "done"},
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+
+    training_data = format_and_mask(dataset, tokenizer)
+
+    row = training_data[0]
+    supervised_text = tokenizer.decode([token for token in row["labels"] if token != -100])
+    assert "<assistant><think>think</think><tool_call>bash</tool_call>" in supervised_text
+    assert "<assistant>done" in supervised_text
+    masked_text = tokenizer.decode(
+        [token_id for token_id, label in zip(row["input_ids"], row["labels"]) if label == -100]
+    )
+    assert "<tool>file_a.py</tool>" in masked_text
