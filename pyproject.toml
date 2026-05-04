@@ -1,7 +1,7 @@
 [project]
 name = "teich"
-version = "0.1.1a6"
-description = "Turn coding agent sessions into training data"
+version = "0.1.1a9"
+description = "Turn coding agent traces into training data"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.10"
@@ -28,6 +28,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agentic_datagen", "src/teich"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"docker/codex-runtime.Dockerfile" = "agentic_datagen/docker/codex-runtime.Dockerfile"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -221,6 +221,9 @@ class DockerRuntimeRunner:
 
     @staticmethod
     def _runtime_dockerfile_path() -> Path:
+        package_path = Path(__file__).parent / "docker" / RUNTIME_DOCKERFILE_NAME
+        if package_path.exists():
+            return package_path
         return Path(__file__).parent.parent.parent / "docker" / RUNTIME_DOCKERFILE_NAME
 
     def _image_created_at(self) -> datetime | None:

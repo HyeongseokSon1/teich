@@ -121,7 +121,6 @@ def _sample_lines(trace_files: Iterable[Path], sample_size: int = 3) -> list[str
 
 def build_traces_readme(*, pretty_name: str, trace_files: list[Path], tags: list[str], model_id: str | None = None) -> str:
     sample_lines = _sample_lines(trace_files)
-    tools_block = json.dumps(_dataset_tools(trace_files), indent=2, ensure_ascii=False)
     sample_block = "\n".join(sample_lines) if sample_lines else json.dumps(
         {
             "type": "session_meta",
@@ -145,12 +144,9 @@ def build_traces_readme(*, pretty_name: str, trace_files: list[Path], tags: list
             "",
             "## Training-ready tools",
             "",
-            "Use this `tools` payload when rendering converted examples through your training chat template.",
+            "A merged `tools` schema extracted from all traces is available in `tools.json`.",
+            "Use it when rendering converted examples through your training chat template.",
             "The same structure is emitted on each converted example as the `tools` field.",
-            "",
-            "```json",
-            tools_block,
-            "```",
             "",
             "## Format",
             "",
@@ -177,13 +173,33 @@ def build_traces_readme(*, pretty_name: str, trace_files: list[Path], tags: list
             "",
             "## Conversion",
             "",
-            "You can convert these raw traces into training examples with:",
+            "### Recommended: load, format, and mask for training",
+            "",
+            "Load traces as a Hugging Face `Dataset`, then format and mask them",
+            "for supervised fine-tuning in one step:",
+            "",
+            "```python",
+            "from teich import load_traces, format_and_mask",
+            "",
+            "dataset = load_traces('./output')",
+            "training_data = format_and_mask(",
+            "    dataset,",
+            "    tokenizer,",
+            "    max_length=32768,",
+            "    chat_template_kwargs={'enable_thinking': True},",
+            ")",
+            "```",
+            "",
+            "### Low-level: convert to raw training examples",
+            "",
+            "If you need the intermediate `messages`/`tools` structures",
+            "before tokenization, use `convert_traces_to_training_data`:",
             "",
             "```python",
             "from pathlib import Path",
             "from teich import convert_traces_to_training_data",
             "",
-            "examples = convert_traces_to_training_data(Path('.'))",
+            "examples = convert_traces_to_training_data(Path('./output'))",
             "```",
             "",
         ]
@@ -209,6 +225,11 @@ def write_traces_readme(
             tags=tags,
             model_id=model_id,
         ),
+        encoding="utf-8",
+    )
+    tools_path = traces_dir / "tools.json"
+    tools_path.write_text(
+        json.dumps(_dataset_tools(trace_files), indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
     return readme_path

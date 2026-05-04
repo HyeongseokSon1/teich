@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import teich.runner as runner_module
 from teich.config import APIConfig, Config, MCPConfig, ModelConfig, PromptInput
 from teich.runner import CodexRunner, PiRunner
 
@@ -38,6 +39,21 @@ def test_runtime_image_rebuilds_when_dockerfile_is_newer(tmp_path: Path):
         CodexRunner(Config())
 
     mock_build.assert_called_once()
+
+
+def test_runtime_dockerfile_path_prefers_packaged_file(tmp_path: Path):
+    package_dir = tmp_path / "site-packages" / "agentic_datagen"
+    package_dir.mkdir(parents=True)
+    packaged_dockerfile = package_dir / "docker" / "codex-runtime.Dockerfile"
+    packaged_dockerfile.parent.mkdir(parents=True)
+    packaged_dockerfile.write_text("FROM node:22-slim\n", encoding="utf-8")
+    fake_runner_file = package_dir / "runner.py"
+    fake_runner_file.write_text("# test stub\n", encoding="utf-8")
+
+    with patch.object(runner_module, "__file__", str(fake_runner_file)):
+        dockerfile_path = CodexRunner._runtime_dockerfile_path()
+
+    assert dockerfile_path == packaged_dockerfile
 
 
 def test_codex_config_setup(tmp_path: Path):

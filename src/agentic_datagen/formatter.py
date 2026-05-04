@@ -7,6 +7,8 @@ import re
 from typing import Any
 
 from datasets import Dataset
+from rich.console import Console
+from rich.table import Table
 
 
 _GEMMA_TURN_START_PATTERN = re.compile(r"<\|turn>(model|user|system)\n")
@@ -902,6 +904,7 @@ def format_and_mask(
     assistant_prompt_prefix_cache: dict[str, tuple[str, ...]] = {}
     effective_max_length = _resolve_effective_max_length(max_length, text_tokenizer)
     saw_non_empty_conversation = False
+    empty_dropped_count = 0
     dropped_oversized_examples_count = 0
 
     if messages_column not in dataset.column_names:
@@ -916,6 +919,7 @@ def format_and_mask(
 
     def _map_batch(batch: dict[str, list[Any]]) -> dict[str, list[Any]]:
         nonlocal saw_non_empty_conversation
+        nonlocal empty_dropped_count
         nonlocal dropped_oversized_examples_count
 
         batch_size = len(batch[messages_column])
@@ -929,6 +933,7 @@ def format_and_mask(
             if not isinstance(messages, list):
                 raise TypeError(f"Row is missing a list-valued '{messages_column}' column")
             if len(messages) == 0:
+                empty_dropped_count += 1
                 continue
 
             saw_non_empty_conversation = True
@@ -973,6 +978,17 @@ def format_and_mask(
         raise ValueError(
             f"Dataset contains no conversations that fit within context window of {effective_max_length} tokens."
         )
+
+    console = Console()
+    table = Table(title="format_and_mask summary")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Count", style="magenta", justify="right")
+    table.add_row("Input rows", str(dataset.num_rows))
+    table.add_row("Kept rows", str(training_data.num_rows))
+    table.add_row("Empty dropped", str(empty_dropped_count))
+    if drop_oversized_examples and effective_max_length is not None:
+        table.add_row("Oversized dropped", str(dropped_oversized_examples_count))
+    console.print(table)
 
     def preview(index: int = 0) -> str:
         if training_data.num_rows == 0:
