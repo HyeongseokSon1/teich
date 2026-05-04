@@ -56,9 +56,13 @@ def generate(
     if concurrency is not None:
         cfg.max_concurrency = concurrency
 
+    prompt_inputs = cfg.get_prompt_inputs()
+    if not prompt_inputs:
+        console.print("[red]No prompts configured. Add prompts in config.yaml or prompts.csv.[/red]")
+        raise typer.Exit(1)
+
     # Ensure output dir exists
     cfg.output.traces_dir.mkdir(parents=True, exist_ok=True)
-    prompt_inputs = cfg.get_prompt_inputs()
     effective_concurrency = (
         max(1, min(cfg.max_concurrency, len(prompt_inputs))) if prompt_inputs else cfg.max_concurrency
     )
