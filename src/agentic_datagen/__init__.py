@@ -1,6 +1,6 @@
 """Agentic Datagen v2 - Generate training data from Codex and Pi traces."""
 
-__version__ = "0.1.1a4"
+__version__ = "0.1.1a6"
 
 from .config import Config, load_config
 from .converter import TrainingExample, convert_trace_to_training_example, convert_traces_to_training_data

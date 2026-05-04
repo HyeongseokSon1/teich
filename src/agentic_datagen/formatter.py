@@ -14,6 +14,7 @@ _GEMMA_ASSISTANT_TURN_PREFIX = "<|turn>model\n"
 _GEMMA_THOUGHT_PREFIX = "<|channel>thought\n"
 _GEMMA_TOOL_RESPONSE_START = "<|tool_response>"
 _GEMMA_TOOL_RESPONSE_END = "<tool_response|>"
+_FORMAT_AND_MASK_BATCH_SIZE = 8
 
 
 def _resolve_chat_template_renderer(tokenizer: Any, text_tokenizer: Any) -> Any:
@@ -297,7 +298,8 @@ def _gemma_mask_row(
     tools: list[dict[str, Any]],
     chat_template_kwargs: dict[str, Any],
     max_length: int | None,
-) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    include_debug_columns: bool,
+) -> dict[str, Any] | None:
     if not _chat_template_looks_like_gemma(renderer):
         return None
     if not _supports_offsets(text_tokenizer):
@@ -319,20 +321,15 @@ def _gemma_mask_row(
         attention_mask = attention_mask[:max_length]
         assistant_masks = assistant_masks[:max_length]
         labels = labels[:max_length]
-    return (
-        {
-            "text": formatted_text,
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "assistant_masks": assistant_masks,
-            "labels": labels,
-        },
-        {
-            "text": formatted_text,
-            "input_ids": input_ids,
-            "labels": labels,
-        },
-    )
+    row = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "labels": labels,
+    }
+    if include_debug_columns:
+        row["text"] = formatted_text
+        row["assistant_masks"] = assistant_masks
+    return row
 
 
 def _fast_mask_row(
@@ -342,7 +339,8 @@ def _fast_mask_row(
     tools: list[dict[str, Any]],
     chat_template_kwargs: dict[str, Any],
     max_length: int | None,
-) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    include_debug_columns: bool,
+) -> dict[str, Any] | None:
     if not _chat_template_supports_assistant_mask(renderer):
         return None
     render_kwargs: dict[str, Any] = {
@@ -369,27 +367,21 @@ def _fast_mask_row(
         attention_mask = [1] * len(input_ids)
     if assistant_masks is None or 1 not in assistant_masks:
         return None
-    formatted_text = _render_chat(renderer, messages, tools, chat_template_kwargs)
     labels = [token_id if assistant_mask else -100 for token_id, assistant_mask in zip(input_ids, assistant_masks)]
     if max_length is not None:
         input_ids = input_ids[:max_length]
         attention_mask = attention_mask[:max_length]
         assistant_masks = assistant_masks[:max_length]
         labels = labels[:max_length]
-    return (
-        {
-            "text": formatted_text,
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "assistant_masks": assistant_masks,
-            "labels": labels,
-        },
-        {
-            "text": formatted_text,
-            "input_ids": input_ids,
-            "labels": labels,
-        },
-    )
+    row = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "labels": labels,
+    }
+    if include_debug_columns:
+        row["text"] = _render_chat(renderer, messages, tools, chat_template_kwargs)
+        row["assistant_masks"] = assistant_masks
+    return row
 
 
 def _prepend_marker(value: Any, marker: str) -> tuple[Any, bool]:
@@ -721,7 +713,8 @@ def _offset_mask_row(
     chat_template_kwargs: dict[str, Any],
     assistant_prompt_prefix_cache: dict[str, tuple[str, ...]],
     max_length: int | None,
-) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    include_debug_columns: bool,
+) -> dict[str, Any] | None:
     if not _supports_offsets(text_tokenizer):
         return None
     assistant_prompt_prefixes = _resolve_assistant_prompt_prefixes(
@@ -749,20 +742,15 @@ def _offset_mask_row(
         attention_mask = attention_mask[:max_length]
         assistant_masks = assistant_masks[:max_length]
         labels = labels[:max_length]
-    return (
-        {
-            "text": formatted_text,
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "assistant_masks": assistant_masks,
-            "labels": labels,
-        },
-        {
-            "text": formatted_text,
-            "input_ids": input_ids,
-            "labels": labels,
-        },
-    )
+    row = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "labels": labels,
+    }
+    if include_debug_columns:
+        row["text"] = formatted_text
+        row["assistant_masks"] = assistant_masks
+    return row
 
 
 def _mask_row(
@@ -774,7 +762,8 @@ def _mask_row(
     chat_template_kwargs: dict[str, Any],
     assistant_prompt_prefix_cache: dict[str, tuple[str, ...]],
     max_length: int | None,
-) -> tuple[dict[str, Any], dict[str, Any]]:
+    include_debug_columns: bool,
+) -> dict[str, Any]:
     messages = row.get(messages_column)
     if not isinstance(messages, list):
         raise TypeError(f"Row is missing a list-valued '{messages_column}' column")
@@ -782,11 +771,27 @@ def _mask_row(
     if not isinstance(tools, list):
         raise TypeError(f"Row is missing a list-valued '{tools_column}' column")
 
-    fast_path = _fast_mask_row(renderer, text_tokenizer, messages, tools, chat_template_kwargs, max_length)
+    fast_path = _fast_mask_row(
+        renderer,
+        text_tokenizer,
+        messages,
+        tools,
+        chat_template_kwargs,
+        max_length,
+        include_debug_columns,
+    )
     if fast_path is not None:
         return fast_path
 
-    gemma_path = _gemma_mask_row(renderer, text_tokenizer, messages, tools, chat_template_kwargs, max_length)
+    gemma_path = _gemma_mask_row(
+        renderer,
+        text_tokenizer,
+        messages,
+        tools,
+        chat_template_kwargs,
+        max_length,
+        include_debug_columns,
+    )
     if gemma_path is not None:
         return gemma_path
 
@@ -798,6 +803,7 @@ def _mask_row(
         chat_template_kwargs,
         assistant_prompt_prefix_cache,
         max_length,
+        include_debug_columns,
     )
     if offset_path is not None:
         return offset_path
@@ -829,20 +835,15 @@ def _mask_row(
         assistant_masks = assistant_masks[:max_length]
         labels = labels[:max_length]
 
-    return (
-        {
-            "text": formatted_text,
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "assistant_masks": assistant_masks,
-            "labels": labels,
-        },
-        {
-            "text": formatted_text,
-            "input_ids": input_ids,
-            "labels": labels,
-        },
-    )
+    row = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "labels": labels,
+    }
+    if include_debug_columns:
+        row["text"] = formatted_text
+        row["assistant_masks"] = assistant_masks
+    return row
 
 
 def _is_prefix(prefix_ids: list[int], full_ids: list[int]) -> bool:
@@ -854,6 +855,17 @@ def _decode_token(text_tokenizer: Any, token_id: int) -> str:
         return text_tokenizer.decode([token_id], skip_special_tokens=False, clean_up_tokenization_spaces=False)
     except TypeError:
         return text_tokenizer.decode([token_id], skip_special_tokens=False)
+
+
+def _resolve_effective_max_length(max_length: int | None, text_tokenizer: Any) -> int | None:
+    if isinstance(max_length, int) and max_length > 0:
+        return max_length
+    tokenizer_max_length = getattr(text_tokenizer, "model_max_length", None)
+    if not isinstance(tokenizer_max_length, int) or tokenizer_max_length <= 0:
+        return None
+    if tokenizer_max_length >= 1_000_000_000:
+        return None
+    return tokenizer_max_length
 
 
 def _build_preview(text_tokenizer: Any, input_ids: list[int], labels: list[int]) -> str:
@@ -881,40 +893,86 @@ def format_and_mask(
     tools_column: str = "tools",
     chat_template_kwargs: dict[str, Any] | None = None,
     max_length: int | None = None,
+    include_debug_columns: bool = False,
+    drop_oversized_examples: bool = True,
 ) -> Dataset:
     template_kwargs = _validate_chat_template_kwargs(chat_template_kwargs)
     text_tokenizer = _resolve_text_tokenizer(tokenizer)
     renderer = _resolve_chat_template_renderer(tokenizer, text_tokenizer)
     assistant_prompt_prefix_cache: dict[str, tuple[str, ...]] = {}
+    effective_max_length = _resolve_effective_max_length(max_length, text_tokenizer)
+    saw_non_empty_conversation = False
+    dropped_oversized_examples_count = 0
 
     if messages_column not in dataset.column_names:
         raise TypeError(f"Dataset is missing required '{messages_column}' column")
 
-    usable_dataset = dataset.filter(
-        lambda row: isinstance(row.get(messages_column), list) and len(row[messages_column]) > 0,
-        desc="Filtering empty conversations",
+    output_columns = ["input_ids", "attention_mask", "labels"]
+    if include_debug_columns:
+        output_columns = ["text", "input_ids", "attention_mask", "assistant_masks", "labels"]
+
+    def _empty_output_batch() -> dict[str, list[Any]]:
+        return {column_name: [] for column_name in output_columns}
+
+    def _map_batch(batch: dict[str, list[Any]]) -> dict[str, list[Any]]:
+        nonlocal saw_non_empty_conversation
+        nonlocal dropped_oversized_examples_count
+
+        batch_size = len(batch[messages_column])
+        tools_batch = batch.get(tools_column)
+        if tools_batch is None:
+            tools_batch = [None] * batch_size
+        output_batch = _empty_output_batch()
+
+        for index in range(batch_size):
+            messages = batch[messages_column][index]
+            if not isinstance(messages, list):
+                raise TypeError(f"Row is missing a list-valued '{messages_column}' column")
+            if len(messages) == 0:
+                continue
+
+            saw_non_empty_conversation = True
+            tools = tools_batch[index] or []
+            if not isinstance(tools, list):
+                raise TypeError(f"Row is missing a list-valued '{tools_column}' column")
+
+            formatted_row = _mask_row(
+                {messages_column: messages, tools_column: tools},
+                renderer,
+                text_tokenizer,
+                messages_column,
+                tools_column,
+                template_kwargs,
+                assistant_prompt_prefix_cache,
+                None if drop_oversized_examples else effective_max_length,
+                include_debug_columns,
+            )
+
+            if drop_oversized_examples and effective_max_length is not None:
+                if len(formatted_row["input_ids"]) > effective_max_length:
+                    dropped_oversized_examples_count += 1
+                    continue
+
+            for column_name in output_columns:
+                output_batch[column_name].append(formatted_row[column_name])
+
+        return output_batch
+
+    training_data = dataset.map(
+        _map_batch,
+        batched=True,
+        batch_size=_FORMAT_AND_MASK_BATCH_SIZE,
+        writer_batch_size=_FORMAT_AND_MASK_BATCH_SIZE,
+        remove_columns=dataset.column_names,
+        desc="Filtering conversations" if drop_oversized_examples else "Formatting and masking conversations",
     )
-    if usable_dataset.num_rows == 0:
+
+    if not saw_non_empty_conversation:
         raise ValueError("Dataset contains no non-empty conversations to format and mask.")
-
-    def _map_row(row: dict[str, Any]) -> dict[str, Any]:
-        masked_row, _ = _mask_row(
-            row,
-            renderer,
-            text_tokenizer,
-            messages_column,
-            tools_column,
-            template_kwargs,
-            assistant_prompt_prefix_cache,
-            max_length,
+    if training_data.num_rows == 0 and drop_oversized_examples and effective_max_length is not None and dropped_oversized_examples_count > 0:
+        raise ValueError(
+            f"Dataset contains no conversations that fit within context window of {effective_max_length} tokens."
         )
-        return masked_row
-
-    training_data = usable_dataset.map(
-        _map_row,
-        remove_columns=usable_dataset.column_names,
-        desc="Formatting and masking conversations",
-    )
 
     def preview(index: int = 0) -> str:
         if training_data.num_rows == 0:

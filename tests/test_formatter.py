@@ -72,6 +72,10 @@ class RequiresUserTokenizer(FakeTokenizer):
         return super().apply_chat_template(messages, **kwargs)
 
 
+class LimitedFakeTokenizer(FakeTokenizer):
+    model_max_length = 60
+
+
 class CountingTokenizer(FakeTokenizer):
     def __init__(self):
         super().__init__()
@@ -348,7 +352,7 @@ def test_format_and_mask_supervises_only_assistant_turns_across_multi_turn_conve
         ]
     )
 
-    training_data = format_and_mask(dataset, tokenizer)
+    training_data = format_and_mask(dataset, tokenizer, include_debug_columns=True)
 
     assert training_data.num_rows == 1
     row = training_data[0]
@@ -373,6 +377,27 @@ def test_format_and_mask_supervises_only_assistant_turns_across_multi_turn_conve
     assert row["assistant_masks"] == [0 if label == -100 else 1 for label in row["labels"]]
 
 
+def test_format_and_mask_returns_compact_training_columns_by_default():
+    tokenizer = FakeTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "world", "reasoning_content": "think"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    training_data = format_and_mask(dataset, tokenizer)
+
+    row = training_data[0]
+    assert set(row.keys()) == {"input_ids", "attention_mask", "labels"}
+    assert len(row["input_ids"]) == len(row["attention_mask"]) == len(row["labels"])
+
+
 def test_format_and_mask_passes_chat_template_kwargs_and_preview_marks_unsupervised_text_red():
     tokenizer = FakeTokenizer()
     dataset = Dataset.from_list(
@@ -391,6 +416,7 @@ def test_format_and_mask_passes_chat_template_kwargs_and_preview_marks_unsupervi
         dataset,
         tokenizer,
         chat_template_kwargs={"enable_thinking": False, "preserve_thinking": False},
+        include_debug_columns=True,
     )
 
     row = training_data[0]
@@ -430,7 +456,7 @@ def test_format_and_mask_supports_processor_objects_with_nested_text_tokenizer()
         ]
     )
 
-    training_data = format_and_mask(dataset, processor)
+    training_data = format_and_mask(dataset, processor, include_debug_columns=True)
 
     row = training_data[0]
     assert row["text"] == "<user>hello</user><assistant><think>think</think>world</assistant>"
@@ -453,7 +479,7 @@ def test_format_and_mask_uses_fast_assistant_mask_path_when_supported():
         ]
     )
 
-    training_data = format_and_mask(dataset, tokenizer)
+    training_data = format_and_mask(dataset, tokenizer, include_debug_columns=True)
 
     row = training_data[0]
     assert row["assistant_masks"] == [0] * len("<user>hello</user>") + [1] * len("<assistant><think>think</think>world</assistant>")
@@ -727,7 +753,75 @@ def test_format_and_mask_skips_rows_with_empty_message_lists():
     training_data = format_and_mask(dataset, tokenizer)
 
     assert training_data.num_rows == 1
-    assert training_data[0]["text"] == "<user>hello</user><assistant>world</assistant>"
+    assert set(training_data[0].keys()) == {"input_ids", "attention_mask", "labels"}
+
+
+def test_format_and_mask_drops_oversized_examples_by_default():
+    tokenizer = FakeTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "world"},
+                ],
+                "tools": [],
+            },
+            {
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "x" * 80},
+                ],
+                "tools": [],
+            },
+        ]
+    )
+
+    training_data = format_and_mask(dataset, tokenizer, max_length=60)
+
+    assert training_data.num_rows == 1
+    assert len(training_data[0]["input_ids"]) < 60
+
+
+def test_format_and_mask_truncates_oversized_examples_when_drop_is_disabled():
+    tokenizer = FakeTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "x" * 80},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    training_data = format_and_mask(dataset, tokenizer, max_length=60, drop_oversized_examples=False)
+
+    assert training_data.num_rows == 1
+    row = training_data[0]
+    assert len(row["input_ids"]) == 60
+    assert len(row["attention_mask"]) == 60
+    assert len(row["labels"]) == 60
+
+
+def test_format_and_mask_uses_tokenizer_model_max_length_when_dropping_oversized_examples():
+    tokenizer = LimitedFakeTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "x" * 80},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    with pytest.raises(ValueError, match="fit within context window of 60 tokens"):
+        format_and_mask(dataset, tokenizer)
 
 
 def test_format_and_mask_raises_when_all_rows_have_empty_message_lists():

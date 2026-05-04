@@ -7,7 +7,7 @@ import pytest
 from rich.console import Console
 from typer.testing import CliRunner
 
-from teich.cli import BatchProgressReporter, app
+from teich.cli import BatchProgressReporter, CONFIG_TEMPLATE, app
 from teich.runner import SessionProgressUpdate, TraceMetrics
 
 runner = CliRunner()
@@ -34,6 +34,11 @@ def test_init_command_existing_files(tmp_path: Path):
 
     assert result.exit_code == 0
     assert "Already exists" in result.output
+
+
+def test_checked_in_config_example_matches_init_template():
+    example_path = Path(__file__).resolve().parent.parent / "config.example.yaml"
+    assert example_path.read_text(encoding="utf-8") == CONFIG_TEMPLATE
 
 
 def test_generate_command_missing_config():

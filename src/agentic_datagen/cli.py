@@ -272,53 +272,106 @@ def init(
 
     console.print(f"\n[bold green]Initialized in {path.absolute()}[/bold green]")
     console.print("\n[yellow]Next:[/yellow]")
-    console.print("1. Set OPENAI_API_KEY in config.yaml or env")
+    console.print("1. Set TEICH_API_KEY / OPENAI_API_KEY in env or config.yaml")
     console.print("2. Add prompt rows to prompts.csv")
     console.print("3. Run: [cyan]uvx teich generate -c config.yaml[/cyan]")
 
 
-CONFIG_TEMPLATE = '''# Teich Configuration
+CONFIG_TEMPLATE = '''# Teich configuration
+#
+# Quick start:
+# 1. Choose agent.provider: codex or pi
+# 2. Set model.model to the model you want to run
+# 3. Keep prompts in prompts.csv, or add inline prompts below
+# 4. Prefer TEICH_API_KEY / OPENAI_API_KEY in your environment for secrets
+# 5. Run: uvx teich generate -c config.yaml
+
 agent:
+  # codex = Codex CLI in Docker
+  # pi = Pi coding agent in Docker
   provider: codex
 
 model:
+  # Model id passed to the selected agent/provider.
   model: codex-mini-latest
+
+  # Codex approval behavior. Common values: never, on-request.
   approval_policy: never
+
+  # Codex sandbox mode.
   sandbox: danger-full-access
+
+  # Optional reasoning / thinking level.
+  # - Codex: forwarded as model_reasoning_effort
+  # - Pi: normalized to low / medium / high when supported
   reasoning_effort: null
 
-# Optional: API/model provider configuration
+  # Optional Pi-specific provider overrides.
+  # Teich already defaults maxTokens to 131072 even if this block is omitted.
+  # Uncomment to customize the Pi/OpenRouter model entry further.
+  # pi_model_overrides:
+  #   maxTokens: 131072
+  #   compat:
+  #     maxTokensField: max_tokens
+
+# Optional API/provider configuration.
+# Leave this section commented out to use the runtime defaults.
+#
+# Common setups:
+# - OpenAI: provider=openai
+# - OpenRouter: provider=openrouter, base_url=https://openrouter.ai/api/v1
+# - Local OpenAI-compatible server: provider=openai, base_url=http://localhost:1234/v1
+#
+# Prefer putting secrets in env vars instead of committing them here:
+#   TEICH_API_KEY=...
+#   TEICH_BASE_URL=...
+#   TEICH_PROVIDER=...
+#   TEICH_MODEL=...
 # api:
 #   provider: openai
 #   base_url: null
 #   api_key: null
+#   wire_api: responses
 
-# Optional: MCP servers
+# Optional MCP servers exposed inside the agent runtime.
 # mcp_servers:
 #   - name: filesystem
 #     command: npx
 #     args: ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"]
 
-# Load prompts from file (optional)
+# Prompts can come from a file, inline below, or both.
+# Relative paths are resolved from the location of this config file.
+# CSV prompt files must include a `prompt` column.
 prompts_file: prompts.csv
 
-# Or define prompts here
+# Optional inline prompts.
 prompts: []
 
 output:
+  # Where normalized raw trace .jsonl files are written.
   traces_dir: ./output
+
+  # Where Teich stores workspace snapshots for each run.
   sandbox_dir: ./sandbox
+
+  # Used in the generated trace README.
   pretty_name: "My Agent Traces"
   readme_file_name: README.md
   tags:
     - agent-traces
     - codex
 
+# Number of prompts to run in parallel.
 max_concurrency: 1
+
+# Per-session timeout in seconds.
 timeout_seconds: 600
 
-# Set via env: OPENAI_API_KEY or here
+# Legacy global API key field.
+# Prefer env vars or api.api_key above for new configs.
 openai_api_key: null
+
+# Optional developer instructions injected into the runtime.
 developer_instructions: null
 '''
 

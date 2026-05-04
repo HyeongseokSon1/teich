@@ -13,6 +13,7 @@ def test_default_config():
     config = Config()
     assert config.model.model == "codex-mini-latest"
     assert config.model.approval_mode == "none"
+    assert config.model.pi_model_overrides == {"maxTokens": 131072}
     assert config.output.traces_dir == Path("./output")
     assert config.output.sandbox_dir == Path("./sandbox")
     assert config.max_concurrency == 1

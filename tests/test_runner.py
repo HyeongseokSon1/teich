@@ -706,6 +706,7 @@ def test_pi_runner_builds_command_and_project_settings(tmp_path: Path):
                 "models": [
                     {
                         "id": "claude-sonnet-4-20250514",
+                        "maxTokens": 131072,
                     }
                 ],
             }
@@ -826,6 +827,7 @@ def test_pi_runner_maps_wire_api_to_openai_completions():
         "models": [
             {
                 "id": "gemma-4",
+                "maxTokens": 131072,
             }
         ],
     }
@@ -850,6 +852,11 @@ def test_pi_runner_preserves_builtin_openrouter_models_for_cost_tracking():
         "baseUrl": "https://openrouter.ai/api/v1",
         "api": "openai-completions",
         "authHeader": True,
+        "modelOverrides": {
+            "deepseek/deepseek-v4-pro": {
+                "maxTokens": 131072,
+            }
+        },
         "apiKey": "sk-or-test",
     }
     assert runner._pi_models_config() == {
@@ -858,6 +865,11 @@ def test_pi_runner_preserves_builtin_openrouter_models_for_cost_tracking():
                 "baseUrl": "https://openrouter.ai/api/v1",
                 "api": "openai-completions",
                 "authHeader": True,
+                "modelOverrides": {
+                    "deepseek/deepseek-v4-pro": {
+                        "maxTokens": 131072,
+                    }
+                },
                 "apiKey": "sk-or-test",
             }
         }
@@ -934,6 +946,34 @@ def test_pi_runner_applies_optional_model_overrides_for_builtin_openrouter():
             "minimax/minimax-m2.7": {
                 "maxTokens": 32768,
                 "contextWindow": 196608,
+            }
+        },
+        "apiKey": "sk-or-test",
+    }
+
+
+def test_pi_runner_applies_default_max_tokens_override_for_builtin_openrouter():
+    with patch.object(PiRunner, '_ensure_image'):
+        runner = PiRunner(
+            Config(
+                agent={"provider": "pi"},
+                model=ModelConfig(model="google/gemma-4-26b-it"),
+                api=APIConfig(
+                    provider="openrouter",
+                    base_url="https://openrouter.ai/api/v1",
+                    api_key="sk-or-test",
+                    wire_api="responses",
+                ),
+            )
+        )
+
+    assert runner._pi_provider_settings() == {
+        "baseUrl": "https://openrouter.ai/api/v1",
+        "api": "openai-responses",
+        "authHeader": True,
+        "modelOverrides": {
+            "google/gemma-4-26b-it": {
+                "maxTokens": 131072,
             }
         },
         "apiKey": "sk-or-test",

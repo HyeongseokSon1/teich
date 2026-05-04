@@ -1,6 +1,6 @@
 [project]
 name = "teich"
-version = "0.1.1a4"
+version = "0.1.1a6"
 description = "Turn coding agent sessions into training data"
 readme = "README.md"
 license = {text = "Apache-2.0"}

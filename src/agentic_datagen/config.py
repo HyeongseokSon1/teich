@@ -74,7 +74,7 @@ class ModelConfig(BaseModel):
     sandbox: str = "danger-full-access"
     reasoning_effort: str | None = None
     approval_mode: str | None = "none"
-    pi_model_overrides: dict[str, object] = Field(default_factory=dict)
+    pi_model_overrides: dict[str, object] = Field(default_factory=lambda: {"maxTokens": 131072})
 
     @model_validator(mode="after")
     def normalize_legacy_approval_mode(self) -> ModelConfig:
