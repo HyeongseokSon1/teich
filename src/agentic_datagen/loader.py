@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from datasets import Dataset
+from datasets import Dataset, Features, Json, List, Value
 from huggingface_hub import snapshot_download
 
 from .converter import convert_traces_to_training_data
@@ -14,6 +14,23 @@ def _trace_directory(root: Path, split: str | None) -> Path:
         if candidate.is_dir():
             return candidate
     return root
+
+
+def _dataset_from_rows(rows: list[dict]) -> Dataset:
+    try:
+        return Dataset.from_list(rows, on_mixed_types="use_json")
+    except TypeError as exc:
+        if "on_mixed_types" not in str(exc):
+            raise
+    features = Features(
+        {
+            "prompt": Value("string"),
+            "messages": List(Json()),
+            "tools": List(Json()),
+            "metadata": Json(),
+        }
+    )
+    return Dataset.from_list(rows, features=features)
 
 
 def load_traces(
@@ -46,4 +63,4 @@ def load_traces(
         if split and traces_dir == root:
             raise ValueError(f"No trace files found in {location} for split '{split}'.")
         raise ValueError(f"No trace files found in {location}.")
-    return Dataset.from_list(rows, on_mixed_types="use_json")
+    return _dataset_from_rows(rows)

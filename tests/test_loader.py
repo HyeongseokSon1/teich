@@ -6,6 +6,7 @@ import pytest
 from datasets import Dataset
 
 from teich import load_traces
+from teich.loader import _dataset_from_rows
 
 
 def _write_codex_trace(trace_file: Path, prompt: str = "List files") -> None:
@@ -134,4 +135,51 @@ def test_load_traces_supports_mixed_nested_tool_argument_types(tmp_path: Path):
     tool_calls = dataset[0]["messages"][-1]["tool_calls"]
     assert tool_calls[0]["function"]["arguments"]["edits"] == [{"oldText": "a", "newText": "b"}]
     assert tool_calls[0]["function"]["arguments"]["content"] == "plain text"
+    assert tool_calls[1]["function"]["arguments"]["content"] == [{"type": "text", "text": "structured"}]
+
+
+def test_dataset_from_rows_falls_back_when_on_mixed_types_is_unsupported():
+    rows = [
+        {
+            "prompt": "Apply edits",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "function": {
+                                "arguments": {
+                                    "content": "plain text",
+                                    "edits": [{"oldText": "a", "newText": "b"}],
+                                }
+                            }
+                        },
+                        {
+                            "function": {
+                                "arguments": {
+                                    "content": [{"type": "text", "text": "structured"}],
+                                }
+                            }
+                        },
+                    ],
+                }
+            ],
+            "tools": [],
+            "metadata": {"source": "test"},
+        }
+    ]
+
+    original_from_list = Dataset.from_list
+
+    def _compat_from_list(data, *args, **kwargs):
+        if "on_mixed_types" in kwargs:
+            raise TypeError("Dataset.from_list() got an unexpected keyword argument 'on_mixed_types'")
+        return original_from_list(data, *args, **kwargs)
+
+    with patch.object(Dataset, "from_list", side_effect=_compat_from_list):
+        dataset = _dataset_from_rows(rows)
+
+    tool_calls = dataset[0]["messages"][0]["tool_calls"]
+    assert tool_calls[0]["function"]["arguments"]["content"] == "plain text"
+    assert tool_calls[0]["function"]["arguments"]["edits"] == [{"oldText": "a", "newText": "b"}]
     assert tool_calls[1]["function"]["arguments"]["content"] == [{"type": "text", "text": "structured"}]
