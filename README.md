@@ -141,7 +141,7 @@ from teich import (
 
 ## 📦 Trace-First Workflow
 
-Unlike synthetic datasets, Teich preserves the **raw agent session** as the source of truth:
+Teich preserves the **raw agent session** as the source of truth:
 
 1. **Collect**: Run agents on real tasks → raw `.jsonl` traces
 2. **Inspect/Share**: Traces are human-readable and uploadable
