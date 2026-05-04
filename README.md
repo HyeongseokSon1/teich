@@ -23,7 +23,7 @@ teich generate -c config.yaml
 - **Multi-agent support**: Works with Codex and Pi
 - **Structured output**: Converts traces into chat messages with tool calls, reasoning, and tool results
 - **SFT-ready formatting**: Applies chat templates and creates assistant masks for supervised fine-tuning
-- **Hugging Face integration**: Load traces from local folders or dataset repos like `badlogicgames/pi-mono`
+- **Hugging Face integration**: Load traces from local folders or dataset repos like `badlogicgames/pi-mono` (or any datasets generated with the tool)
 
 ## 📥 Install
 
