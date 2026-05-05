@@ -16,7 +16,13 @@ pip install teich
 teich init my-project && cd my-project
 teich generate -c config.yaml
 ```
+Or us uv
+```bash
+uvx teich init my-project && cd my-project
+uvx teich generate -c config.yaml
+```
 
+> Be sure to edit your config.yaml and prompts.csv file as needed
 ## ⭐ What Teich Does
 
 - **Trace-first data collection**: Run real coding agents and keep the raw session traces when you want full fidelity
