@@ -16,7 +16,7 @@ pip install teich
 teich init my-project && cd my-project
 teich generate -c config.yaml
 ```
-Or us uv
+Or us [astral-uv](https://docs.astral.sh/uv/getting-started/installation/)
 ```bash
 uvx teich init my-project && cd my-project
 uvx teich generate -c config.yaml
