@@ -17,6 +17,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -144,6 +146,24 @@ class TraceMetrics:
         total_tokens = self._int_value(usage.get("totalTokens"))
         self.total_tokens += total_tokens
         self.est_total_tokens += total_tokens
+        cost = usage.get("cost")
+        if isinstance(cost, dict):
+            self.total_cost += self._float_value(cost.get("total"))
+
+    def add_structured_usage(self, usage: dict[str, Any]) -> None:
+        self.input_tokens += self._int_value(usage.get("input") or usage.get("prompt_tokens") or usage.get("input_tokens"))
+        self.output_tokens += self._int_value(usage.get("output") or usage.get("completion_tokens") or usage.get("output_tokens"))
+        self.reasoning_tokens += self._int_value(
+            usage.get("reasoning")
+            or usage.get("reasoning_tokens")
+            or usage.get("reasoning_output_tokens")
+        )
+        self.cache_read_tokens += self._int_value(usage.get("cacheRead") or usage.get("cached_input_tokens"))
+        self.cache_write_tokens += self._int_value(usage.get("cacheWrite"))
+        total_tokens = self._int_value(usage.get("totalTokens") or usage.get("total_tokens"))
+        if total_tokens:
+            self.total_tokens += total_tokens
+            self.est_total_tokens += total_tokens
         cost = usage.get("cost")
         if isinstance(cost, dict):
             self.total_cost += self._float_value(cost.get("total"))
@@ -479,6 +499,27 @@ class DockerRuntimeRunner:
                     continue
                 event = json.loads(line)
                 if not isinstance(event, dict):
+                    continue
+
+                if isinstance(event.get("messages"), list):
+                    if isinstance(event.get("provider"), str) and event.get("provider") and not metrics.provider:
+                        metrics.provider = event["provider"]
+                    metadata = event.get("metadata")
+                    if isinstance(metadata, dict):
+                        provider = metadata.get("model_provider")
+                        model = metadata.get("model")
+                        if isinstance(provider, str) and provider.strip() and not metrics.provider:
+                            metrics.provider = provider.strip()
+                        if isinstance(model, str) and model.strip() and not metrics.model:
+                            metrics.model = model.strip()
+                        usage = metadata.get("usage")
+                        if isinstance(usage, dict):
+                            metrics.add_structured_usage(usage)
+                    if isinstance(event.get("model"), str) and event.get("model") and not metrics.model:
+                        metrics.model = event["model"]
+                    usage = event.get("usage")
+                    if isinstance(usage, dict):
+                        metrics.add_structured_usage(usage)
                     continue
 
                 event_type = event.get("type")
@@ -1100,6 +1141,266 @@ class CodexRunner(DockerRuntimeRunner):
         finally:
             shutil.rmtree(workspace_root, ignore_errors=True)
             shutil.rmtree(codex_home, ignore_errors=True)
+
+    def run_all(
+        self,
+        max_concurrency: int = 1,
+        progress_callback: SessionProgressCallback | None = None,
+    ) -> list[Path]:
+        return super().run_all(max_concurrency=max_concurrency, progress_callback=progress_callback)
+
+
+class ChatRunner(DockerRuntimeRunner):
+    """Generates text-only chat datasets from prompt inputs via an OpenAI-compatible API."""
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.image_name = RUNTIME_IMAGE_NAME
+
+    def _default_base_url(self) -> str:
+        provider = self.config.api.provider.strip().lower()
+        if provider == "openai":
+            return "https://api.openai.com/v1"
+        if provider == "openrouter":
+            return "https://openrouter.ai/api/v1"
+        raise RuntimeError(
+            "Chat runner requires api.base_url for providers other than openai or openrouter."
+        )
+
+    def _wire_api(self) -> str:
+        return self.config.api.wire_api.strip().lower()
+
+    def _api_base_url(self) -> str:
+        base_url = self.config.get_base_url() or self._default_base_url()
+        return base_url.rstrip("/")
+
+    def _chat_system_prompt(self) -> str:
+        if isinstance(self.config.developer_instructions, str) and self.config.developer_instructions.strip():
+            return self.config.developer_instructions.strip()
+        return "You are a helpful assistant"
+
+    def _chat_endpoint(self) -> str:
+        if self._wire_api() in {"completions", "chat_completions", "chat-completions", "openai-completions"}:
+            return f"{self._api_base_url()}/chat/completions"
+        return f"{self._api_base_url()}/responses"
+
+    def _chat_request_body(self, prompt: str) -> dict[str, Any]:
+        system_prompt = self._chat_system_prompt()
+        model = self.config.get_effective_model()
+        reasoning_effort = self.config.model.reasoning_effort
+        if self._wire_api() in {"completions", "chat_completions", "chat-completions", "openai-completions"}:
+            body: dict[str, Any] = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+            }
+            if isinstance(reasoning_effort, str) and reasoning_effort.strip():
+                body["reasoning_effort"] = reasoning_effort.strip()
+            return body
+        body = {
+            "model": model,
+            "instructions": system_prompt,
+            "input": prompt,
+        }
+        if isinstance(reasoning_effort, str) and reasoning_effort.strip():
+            body["reasoning"] = {"effort": reasoning_effort.strip()}
+        return body
+
+    def _chat_headers(self) -> dict[str, str]:
+        headers = {
+            "content-type": "application/json",
+            "accept": "application/json",
+        }
+        api_key = self.config.get_api_key()
+        if api_key:
+            headers["authorization"] = f"Bearer {api_key}"
+        return headers
+
+    @staticmethod
+    def _extract_content_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content.strip()
+        if not isinstance(content, list):
+            return ""
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str) and item.strip():
+                parts.append(item.strip())
+                continue
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+        return "\n".join(parts).strip()
+
+    @staticmethod
+    def _extract_reasoning_text(payload: Any) -> str | None:
+        if isinstance(payload, str) and payload.strip():
+            return payload.strip()
+        if isinstance(payload, dict):
+            summary = payload.get("summary")
+            if isinstance(summary, list):
+                parts = [
+                    item.get("text", "").strip()
+                    for item in summary
+                    if isinstance(item, dict) and isinstance(item.get("text"), str) and item.get("text").strip()
+                ]
+                if parts:
+                    return "\n\n".join(parts)
+            text = payload.get("text")
+            if isinstance(text, str) and text.strip():
+                return text.strip()
+        if isinstance(payload, list):
+            parts = [
+                ChatRunner._extract_reasoning_text(item)
+                for item in payload
+            ]
+            merged = [part for part in parts if isinstance(part, str) and part.strip()]
+            if merged:
+                return "\n\n".join(merged)
+        return None
+
+    def _parse_chat_response(self, payload: dict[str, Any]) -> tuple[str, str | None, dict[str, Any] | None, str]:
+        model = payload.get("model") if isinstance(payload.get("model"), str) and payload.get("model") else self.config.get_effective_model()
+        usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else None
+        if self._wire_api() in {"completions", "chat_completions", "chat-completions", "openai-completions"}:
+            choices = payload.get("choices")
+            if not isinstance(choices, list) or not choices:
+                raise RuntimeError("Chat completion response did not include any choices.")
+            message = choices[0].get("message") if isinstance(choices[0], dict) else None
+            if not isinstance(message, dict):
+                raise RuntimeError("Chat completion response did not include a valid assistant message.")
+            content = self._extract_content_text(message.get("content"))
+            thinking = self._extract_reasoning_text(message.get("reasoning"))
+            return content, thinking, usage, model
+
+        output_items = payload.get("output")
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        if isinstance(output_items, list):
+            for item in output_items:
+                if not isinstance(item, dict):
+                    continue
+                item_type = item.get("type")
+                if item_type == "reasoning":
+                    reasoning = self._extract_reasoning_text(item.get("summary") or item.get("content"))
+                    if isinstance(reasoning, str) and reasoning.strip():
+                        reasoning_parts.append(reasoning.strip())
+                    continue
+                if item_type == "message" and item.get("role") == "assistant":
+                    content = self._extract_content_text(item.get("content"))
+                    if content:
+                        content_parts.append(content)
+        if not content_parts:
+            output_text = payload.get("output_text")
+            if isinstance(output_text, str) and output_text.strip():
+                content_parts.append(output_text.strip())
+        content = "\n\n".join(part for part in content_parts if part).strip()
+        thinking = "\n\n".join(part for part in reasoning_parts if part).strip() or None
+        return content, thinking, usage, model
+
+    @staticmethod
+    def _normalize_usage(usage: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not isinstance(usage, dict):
+            return None
+        input_tokens = TraceMetrics._int_value(usage.get("input") or usage.get("prompt_tokens") or usage.get("input_tokens"))
+        output_tokens = TraceMetrics._int_value(usage.get("output") or usage.get("completion_tokens") or usage.get("output_tokens"))
+        reasoning_tokens = TraceMetrics._int_value(
+            usage.get("reasoning")
+            or usage.get("reasoning_tokens")
+            or usage.get("reasoning_output_tokens")
+            or (usage.get("output_tokens_details") or {}).get("reasoning_tokens")
+        )
+        total_tokens = TraceMetrics._int_value(usage.get("totalTokens") or usage.get("total_tokens"))
+        normalized = {
+            "input": input_tokens,
+            "output": output_tokens,
+            "reasoning": reasoning_tokens,
+            "totalTokens": total_tokens or (input_tokens + output_tokens + reasoning_tokens),
+        }
+        return normalized
+
+    def _request_chat_completion(self, prompt: str) -> dict[str, Any]:
+        body = self._chat_request_body(prompt)
+        request = Request(
+            self._chat_endpoint(),
+            data=json.dumps(body).encode("utf-8"),
+            headers=self._chat_headers(),
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=self.config.timeout_seconds) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            details = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Chat request failed with HTTP {exc.code}: {details}") from exc
+        except URLError as exc:
+            raise RuntimeError(f"Chat request failed: {exc.reason}") from exc
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Chat request returned invalid JSON.") from exc
+        error = payload.get("error")
+        if isinstance(error, dict):
+            message = error.get("message") if isinstance(error.get("message"), str) else json.dumps(error, ensure_ascii=False)
+            raise RuntimeError(f"Chat request failed: {message}")
+        content, thinking, usage, model = self._parse_chat_response(payload)
+        if not content and not thinking:
+            raise RuntimeError("Chat request returned neither assistant content nor thinking.")
+        system_prompt = self._chat_system_prompt()
+        return {
+            "messages": [
+                {"role": "system", "content": system_prompt, "thinking": None},
+                {"role": "user", "content": prompt, "thinking": None},
+                {"role": "assistant", "content": content, "thinking": thinking},
+            ],
+            "system": system_prompt,
+            "prompt": prompt,
+            "thinking": thinking,
+            "response": content,
+            "model": model,
+            "provider": self.config.api.provider,
+            "usage": self._normalize_usage(usage),
+            "metadata": {
+                "trace_type": "chat",
+                "model_provider": self.config.api.provider,
+                "model": model,
+            },
+        }
+
+    def _resolve_output_path(self, file_name: str) -> Path:
+        destination = self.config.output.traces_dir / file_name
+        if not destination.exists():
+            return destination
+        stem = destination.stem
+        suffix = destination.suffix
+        counter = 1
+        while True:
+            candidate = destination.with_name(f"{stem}_{counter}{suffix}")
+            if not candidate.exists():
+                return candidate
+            counter += 1
+
+    def run_session(
+        self,
+        prompt: str,
+        session_id: str | None = None,
+        progress_callback: SessionProgressCallback | None = None,
+        progress_base: SessionProgressUpdate | None = None,
+        prompt_input: PromptInput | None = None,
+    ) -> Path:
+        if session_id is None:
+            session_id = str(uuid.uuid4())
+        if self.config.mcp_servers:
+            raise RuntimeError("Chat runner does not support mcp_servers.")
+        if prompt_input and prompt_input.github_repo:
+            raise RuntimeError("Chat runner does not support github_repo prompt inputs.")
+        destination = self._resolve_output_path(f"{session_id}.jsonl")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        training_row = self._request_chat_completion(prompt)
+        destination.write_text(json.dumps(training_row, ensure_ascii=False) + "\n", encoding="utf-8")
+        return destination
 
     def run_all(
         self,

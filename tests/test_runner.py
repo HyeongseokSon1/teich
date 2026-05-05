@@ -11,7 +11,7 @@ import pytest
 
 import teich.runner as runner_module
 from teich.config import APIConfig, Config, MCPConfig, ModelConfig, PromptInput
-from teich.runner import CodexRunner, PiRunner
+from teich.runner import ChatRunner, CodexRunner, PiRunner
 
 
 def test_codex_runner_init():
@@ -271,6 +271,37 @@ def test_summarize_trace_file_uses_pi_usage_payload(tmp_path: Path):
     assert metrics.total_tokens == 24
     assert metrics.est_total_tokens == 24
     assert metrics.total_cost == 0.5
+
+
+def test_summarize_trace_file_reads_structured_chat_usage(tmp_path: Path):
+    trace_file = tmp_path / "chat.jsonl"
+    trace_file.write_text(
+        json.dumps(
+            {
+                "messages": [
+                    {"role": "system", "content": "You are a helpful assistant", "thinking": None},
+                    {"role": "user", "content": "Hello", "thinking": None},
+                    {"role": "assistant", "content": "Hi!", "thinking": "I should greet the user."},
+                ],
+                "prompt": "Hello",
+                "response": "Hi!",
+                "model": "gpt-4.1-mini",
+                "provider": "openai",
+                "usage": {"prompt_tokens": 4, "completion_tokens": 3, "total_tokens": 7},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    metrics = CodexRunner._summarize_trace_file(trace_file)
+
+    assert metrics.provider == "openai"
+    assert metrics.model == "gpt-4.1-mini"
+    assert metrics.input_tokens == 4
+    assert metrics.output_tokens == 3
+    assert metrics.total_tokens == 7
+    assert metrics.est_total_tokens == 7
 
 
 def test_summarize_trace_file_prefers_codex_total_usage(tmp_path: Path):
@@ -774,6 +805,44 @@ def test_pi_runner_builds_command_and_project_settings(tmp_path: Path):
 
 def test_pi_runner_resolves_pi_executable_from_path():
     assert PiRunner._resolve_pi_executable() == "@mariozechner/pi-coding-agent"
+
+
+def test_chat_runner_writes_structured_dataset_row_from_responses_api(tmp_path: Path):
+    config = Config(
+        agent={"provider": "chat"},
+        model=ModelConfig(model="gpt-4.1-mini", reasoning_effort="medium"),
+        api=APIConfig(provider="openai", api_key="sk-test", wire_api="responses"),
+        output={"traces_dir": tmp_path / "output"},
+    )
+    runner = ChatRunner(config)
+
+    payload = {
+        "model": "gpt-4.1-mini",
+        "output": [
+            {"type": "reasoning", "summary": [{"text": "I should greet the user."}]},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Hi!"}]},
+        ],
+        "output_text": "Hi!",
+        "usage": {"input_tokens": 4, "output_tokens": 3, "total_tokens": 7},
+    }
+
+    response = MagicMock()
+    response.read.return_value = json.dumps(payload).encode("utf-8")
+    response.__enter__.return_value = response
+    response.__exit__.return_value = False
+
+    with patch("teich.runner.urlopen", return_value=response) as mock_urlopen:
+        result = runner.run_session("Hello", "chat-session")
+
+    assert result == tmp_path / "output" / "chat-session.jsonl"
+    row = json.loads(result.read_text(encoding="utf-8").strip())
+    assert row["prompt"] == "Hello"
+    assert row["response"] == "Hi!"
+    assert row["thinking"] == "I should greet the user."
+    assert row["messages"][2]["thinking"] == "I should greet the user."
+    assert row["usage"]["totalTokens"] == 7
+    request = mock_urlopen.call_args.args[0]
+    assert request.full_url == "https://api.openai.com/v1/responses"
 
 
 def test_pi_runner_init_uses_shared_runtime_image():

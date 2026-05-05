@@ -1,7 +1,7 @@
 # Teich configuration
 #
 # Quick start:
-# 1. Choose agent.provider: codex or pi
+# 1. Choose agent.provider: codex, pi, or chat
 # 2. Set model.model to the model you want to run
 # 3. Keep prompts in prompts.csv, or add inline prompts below
 # 4. Prefer TEICH_API_KEY / OPENAI_API_KEY in your environment for secrets
@@ -10,6 +10,7 @@
 agent:
   # codex = Codex CLI in Docker
   # pi = Pi coding agent in Docker
+  # chat = direct text-only dataset generation via an OpenAI-compatible API
   provider: codex
 
 model:
@@ -69,7 +70,9 @@ prompts_file: prompts.csv
 prompts: []
 
 output:
-  # Where normalized raw trace .jsonl files are written.
+  # Where generated .jsonl files are written.
+  # - codex / pi: raw normalized agent traces
+  # - chat: text-only training rows with messages/prompt/response/thinking fields
   traces_dir: ./output
 
   # Where Teich stores workspace snapshots for each run.
@@ -78,9 +81,13 @@ output:
   # Used in the generated trace README.
   pretty_name: "My Agent Traces"
   readme_file_name: README.md
-  tags:
-    - agent-traces
-    - codex
+
+# Optional direct upload to a Hugging Face dataset repo.
+# Tags are auto-generated from the provider and model.
+publish:
+  repo_id: null
+  hf_token: null
+  private: false
 
 # Number of prompts to run in parallel.
 max_concurrency: 1

@@ -93,8 +93,26 @@ class OutputConfig(BaseModel):
     traces_dir: Path = Field(default=Path("./output"))
     sandbox_dir: Path = Field(default=Path("./sandbox"))
     pretty_name: str = "Agentic Training Traces"
-    tags: list[str] = Field(default_factory=lambda: ["agent-traces", "codex"])
     readme_file_name: str = "README.md"
+
+
+class PublishConfig(BaseModel):
+    """Publishing configuration."""
+    repo_id: str | None = None
+    hf_token: str | None = None
+    private: bool = False
+
+    @field_validator("repo_id")
+    @classmethod
+    def validate_repo_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            return None
+        if not GITHUB_REPO_ID_PATTERN.fullmatch(normalized):
+            raise ValueError("publish.repo_id must be in owner/repo format, e.g. armand0e/my-dataset")
+        return normalized
 
 
 class PromptInput(BaseModel):
@@ -153,6 +171,7 @@ class Config(BaseModel):
     prompts: list[str] = Field(default_factory=list)
     prompts_file: Path | None = None
     output: OutputConfig = Field(default_factory=OutputConfig)
+    publish: PublishConfig = Field(default_factory=PublishConfig)
     max_concurrency: int = Field(default=1, ge=1)
     timeout_seconds: int = 600
     openai_api_key: str | None = None
@@ -216,6 +235,32 @@ class Config(BaseModel):
     def get_agent_provider(self) -> str:
         """Get active agent provider."""
         return self.agent.provider.strip().lower() or "codex"
+
+    def get_dataset_tags(self) -> list[str]:
+        """Get auto-generated dataset tags for README frontmatter and uploads."""
+        provider = self.get_agent_provider()
+        model_name = self.get_effective_model().strip() or "unknown-model"
+        if provider == "chat":
+            ordered_tags = ["conversational", "distillation", "teich", model_name]
+        else:
+            ordered_tags = ["agent-traces", provider, "distillation", model_name, "teich"]
+        tags: list[str] = []
+        seen: set[str] = set()
+        for tag in ordered_tags:
+            normalized = tag.strip() if isinstance(tag, str) else str(tag).strip()
+            if not normalized or normalized in seen:
+                continue
+            tags.append(normalized)
+            seen.add(normalized)
+        return tags
+
+    def get_publish_repo_id(self) -> str | None:
+        """Get the configured Hugging Face dataset repo id, if any."""
+        return self.publish.repo_id
+
+    def get_hf_token(self) -> str | None:
+        """Get effective Hugging Face token from config or common env vars."""
+        return self.publish.hf_token or _get_env_alias("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN", "TEICH_HF_TOKEN")
 
     def get_prompts(self) -> list[str]:
         """Get prompt text only for all configured prompt inputs."""

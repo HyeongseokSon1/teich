@@ -20,6 +20,7 @@ def test_default_config():
     assert config.timeout_seconds == 600
     assert config.mcp_servers == []
     assert config.prompts == []
+    assert config.get_dataset_tags() == ["agent-traces", "codex", "distillation", "codex-mini-latest", "teich"]
 
 
 def test_config_from_yaml(tmp_path: Path, monkeypatch):
@@ -49,9 +50,11 @@ output:
   traces_dir: ./traces
   sandbox_dir: ./sandboxes
   pretty_name: "Test Traces"
-  tags:
-    - test
-    - traces
+
+publish:
+  repo_id: armand0e/test-dataset
+  hf_token: hf-test123
+  private: true
 
 max_concurrency: 3
 timeout_seconds: 300
@@ -69,11 +72,19 @@ openai_api_key: sk-test123
     assert config.output.traces_dir == Path("./traces")
     assert config.output.sandbox_dir == Path("./sandboxes")
     assert config.output.pretty_name == "Test Traces"
-    assert config.output.tags == ["test", "traces"]
+    assert config.publish.repo_id == "armand0e/test-dataset"
+    assert config.publish.hf_token == "hf-test123"
+    assert config.publish.private is True
     assert config.max_concurrency == 3
     assert config.timeout_seconds == 300
     assert config.openai_api_key == "sk-test123"
     assert config.prompts == ["Build a todo app", "Create a python script"]
+
+
+def test_config_generates_chat_dataset_tags():
+    config = Config(agent={"provider": "chat"}, model=ModelConfig(model="gpt-4.1-mini"))
+
+    assert config.get_dataset_tags() == ["conversational", "distillation", "teich", "gpt-4.1-mini"]
 
 
 def test_config_prompts_file(tmp_path: Path):

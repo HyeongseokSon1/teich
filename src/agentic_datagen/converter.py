@@ -633,15 +633,151 @@ def _convert_pi_trace_to_training_example(
     )
 
 
+def _is_structured_training_row(value: Any) -> bool:
+    return isinstance(value, dict) and isinstance(value.get("messages"), list)
+
+
+def _normalize_training_message(message: Any) -> dict[str, Any] | None:
+    if not isinstance(message, dict):
+        return None
+    role = message.get("role")
+    if not isinstance(role, str) or not role.strip():
+        return None
+    normalized_role = _normalize_role(role.strip())
+    normalized: dict[str, Any] = {
+        "role": normalized_role,
+        "content": message.get("content") if isinstance(message.get("content"), str) else str(message.get("content") or ""),
+    }
+    if normalized_role == "assistant":
+        reasoning_content = message.get("reasoning_content")
+        if not isinstance(reasoning_content, str) or not reasoning_content.strip():
+            thinking = message.get("thinking")
+            if isinstance(thinking, str) and thinking.strip():
+                reasoning_content = thinking.strip()
+        if isinstance(reasoning_content, str) and reasoning_content.strip():
+            normalized["reasoning_content"] = reasoning_content.strip()
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list) and tool_calls:
+            normalized["tool_calls"] = tool_calls
+    if normalized_role == "tool":
+        tool_call_id = message.get("tool_call_id")
+        if isinstance(tool_call_id, str) and tool_call_id:
+            normalized["tool_call_id"] = tool_call_id
+        tool_name = message.get("name")
+        if isinstance(tool_name, str) and tool_name:
+            normalized["name"] = tool_name
+        if message.get("is_error") is True:
+            normalized["is_error"] = True
+    return normalized
+
+
+def _prompt_from_messages(messages: list[dict[str, Any]]) -> str:
+    return next(
+        (
+            message.get("content", "")
+            for message in messages
+            if message.get("role") == "user" and isinstance(message.get("content"), str)
+        ),
+        "",
+    )
+
+
+def _structured_training_example_from_row(
+    source_file: Path,
+    row: dict[str, Any],
+    row_index: int,
+) -> TrainingExample:
+    messages = [
+        normalized_message
+        for normalized_message in (_normalize_training_message(message) for message in row.get("messages") or [])
+        if normalized_message is not None
+    ]
+    if not messages:
+        system = row.get("system")
+        if isinstance(system, str) and system.strip():
+            messages.append({"role": "system", "content": system.strip()})
+        prompt = row.get("prompt")
+        if isinstance(prompt, str) and prompt.strip():
+            messages.append({"role": "user", "content": prompt.strip()})
+        response = row.get("response") if isinstance(row.get("response"), str) else ""
+        assistant_message: dict[str, Any] = {"role": "assistant", "content": response}
+        thinking = row.get("thinking")
+        if isinstance(thinking, str) and thinking.strip():
+            assistant_message["reasoning_content"] = thinking.strip()
+        if assistant_message["content"] or "reasoning_content" in assistant_message:
+            messages.append(assistant_message)
+    tools = row.get("tools") if isinstance(row.get("tools"), list) else []
+    prompt = row.get("prompt") if isinstance(row.get("prompt"), str) else _prompt_from_messages(messages)
+    metadata = dict(row.get("metadata")) if isinstance(row.get("metadata"), dict) else {}
+    if isinstance(row.get("model"), str) and row.get("model"):
+        metadata.setdefault("model", row["model"])
+    if isinstance(row.get("usage"), dict) and row.get("usage"):
+        metadata.setdefault("usage", row["usage"])
+    metadata.setdefault("source_file", source_file.name)
+    metadata.setdefault("source_line", row_index)
+    metadata.setdefault(
+        "trace_type",
+        "chat" if any(key in row for key in ("system", "thinking", "response", "model")) and not tools else "structured",
+    )
+    return TrainingExample(
+        source_file=source_file,
+        prompt=prompt,
+        messages=messages,
+        tools=tools,
+        metadata=metadata,
+    )
+
+
+def load_trace_file(trace_file: Path) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    with trace_file.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line:
+                continue
+            events.append(json.loads(line))
+    return events
+
+
 def convert_trace_to_training_example(trace_file: Path) -> TrainingExample:
     events = load_trace_file(trace_file)
+    if events and all(_is_structured_training_row(event) for event in events):
+        if len(events) != 1:
+            raise ValueError(
+                f"Structured training data file {trace_file} contains {len(events)} rows; use convert_traces_to_training_data or load_traces instead."
+            )
+        return _structured_training_example_from_row(trace_file, events[0], 1)
     trace_type = _detect_trace_type(events)
     if trace_type == "pi":
         return _convert_pi_trace_to_training_example(trace_file, events)
     return _convert_codex_trace_to_training_example(trace_file, events)
 
 
+def _jsonl_files(source: Path) -> list[Path]:
+    if source.is_file():
+        return [source]
+    return sorted(path for path in source.glob("*.jsonl") if path.is_file())
+
+
+def _convert_jsonl_file_to_training_rows(jsonl_file: Path) -> list[dict[str, Any]]:
+    rows = load_trace_file(jsonl_file)
+    if not rows:
+        return []
+    if all(_is_structured_training_row(row) for row in rows):
+        return [
+            _structured_training_example_from_row(jsonl_file, row, row_index).to_dict()
+            for row_index, row in enumerate(rows, start=1)
+        ]
+    trace_type = _detect_trace_type(rows)
+    if trace_type == "pi":
+        return [_convert_pi_trace_to_training_example(jsonl_file, rows).to_dict()]
+    return [_convert_codex_trace_to_training_example(jsonl_file, rows).to_dict()]
+
+
 def convert_traces_to_training_data(traces_dir: Path | str) -> list[dict[str, Any]]:
-    directory = Path(traces_dir)
-    trace_files = sorted(path for path in directory.glob("*.jsonl") if path.is_file())
-    return [convert_trace_to_training_example(path).to_dict() for path in trace_files]
+    source = Path(traces_dir)
+    trace_files = _jsonl_files(source)
+    rows: list[dict[str, Any]] = []
+    for path in trace_files:
+        rows.extend(_convert_jsonl_file_to_training_rows(path))
+    return rows

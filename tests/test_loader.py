@@ -138,6 +138,45 @@ def test_load_traces_supports_mixed_nested_tool_argument_types(tmp_path: Path):
     assert tool_calls[1]["function"]["arguments"]["content"] == [{"type": "text", "text": "structured"}]
 
 
+def test_load_traces_loads_structured_chat_dataset_file(tmp_path: Path):
+    dataset_file = tmp_path / "chat.jsonl"
+    dataset_file.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "messages": [
+                            {"role": "system", "content": "You are a helpful assistant", "thinking": None},
+                            {"role": "user", "content": "Hello", "thinking": None},
+                            {"role": "assistant", "content": "Hi!", "thinking": "I should greet the user."},
+                        ],
+                        "system": "You are a helpful assistant",
+                        "prompt": "Hello",
+                        "thinking": "I should greet the user.",
+                        "response": "Hi!",
+                        "model": "gpt-4.1-mini",
+                        "usage": {"prompt_tokens": 4, "completion_tokens": 3, "total_tokens": 7},
+                    }
+                )
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    dataset = load_traces(dataset_file)
+
+    assert dataset.num_rows == 1
+    row = dataset[0]
+    assert row["prompt"] == "Hello"
+    assert row["messages"][2]["role"] == "assistant"
+    assert row["messages"][2]["reasoning_content"] == "I should greet the user."
+    assert row["tools"] == []
+    assert row["metadata"]["trace_type"] == "chat"
+    assert row["metadata"]["model"] == "gpt-4.1-mini"
+    assert row["metadata"]["usage"]["prompt_tokens"] == 4
+
+
 def test_dataset_from_rows_falls_back_when_on_mixed_types_is_unsupported():
     rows = [
         {

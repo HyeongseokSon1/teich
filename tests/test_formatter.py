@@ -398,6 +398,60 @@ def test_format_and_mask_returns_compact_training_columns_by_default():
     assert len(row["input_ids"]) == len(row["attention_mask"]) == len(row["labels"])
 
 
+def test_format_and_mask_accepts_multiple_datasets_and_concatenates_them():
+    tokenizer = FakeTokenizer()
+    tool_dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "use tool"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": "inspect",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "bash", "arguments": {"command": "ls"}},
+                            }
+                        ],
+                    },
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+                        },
+                    }
+                ],
+                "metadata": {"trace_type": "codex"},
+            }
+        ]
+    )
+    chat_dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "system", "content": "You are helpful"},
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "world", "reasoning_content": "be friendly"},
+                ],
+                "tools": [],
+                "metadata": {"trace_type": "chat"},
+            }
+        ]
+    )
+
+    training_data = format_and_mask([tool_dataset, chat_dataset], tokenizer, include_debug_columns=True)
+
+    assert training_data.num_rows == 2
+    assert "<tool_call>bash</tool_call>" in training_data[0]["text"]
+    assert "<assistant><think>be friendly</think>world</assistant>" in training_data[1]["text"]
+
+
 def test_format_and_mask_passes_chat_template_kwargs_and_preview_marks_unsupervised_text_red():
     tokenizer = FakeTokenizer()
     dataset = Dataset.from_list(

@@ -7,21 +7,42 @@ from pathlib import Path
 from threading import RLock
 
 import typer
+from huggingface_hub import HfApi
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 
 from .config import Config
-from .runner import CodexRunner, PiRunner, SessionProgressUpdate, TraceMetrics
+from .runner import ChatRunner, CodexRunner, PiRunner, SessionProgressUpdate, TraceMetrics
 from .trace_readme import write_traces_readme
 
 console = Console()
 app = typer.Typer(
     name="teich",
-    help="Generate agent training data using Codex or Pi",
+    help="Generate agent training data using Codex, Pi, or chat",
     no_args_is_help=True,
 )
+
+
+def _publish_dataset_to_hub(cfg: Config) -> str:
+    repo_id = cfg.get_publish_repo_id()
+    if not repo_id:
+        raise ValueError("No publish.repo_id configured")
+    api = HfApi(token=cfg.get_hf_token())
+    repo_url = api.create_repo(
+        repo_id=repo_id,
+        repo_type="dataset",
+        private=cfg.publish.private,
+        exist_ok=True,
+    )
+    api.upload_folder(
+        folder_path=str(cfg.output.traces_dir),
+        repo_id=repo_id,
+        repo_type="dataset",
+        commit_message="Upload teich dataset output",
+    )
+    return str(repo_url)
 
 
 @app.command()
@@ -79,9 +100,11 @@ def generate(
             runner = CodexRunner(cfg)
         elif agent_provider == "pi":
             runner = PiRunner(cfg)
+        elif agent_provider == "chat":
+            runner = ChatRunner(cfg)
         else:
             console.print(
-                f"[red]Unsupported agent provider: {agent_provider}. Supported providers: codex, pi.[/red]"
+                f"[red]Unsupported agent provider: {agent_provider}. Supported providers: codex, pi, chat.[/red]"
             )
             raise typer.Exit(1)
 
@@ -90,16 +113,17 @@ def generate(
                 max_concurrency=cfg.max_concurrency,
                 progress_callback=reporter.update,
             )
+        dataset_tags = cfg.get_dataset_tags()
         readme_path = write_traces_readme(
             cfg.output.traces_dir,
             pretty_name=cfg.output.pretty_name,
-            tags=cfg.output.tags,
+            tags=dataset_tags,
             model_id=cfg.model.model,
             readme_file_name=cfg.output.readme_file_name,
         )
         totals = reporter.snapshot_totals()
 
-        console.print(f"\n[bold green]Success! Generated {len(results)} trace files:[/bold green]")
+        console.print(f"\n[bold green]Success! Generated {len(results)} JSONL files:[/bold green]")
         for r in results:
             console.print(f"  - {r}")
         console.print(
@@ -109,8 +133,12 @@ def generate(
             f"cache_read={totals['cache_read_tokens']}"
         )
         console.print(f"[cyan]API cost:[/cyan] ${totals['total_cost']:.6f}")
-        console.print(f"[green]Saved sandboxes: {cfg.output.sandbox_dir}[/green]")
+        if agent_provider != "chat":
+            console.print(f"[green]Saved sandboxes: {cfg.output.sandbox_dir}[/green]")
         console.print(f"\n[green]Wrote README: {readme_path}[/green]")
+        if cfg.get_publish_repo_id():
+            repo_url = _publish_dataset_to_hub(cfg)
+            console.print(f"[green]Published dataset: {repo_url}[/green]")
 
     except Exception as e:
         console.print(f"\n[red]Error: {e}[/red]")
@@ -280,7 +308,7 @@ def init(
 CONFIG_TEMPLATE = '''# Teich configuration
 #
 # Quick start:
-# 1. Choose agent.provider: codex or pi
+# 1. Choose agent.provider: codex, pi, or chat
 # 2. Set model.model to the model you want to run
 # 3. Keep prompts in prompts.csv, or add inline prompts below
 # 4. Prefer TEICH_API_KEY / OPENAI_API_KEY in your environment for secrets
@@ -289,6 +317,7 @@ CONFIG_TEMPLATE = '''# Teich configuration
 agent:
   # codex = Codex CLI in Docker
   # pi = Pi coding agent in Docker
+  # chat = direct text-only dataset generation via an OpenAI-compatible API
   provider: codex
 
 model:
@@ -348,7 +377,9 @@ prompts_file: prompts.csv
 prompts: []
 
 output:
-  # Where normalized raw trace .jsonl files are written.
+  # Where generated .jsonl files are written.
+  # - codex / pi: raw normalized agent traces
+  # - chat: text-only training rows with messages/prompt/response/thinking fields
   traces_dir: ./output
 
   # Where Teich stores workspace snapshots for each run.
@@ -357,9 +388,13 @@ output:
   # Used in the generated trace README.
   pretty_name: "My Agent Traces"
   readme_file_name: README.md
-  tags:
-    - agent-traces
-    - codex
+
+# Optional direct upload to a Hugging Face dataset repo.
+# Tags are auto-generated from the provider and model.
+publish:
+  repo_id: null
+  hf_token: null
+  private: false
 
 # Number of prompts to run in parallel.
 max_concurrency: 1

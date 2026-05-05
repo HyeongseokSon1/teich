@@ -56,11 +56,11 @@ def load_traces(
                 allow_patterns=["*.jsonl", "**/*.jsonl"],
             )
         )
-    traces_dir = _trace_directory(root, split)
+    traces_dir = root if root.is_file() else _trace_directory(root, split)
     rows = convert_traces_to_training_data(traces_dir)
     if not rows:
         location = traces_dir if traces_dir != root else root
-        if split and traces_dir == root:
+        if split and traces_dir == root and root.is_dir():
             raise ValueError(f"No trace files found in {location} for split '{split}'.")
-        raise ValueError(f"No trace files found in {location}.")
+        raise ValueError(f"No JSONL trace or training data files found in {location}.")
     return _dataset_from_rows(rows)

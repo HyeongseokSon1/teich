@@ -4,9 +4,10 @@ from copy import deepcopy
 from difflib import SequenceMatcher
 import json
 import re
+from collections.abc import Sequence
 from typing import Any
 
-from datasets import Dataset
+from datasets import Dataset, concatenate_datasets
 from rich.console import Console
 from rich.table import Table
 
@@ -888,7 +889,7 @@ def _build_preview(text_tokenizer: Any, input_ids: list[int], labels: list[int])
 
 
 def format_and_mask(
-    dataset: Dataset,
+    dataset: Dataset | Sequence[Dataset],
     tokenizer: Any,
     *,
     messages_column: str = "messages",
@@ -898,6 +899,33 @@ def format_and_mask(
     include_debug_columns: bool = False,
     drop_oversized_examples: bool = True,
 ) -> Dataset:
+    if isinstance(dataset, Sequence) and not isinstance(dataset, Dataset):
+        datasets = list(dataset)
+        if not datasets:
+            raise ValueError("At least one dataset must be provided to format_and_mask.")
+        if len(datasets) > 1:
+            formatted_datasets: list[Dataset] = []
+            for item in datasets:
+                if not isinstance(item, Dataset):
+                    raise TypeError("format_and_mask expects a Dataset or a sequence of Dataset objects.")
+                formatted_datasets.append(
+                    format_and_mask(
+                        item,
+                        tokenizer,
+                        messages_column=messages_column,
+                        tools_column=tools_column,
+                        chat_template_kwargs=chat_template_kwargs,
+                        max_length=max_length,
+                        include_debug_columns=include_debug_columns,
+                        drop_oversized_examples=drop_oversized_examples,
+                    )
+                )
+            return concatenate_datasets(formatted_datasets)
+        else:
+            dataset = datasets[0]
+    if not isinstance(dataset, Dataset):
+        raise TypeError("format_and_mask expects a Dataset or a sequence of Dataset objects.")
+
     template_kwargs = _validate_chat_template_kwargs(chat_template_kwargs)
     text_tokenizer = _resolve_text_tokenizer(tokenizer)
     renderer = _resolve_chat_template_renderer(tokenizer, text_tokenizer)
