@@ -40,7 +40,10 @@ def load_traces(
     token: str | None = None,
     cache_dir: str | Path | None = None,
     local_dir: str | Path | None = None,
+    max_examples: int | None = None,
 ) -> Dataset:
+    if max_examples is not None and max_examples < 0:
+        raise ValueError("max_examples must be non-negative.")
     source_path = Path(source)
     if source_path.exists():
         root = source_path
@@ -63,4 +66,9 @@ def load_traces(
         if split and traces_dir == root and root.is_dir():
             raise ValueError(f"No trace files found in {location} for split '{split}'.")
         raise ValueError(f"No JSONL trace or training data files found in {location}.")
-    return _dataset_from_rows(rows)
+    dataset = _dataset_from_rows(rows)
+    if max_examples is not None:
+        dataset = dataset.shuffle(seed=3407)
+        limit = min(max_examples, dataset.num_rows)
+        dataset = dataset.select(range(limit))
+    return dataset

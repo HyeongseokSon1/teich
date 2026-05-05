@@ -138,6 +138,26 @@ def test_load_traces_supports_mixed_nested_tool_argument_types(tmp_path: Path):
     assert tool_calls[1]["function"]["arguments"]["content"] == [{"type": "text", "text": "structured"}]
 
 
+def test_load_traces_max_examples_shuffles_trace_rows_deterministically(tmp_path: Path):
+    train_dir = tmp_path / "train"
+    train_dir.mkdir(parents=True)
+    for index in range(4):
+        _write_codex_trace(train_dir / f"trace-{index}.jsonl", prompt=f"Prompt {index}")
+
+    full_dataset = load_traces(tmp_path, split="train")
+    limited_a = load_traces(tmp_path, split="train", max_examples=2)
+    limited_b = load_traces(tmp_path, split="train", max_examples=2)
+    expected = full_dataset.shuffle(seed=3407).select(range(2))
+
+    limited_prompts_a = [row["prompt"] for row in limited_a]
+    limited_prompts_b = [row["prompt"] for row in limited_b]
+    expected_prompts = [row["prompt"] for row in expected]
+
+    assert limited_a.num_rows == 2
+    assert limited_prompts_a == limited_prompts_b
+    assert limited_prompts_a == expected_prompts
+
+
 def test_load_traces_loads_structured_chat_dataset_file(tmp_path: Path):
     dataset_file = tmp_path / "chat.jsonl"
     dataset_file.write_text(
@@ -175,6 +195,49 @@ def test_load_traces_loads_structured_chat_dataset_file(tmp_path: Path):
     assert row["metadata"]["trace_type"] == "chat"
     assert row["metadata"]["model"] == "gpt-4.1-mini"
     assert row["metadata"]["usage"]["prompt_tokens"] == 4
+
+
+def test_load_traces_max_examples_shuffles_structured_rows_deterministically(tmp_path: Path):
+    dataset_file = tmp_path / "chat.jsonl"
+    dataset_file.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "messages": [
+                        {"role": "system", "content": "You are a helpful assistant", "thinking": None},
+                        {"role": "user", "content": f"Hello {index}", "thinking": None},
+                        {"role": "assistant", "content": f"Hi {index}!", "thinking": f"Greet user {index}."},
+                    ],
+                    "system": "You are a helpful assistant",
+                    "prompt": f"Hello {index}",
+                    "thinking": f"Greet user {index}.",
+                    "response": f"Hi {index}!",
+                    "model": "gpt-4.1-mini",
+                }
+            )
+            for index in range(5)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    full_dataset = load_traces(dataset_file)
+    limited_a = load_traces(dataset_file, max_examples=3)
+    limited_b = load_traces(dataset_file, max_examples=3)
+    expected = full_dataset.shuffle(seed=3407).select(range(3))
+
+    limited_prompts_a = [row["prompt"] for row in limited_a]
+    limited_prompts_b = [row["prompt"] for row in limited_b]
+    expected_prompts = [row["prompt"] for row in expected]
+
+    assert limited_a.num_rows == 3
+    assert limited_prompts_a == limited_prompts_b
+    assert limited_prompts_a == expected_prompts
+
+
+def test_load_traces_rejects_negative_max_examples(tmp_path: Path):
+    with pytest.raises(ValueError, match="max_examples must be non-negative"):
+        load_traces(tmp_path, split="train", max_examples=-1)
 
 
 def test_dataset_from_rows_falls_back_when_on_mixed_types_is_unsupported():
