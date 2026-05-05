@@ -33,11 +33,7 @@ uvx teich generate -c config.yaml
 - **SFT-ready formatting**: Applies chat templates and creates assistant masks for supervised fine-tuning
 - **Hugging Face integration**: Load raw traces or structured JSONL datasets from local folders, files, or dataset repos
 
-## 📥 Install
-
-```bash
-pip install teich
-```
+## 📥 Prerequisites
 
 Requirements for agent trace generation:
 
