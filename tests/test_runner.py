@@ -42,7 +42,7 @@ def test_runtime_image_rebuilds_when_dockerfile_is_newer(tmp_path: Path):
 
 
 def test_runtime_dockerfile_path_prefers_packaged_file(tmp_path: Path):
-    package_dir = tmp_path / "site-packages" / "agentic_datagen"
+    package_dir = tmp_path / "site-packages" / "teich"
     package_dir.mkdir(parents=True)
     packaged_dockerfile = package_dir / "docker" / "codex-runtime.Dockerfile"
     packaged_dockerfile.parent.mkdir(parents=True)

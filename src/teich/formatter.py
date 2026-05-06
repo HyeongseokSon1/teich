@@ -17,6 +17,24 @@ _GEMMA_ASSISTANT_TURN_PREFIX = "<|turn>model\n"
 _GEMMA_THOUGHT_PREFIX = "<|channel>thought\n"
 _GEMMA_TOOL_RESPONSE_START = "<|tool_response>"
 _GEMMA_TOOL_RESPONSE_END = "<tool_response|>"
+_ASSISTANT_BLOCK_START_TOKENS = (
+    "<|im_start|>assistant\n",
+    "<|assistant|>\n",
+    "<|assistant|>",
+    "<assistant>",
+    "<|start_of_role|>assistant<|end_of_role|>",
+)
+_ASSISTANT_BLOCK_END_TOKENS = (
+    "<|im_end|>",
+    "</assistant>",
+    "</s>",
+    "<|end_of_text|>",
+)
+_REASONING_BLOCK_PATTERNS = (
+    re.compile(r"<think>\n.*?</think>\n\n?", re.DOTALL),
+    re.compile(r"<think>.*?</think>", re.DOTALL),
+    re.compile(r"<\|channel>thought\n.*?<channel\|>", re.DOTALL),
+)
 _FORMAT_AND_MASK_BATCH_SIZE = 8
 
 
@@ -287,8 +305,6 @@ def _gemma_like_supervised_spans(text: str) -> list[tuple[int, int]]:
         block_start = match.start()
         block_end = turn_matches[index + 1].start() if index + 1 < len(turn_matches) else len(text)
         supervised_start = block_start + len(_GEMMA_ASSISTANT_TURN_PREFIX)
-        if text.startswith(_GEMMA_THOUGHT_PREFIX, supervised_start):
-            supervised_start += len(_GEMMA_THOUGHT_PREFIX)
         if supervised_start < block_end:
             supervised_spans.append((supervised_start, block_end))
     return _subtract_spans(supervised_spans, tool_response_spans)
@@ -300,6 +316,7 @@ def _gemma_mask_row(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]],
     chat_template_kwargs: dict[str, Any],
+    train_on_reasoning: bool,
     max_length: int | None,
     include_debug_columns: bool,
 ) -> dict[str, Any] | None:
@@ -311,6 +328,10 @@ def _gemma_mask_row(
     supervised_spans = _gemma_like_supervised_spans(formatted_text)
     if not supervised_spans:
         return None
+    if not train_on_reasoning:
+        supervised_spans = _subtract_spans(supervised_spans, _reasoning_spans(formatted_text))
+        if not supervised_spans:
+            return None
     encoded = _tokenize_text_with_offsets(text_tokenizer, formatted_text)
     if encoded is None:
         return None
@@ -444,7 +465,11 @@ def _wrap_with_markers(value: Any, start_marker: str, end_marker: str) -> tuple[
     return updated_value, True
 
 
-def _mark_supervised_messages(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
+def _mark_supervised_messages(
+    messages: list[dict[str, Any]],
+    *,
+    train_on_reasoning: bool,
+) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
     marked_messages = deepcopy(messages)
     markers: list[tuple[str, str]] = []
     marker_index = 0
@@ -462,10 +487,11 @@ def _mark_supervised_messages(messages: list[dict[str, Any]]) -> tuple[list[dict
     for message in marked_messages:
         if not _is_assistant_message(message):
             continue
-        reasoning = message.get("reasoning_content")
-        updated_reasoning, changed = mark_value(reasoning)
-        if changed:
-            message["reasoning_content"] = updated_reasoning
+        if train_on_reasoning:
+            reasoning = message.get("reasoning_content")
+            updated_reasoning, changed = mark_value(reasoning)
+            if changed:
+                message["reasoning_content"] = updated_reasoning
         tool_calls = message.get("tool_calls") or []
         for tool_call in tool_calls:
             function = tool_call.get("function")
@@ -541,6 +567,13 @@ def _merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
         else:
             merged_spans.append((start, end))
     return merged_spans
+
+
+def _reasoning_spans(text: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    for pattern in _REASONING_BLOCK_PATTERNS:
+        spans.extend((match.start(), match.end()) for match in pattern.finditer(text))
+    return _merge_spans(spans)
 
 
 def _assistant_prompt_probe_contexts(messages: list[dict[str, Any]]) -> tuple[str, ...]:
@@ -632,26 +665,15 @@ def _resolve_assistant_prompt_prefixes(
 
 
 def _assistant_block_bounds(text: str, start: int, end: int) -> tuple[int, int] | None:
-    assistant_start_tokens = (
-        "<|im_start|>assistant\n",
-        "<|assistant|>\n",
-        "<|assistant|>",
-        "<assistant>",
-    )
-    assistant_end_tokens = (
-        "<|im_end|>",
-        "</assistant>",
-        "</s>",
-    )
     block_start = -1
-    for token in assistant_start_tokens:
+    for token in _ASSISTANT_BLOCK_START_TOKENS:
         token_start = text.rfind(token, 0, start)
         if token_start > block_start:
             block_start = token_start
     if block_start < 0:
         return None
     block_end = -1
-    for token in assistant_end_tokens:
+    for token in _ASSISTANT_BLOCK_END_TOKENS:
         token_end_start = text.find(token, end)
         if token_end_start >= 0 and (block_end < 0 or token_end_start < block_end):
             block_end = token_end_start + len(token)
@@ -666,6 +688,7 @@ def _expand_supervised_spans(
     text: str,
     supervised_spans: list[tuple[int, int]],
     assistant_prompt_prefixes: tuple[str, ...],
+    train_on_reasoning: bool,
 ) -> list[tuple[int, int]]:
     expanded_spans: list[tuple[int, int]] = []
     for start, end in supervised_spans:
@@ -679,10 +702,14 @@ def _expand_supervised_spans(
             continue
         block_text = text[block_start:block_end]
         matched_prefix = next((prefix for prefix in assistant_prompt_prefixes if block_text.startswith(prefix)), None)
-        if matched_prefix is None:
-            expanded_spans.append((start, end))
+        fallback_prefix = next((prefix for prefix in _ASSISTANT_BLOCK_START_TOKENS if block_text.startswith(prefix)), None)
+        if matched_prefix is not None:
+            expanded_spans.append((block_start + len(matched_prefix), block_end))
             continue
-        expanded_spans.append((block_start + len(matched_prefix), block_end))
+        if fallback_prefix is not None:
+            expanded_spans.append((block_start + len(fallback_prefix), block_end))
+            continue
+        expanded_spans.append((start, end))
     return _merge_spans(expanded_spans)
 
 
@@ -715,6 +742,7 @@ def _offset_mask_row(
     tools: list[dict[str, Any]],
     chat_template_kwargs: dict[str, Any],
     assistant_prompt_prefix_cache: dict[str, tuple[str, ...]],
+    train_on_reasoning: bool,
     max_length: int | None,
     include_debug_columns: bool,
 ) -> dict[str, Any] | None:
@@ -727,13 +755,22 @@ def _offset_mask_row(
         chat_template_kwargs,
         assistant_prompt_prefix_cache,
     )
-    marked_messages, markers = _mark_supervised_messages(messages)
+    marked_messages, markers = _mark_supervised_messages(messages, train_on_reasoning=train_on_reasoning)
     marked_text = _render_chat(renderer, marked_messages, tools, chat_template_kwargs)
     stripped = _strip_markers_and_collect_spans(marked_text, markers)
     if stripped is None:
         return None
     formatted_text, supervised_spans = stripped
-    supervised_spans = _expand_supervised_spans(formatted_text, supervised_spans, assistant_prompt_prefixes)
+    supervised_spans = _expand_supervised_spans(
+        formatted_text,
+        supervised_spans,
+        assistant_prompt_prefixes,
+        train_on_reasoning,
+    )
+    if not train_on_reasoning:
+        supervised_spans = _subtract_spans(supervised_spans, _reasoning_spans(formatted_text))
+        if not supervised_spans:
+            return None
     encoded = _tokenize_text_with_offsets(text_tokenizer, formatted_text)
     if encoded is None:
         return None
@@ -764,6 +801,7 @@ def _mask_row(
     tools_column: str,
     chat_template_kwargs: dict[str, Any],
     assistant_prompt_prefix_cache: dict[str, tuple[str, ...]],
+    train_on_reasoning: bool,
     max_length: int | None,
     include_debug_columns: bool,
 ) -> dict[str, Any]:
@@ -774,17 +812,18 @@ def _mask_row(
     if not isinstance(tools, list):
         raise TypeError(f"Row is missing a list-valued '{tools_column}' column")
 
-    fast_path = _fast_mask_row(
-        renderer,
-        text_tokenizer,
-        messages,
-        tools,
-        chat_template_kwargs,
-        max_length,
-        include_debug_columns,
-    )
-    if fast_path is not None:
-        return fast_path
+    if train_on_reasoning:
+        fast_path = _fast_mask_row(
+            renderer,
+            text_tokenizer,
+            messages,
+            tools,
+            chat_template_kwargs,
+            max_length,
+            include_debug_columns,
+        )
+        if fast_path is not None:
+            return fast_path
 
     gemma_path = _gemma_mask_row(
         renderer,
@@ -792,6 +831,7 @@ def _mask_row(
         messages,
         tools,
         chat_template_kwargs,
+        train_on_reasoning,
         max_length,
         include_debug_columns,
     )
@@ -805,6 +845,7 @@ def _mask_row(
         tools,
         chat_template_kwargs,
         assistant_prompt_prefix_cache,
+        train_on_reasoning,
         max_length,
         include_debug_columns,
     )
@@ -908,6 +949,7 @@ def format_and_mask(
     messages_column: str = "messages",
     tools_column: str = "tools",
     chat_template_kwargs: dict[str, Any] | None = None,
+    train_on_reasoning: bool = True,
     max_length: int | None = None,
     include_debug_columns: bool = False,
     drop_oversized_examples: bool = True,
@@ -929,6 +971,7 @@ def format_and_mask(
                         messages_column=messages_column,
                         tools_column=tools_column,
                         chat_template_kwargs=chat_template_kwargs,
+                        train_on_reasoning=train_on_reasoning,
                         max_length=max_length,
                         include_debug_columns=include_debug_columns,
                         drop_oversized_examples=drop_oversized_examples,
@@ -992,6 +1035,7 @@ def format_and_mask(
                 tools_column,
                 template_kwargs,
                 assistant_prompt_prefix_cache,
+                train_on_reasoning,
                 None if drop_oversized_examples else effective_max_length,
                 include_debug_columns,
             )

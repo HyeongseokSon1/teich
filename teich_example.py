@@ -1,11 +1,25 @@
 # -*- coding: utf-8 -*-
+import os
+from pathlib import Path
+import sys
+
 from unsloth import FastLanguageModel
 import torch
 
-MAX_SEQ_LEN = 65536
+ROOT = Path(__file__).resolve().parent
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+MAX_SEQ_LEN = 32768
+MODEL_NAME = "Qwen/Qwen3.5-9B"
+TRAIN_ON_REASONING = True
+CHAT_TEMPLATE_KWARGS = {"enable_thinking": True, "preserve_thinking": True}
+PUSH_TO_HUB_REPO_ID = "armand0e/traces-test"
+HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN") or os.environ.get("TEICH_HF_TOKEN")
 
 model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name = "Qwen/Qwen3.5-4B",
+    model_name = MODEL_NAME,
     max_seq_length = MAX_SEQ_LEN, # Choose any for long context!
     load_in_4bit = False,  # 4 bit quantization to reduce memory
     load_in_8bit = False, # [NEW!] A bit more accurate, uses 2x memory
@@ -31,8 +45,8 @@ model = FastLanguageModel.get_peft_model(
 
 from teich import format_and_mask, load_traces
 datasets = [
-    load_traces("armand0e/ag-datagen-v2-test", split = "train"),
-    load_traces("./output"),
+    load_traces("armand0e/teich-test", split = "train"),
+    load_traces("TeichAI/lordx64-claude-opus-4.7-max-cleaned", split = "train", max_examples = 500),
 ]
 #dataset = dataset.filter(lambda row: isinstance(row["messages"], list) and len(row["messages"]) > 0)
 
@@ -40,7 +54,8 @@ datasets = [
 training_data = format_and_mask(
     datasets,
     tokenizer,
-    chat_template_kwargs = {"enable_thinking": True, "preserve_thinking": True},
+    chat_template_kwargs = CHAT_TEMPLATE_KWARGS,
+    train_on_reasoning = TRAIN_ON_REASONING,
     max_length = MAX_SEQ_LEN,
 )
 
@@ -55,9 +70,9 @@ trainer = SFTTrainer(
         dataset_kwargs = {"skip_prepare_dataset": True},
         dataset_num_proc = 1, # Increasing "might" throw error on Colab/other envs.
         per_device_train_batch_size = 1,
-        gradient_accumulation_steps = 4, # Use GA to mimic batch size!
+        gradient_accumulation_steps = 16, # Use GA to mimic batch size!
         warmup_steps = 5,
-        num_train_epochs = 3, # Set this for 1 full training run.
+        num_train_epochs = 2, # Set this for 1 full training run.
         learning_rate = 2e-5, # Reduce to 2e-5 for long training runs
         logging_steps = 1,
         optim = "adamw_8bit",
@@ -98,4 +113,4 @@ print(f"Peak reserved memory for training = {used_memory_for_lora} GB.")
 print(f"Peak reserved memory % of max memory = {used_percentage} %.")
 print(f"Peak reserved memory for training % of max memory = {lora_percentage} %.")
 
-model.push_to_hub_merged("armand0e/traces-test", tokenizer, save_method = "merged_16bit", token = "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")
+model.push_to_hub_merged(PUSH_TO_HUB_REPO_ID, tokenizer, save_method = "merged_16bit", token = HF_TOKEN)

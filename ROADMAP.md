@@ -123,6 +123,14 @@ Since Codex CLI behavior varies by provider, keep exploring alternatives:
 - [ ] Google Gemini runner
 - [ ] Ollama/local model runner beyond Codex OSS mode
 
+### 4.3 Chat Template Masking Coverage
+- [ ] Audit tokenizer-only masking coverage for Qwen 3.5 family chat templates
+- [ ] Audit tokenizer-only masking coverage for Qwen 3.6 family chat templates
+- [ ] Audit Qwen 3 hybrid chat templates, including non-2507 dense and A3B variants
+- [ ] Audit Qwen 3 2507 instruct and thinking chat templates
+- [ ] Audit Gemma 4 tokenizer/template differences, especially `gemma-4-E2B-it` and `gemma-4-E4B-it`
+- [ ] Audit Granite 4.1 chat template masking across 3B, 8B, and 30B models
+
 ---
 
 ## Phase 5: Production Polish

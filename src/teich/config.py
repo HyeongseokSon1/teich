@@ -203,18 +203,18 @@ class Config(BaseModel):
             )
         prompts_file = data.get("prompts_file")
         if isinstance(prompts_file, str) and prompts_file.strip():
-            prompts_file_path = Path(prompts_file)
-            if not prompts_file_path.is_absolute():
-                data["prompts_file"] = (path.parent / prompts_file_path).resolve()
+            if prompts_file_path := data.get("prompts_file"):
+                if not Path(prompts_file_path).is_absolute():
+                    data["prompts_file"] = (path.parent / prompts_file_path).resolve()
 
         # Apply environment variable overrides
-        if model_env := _get_env_alias("TEICH_MODEL", "AGENTIC_DATAGEN_MODEL"):
+        if model_env := _get_env_alias("TEICH_MODEL"):
             data.setdefault("model", {})["model"] = model_env
-        if base_url_env := _get_env_alias("TEICH_BASE_URL", "AGENTIC_DATAGEN_BASE_URL"):
+        if base_url_env := _get_env_alias("TEICH_BASE_URL"):
             data.setdefault("api", {})["base_url"] = base_url_env
-        if api_key_env := _get_env_alias("TEICH_API_KEY", "AGENTIC_DATAGEN_API_KEY"):
+        if api_key_env := _get_env_alias("TEICH_API_KEY"):
             data.setdefault("api", {})["api_key"] = api_key_env
-        if provider_env := _get_env_alias("TEICH_PROVIDER", "AGENTIC_DATAGEN_PROVIDER"):
+        if provider_env := _get_env_alias("TEICH_PROVIDER"):
             data.setdefault("api", {})["provider"] = provider_env
 
         return cls(**data)

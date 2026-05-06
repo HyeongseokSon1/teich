@@ -485,6 +485,70 @@ def test_format_and_mask_passes_chat_template_kwargs_and_preview_marks_unsupervi
     assert "<assistant>world</assistant>" in preview
 
 
+def test_format_and_mask_can_exclude_reasoning_from_qwen_style_supervision():
+    tokenizer = QwenLikeOffsetTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "world", "reasoning_content": "think"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    training_data = format_and_mask(
+        dataset,
+        tokenizer,
+        chat_template_kwargs={"enable_thinking": True},
+        train_on_reasoning=False,
+        include_debug_columns=True,
+    )
+
+    row = training_data[0]
+    assert row["text"] == "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\nthink\n</think>\n\nworld<|im_end|>\n"
+    supervised_text = tokenizer.decode([token for token in row["labels"] if token != -100])
+    assert supervised_text == "world<|im_end|>\n"
+    masked_text = tokenizer.decode(
+        [token_id for token_id, label in zip(row["input_ids"], row["labels"]) if label == -100]
+    )
+    assert "think\n</think>\n\n" in masked_text
+    assert "<|im_start|>assistant\n<think>\n" in masked_text
+
+
+def test_format_and_mask_can_exclude_reasoning_from_gemma_style_supervision():
+    tokenizer = GemmaLikeOffsetTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "world", "reasoning_content": "think"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    training_data = format_and_mask(
+        dataset,
+        tokenizer,
+        train_on_reasoning=False,
+        include_debug_columns=True,
+    )
+
+    row = training_data[0]
+    assert row["text"] == "<bos><|turn>user\nhello<turn|>\n<|turn>model\n<|channel>thought\nthink\n<channel|>world<turn|>\n"
+    supervised_text = tokenizer.decode([token for token in row["labels"] if token != -100])
+    assert supervised_text == "world<turn|>\n"
+    masked_text = tokenizer.decode(
+        [token_id for token_id, label in zip(row["input_ids"], row["labels"]) if label == -100]
+    )
+    assert "<|channel>thought\nthink\n<channel|>" in masked_text
+
+
 def test_format_and_mask_rejects_reserved_chat_template_kwargs():
     tokenizer = FakeTokenizer()
     dataset = Dataset.from_list([{"messages": [], "tools": []}])
@@ -775,19 +839,166 @@ def test_format_and_mask_uses_gemma_structured_mask_path():
         ]
     )
 
+    training_data = format_and_mask(dataset, tokenizer)
+
+    row = training_data[0]
+    supervised_text = tokenizer.decode([token for token in row["labels"] if token != -100])
+    assert supervised_text.startswith('<|channel>thought\ninspect repo\n<channel|><|tool_call>call:bash{command:"ls"}<tool_call|>')
+    assert supervised_text.endswith('done<turn|>\n')
+    assert "response:bash" not in supervised_text
+    masked_text = tokenizer.decode(
+        [token_id for token_id, label in zip(row["input_ids"], row["labels"]) if label == -100]
+    )
+    assert "file_a.py" in masked_text
+    assert tokenizer.render_count == 1
+
+
+class GraniteLikeOffsetTokenizer(OffsetCountingTokenizer):
+    def apply_chat_template(
+        self,
+        messages,
+        *,
+        tokenize=False,
+        add_generation_prompt=False,
+        tools=None,
+        **kwargs,
+    ):
+        self.render_count += 1
+        if kwargs:
+            raise AssertionError(f"Unexpected chat template kwargs: {kwargs}")
+        parts: list[str] = []
+        if tools:
+            parts.append("<|start_of_role|>system<|end_of_role|>tools<|end_of_text|>\n")
+        for message in messages:
+            role = message["role"]
+            if role == "user":
+                parts.append(f"<|start_of_role|>user<|end_of_role|>{message.get('content', '')}<|end_of_text|>\n")
+                continue
+            if role == "assistant":
+                parts.append("<|start_of_role|>assistant<|end_of_role|>")
+                for tool_call in message.get("tool_calls") or []:
+                    function = tool_call["function"]
+                    parts.append('<tool_call>{"name": "')
+                    parts.append(function["name"])
+                    parts.append('", "arguments": {"command": "')
+                    parts.append(function.get("arguments", {}).get("command", ""))
+                    parts.append('"}}</tool_call>')
+                if message.get("content"):
+                    parts.append(str(message["content"]))
+                parts.append("<|end_of_text|>\n")
+                continue
+            if role == "tool":
+                parts.append(
+                    f"<|start_of_role|>user<|end_of_role|><tool_response>{message.get('content', '')}</tool_response><|end_of_text|>\n"
+                )
+                continue
+            raise AssertionError(f"Unexpected role: {role}")
+        if add_generation_prompt:
+            parts.append("<|start_of_role|>assistant<|end_of_role|>")
+        rendered = "".join(parts)
+        if tokenize:
+            return self(rendered)
+        return rendered
+
+
+class QwenMismatchOffsetTokenizer(QwenLikeOffsetTokenizer):
+    def apply_chat_template(self, messages, *, add_generation_prompt=False, enable_thinking=True, **kwargs):
+        rendered = super().apply_chat_template(
+            messages,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=enable_thinking,
+            **kwargs,
+        )
+        if add_generation_prompt:
+            return rendered
+        return rendered.replace("<|im_start|>assistant\n<think>\n", "<|im_start|>assistant\n")
+
+
+def test_format_and_mask_expands_granite_style_assistant_blocks():
+    tokenizer = GraniteLikeOffsetTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "List files"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "bash", "arguments": {"command": "dir"}},
+                            }
+                        ],
+                    },
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+
+    training_data = format_and_mask(dataset, tokenizer)
+
+    row = training_data[0]
+    supervised_text = tokenizer.decode([token for token in row["labels"] if token != -100])
+    assert '<tool_call>{"name": "bash", "arguments": {"command": "dir"}}</tool_call><|end_of_text|>\n' in supervised_text
+    masked_text = tokenizer.decode(
+        [token_id for token_id, label in zip(row["input_ids"], row["labels"]) if label == -100]
+    )
+    assert "List files" in masked_text
+
+
+def test_format_and_mask_falls_back_to_assistant_header_when_qwen_prefix_probe_mismatches():
+    tokenizer = QwenMismatchOffsetTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "first request"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": "inspect repo",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "bash", "arguments": {"command": "ls"}},
+                            }
+                        ],
+                    },
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+
     training_data = format_and_mask(dataset, tokenizer, chat_template_kwargs={"enable_thinking": True})
 
     row = training_data[0]
     supervised_text = tokenizer.decode([token for token in row["labels"] if token != -100])
-    assert supervised_text.startswith("inspect repo\n<channel|><|tool_call>call:bash")
-    assert "response:bash" not in supervised_text
-    assert "done<turn|>\n" in supervised_text
+    assert supervised_text.startswith("inspect repo\n</think>\n\n<tool_call>\n<function=bash>")
     masked_text = tokenizer.decode(
         [token_id for token_id, label in zip(row["input_ids"], row["labels"]) if label == -100]
     )
-    assert "<|turn>user\nfirst request<turn|>\n" in masked_text
-    assert "<|tool_response>response:bash{value:\"file_a.py\"}<tool_response|>" in masked_text
-    assert tokenizer.render_count == 1
+    assert "<|im_start|>assistant\n" in masked_text
 
 
 def test_format_and_mask_skips_rows_with_empty_message_lists():
