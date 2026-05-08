@@ -1,12 +1,12 @@
 # Teich
 
-Turn coding agent sessions into training data.
+Turn coding agent sessions into auditable supervised fine-tuning data.
 
 ---
 
-Run `codex` or `pi` to capture raw traces, or use `chat` mode to generate text-only training rows directly.
+Run `codex` or `pi` to capture raw coding-agent traces, or use `chat` mode to generate text-only training rows directly.
 
-Easily format, filter, combine and mask any supported dataset(s) for supervised fine-tuning (SFT)
+Load local folders, local files, or Hugging Face dataset repos; normalize them into `messages`/`tools`; and prepare pre-tokenized, audited SFT datasets with a Teich-owned data collator.
 
 ## ⚡ Quick Start
 
@@ -30,11 +30,11 @@ uvx teich generate -c config.yaml
 
 ## ⭐ What Teich Does
 
-- **Trace-first data collection**: Run real coding agents and keep the raw session traces when you want full fidelity
+- **Trace-first data collection**: Run real coding agents and keep raw session traces as the source of truth
 - **Multi-agent support**: Works with Codex, Pi, and a text-only `chat` mode
-- **Structured output**: Converts traces into chat messages with tool calls, reasoning, and tool results, or emits ready-to-train chat rows directly
-- **SFT-ready formatting**: Applies chat templates and creates assistant masks for supervised fine-tuning
-- **Hugging Face integration**: Load raw traces or structured JSONL datasets from local folders, files, or dataset repos
+- **Structured conversion**: Converts traces into chat messages with tool calls, reasoning, tool results, metadata, and configured tool snapshots
+- **SFT-ready preparation**: Applies tokenizer chat templates, masks labels, builds a Teich collator, and audits the dataset before training
+- **Hugging Face integration**: Publishes dataset cards plus `tools.json`, and loads local or Hub datasets through one API
 
 ## 📥 Prerequisites
 
@@ -44,6 +44,8 @@ Requirements for agent trace generation:
 - OpenAI/OpenRouter API key (or local OpenAI-compatible endpoint)
 
 `agent.provider: chat` does not require Docker. The Python utilities also work without Docker if you already have traces or structured JSONL datasets.
+
+Training examples use your existing finetuning stack. For the TRL example below, install compatible versions of `transformers`, `trl`, and your model-loading stack separately.
 
 ## 🚀 Usage
 
@@ -66,6 +68,16 @@ Outputs:
 
 If `publish.repo_id` is configured, Teich also creates or updates the matching Hugging Face **dataset** repo and uploads the generated JSONL, README, and `tools.json` automatically.
 
+If a long run is interrupted, use:
+
+```bash
+teich generate -c config.yaml --resume
+```
+
+Teich will scan existing outputs and skip prompts that already converted into completed training examples.
+
+Prompt files can be CSV, text, JSONL/NDJSON, or JSON. JSONL is recommended for very long or multiline prompts.
+
 ### Generate a text-only chat dataset
 
 ```yaml
@@ -86,24 +98,75 @@ Each generated JSONL line will look like:
 {"messages":[{"role":"system","content":"You are a helpful assistant","thinking":null},{"role":"user","content":"Hello","thinking":null},{"role":"assistant","content":"Hi!","thinking":"I should greet the user."}],"system":"You are a helpful assistant","prompt":"Hello","thinking":"I should greet the user.","response":"Hi!","model":"gpt-4.1-mini"}
 ```
 
-### Load and format for training
+### Prepare for training
 
 ```python
-from teich import load_traces, format_and_mask
+from teich import prepare_sft_dataset
 
-# Load from local folder, local file, or HF dataset
+prepared = prepare_sft_dataset(
+    "badlogicgames/pi-mono",
+    tokenizer,
+    max_length=32768,
+    chat_template_kwargs={"enable_thinking": True},
+)
+
+training_data = prepared.dataset
+data_collator = prepared.collator
+print(prepared.preview())
+```
+
+`prepare_sft_dataset` loads local folders, local files, or Hugging Face datasets; applies the tokenizer chat template; creates masked SFT labels; builds a Teich data collator; and runs dataset/collator audits by default.
+
+### Train with TRL `SFTTrainer`
+
+Teich prepares pre-tokenized `input_ids` / `attention_mask` / `labels` rows and returns the collator/config knobs needed to keep those labels intact inside TRL:
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from trl import SFTConfig, SFTTrainer
+from teich import prepare_sft_dataset
+
+model_id = "Qwen/Qwen3-0.6B"
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+model = AutoModelForCausalLM.from_pretrained(model_id)
+
+prepared = prepare_sft_dataset(
+    "badlogicgames/pi-mono",
+    tokenizer,
+    max_length=32768,
+    chat_template_kwargs={"enable_thinking": True},
+)
+
+trainer = SFTTrainer(
+    model=model,
+    train_dataset=prepared.dataset,
+    data_collator=prepared.collator,
+    args=SFTConfig(
+        **prepared.sft_config_kwargs,
+        output_dir="outputs",
+        per_device_train_batch_size=1,
+    ),
+)
+trainer.train()
+```
+
+`prepared.sft_config_kwargs` includes `dataset_kwargs={"skip_prepare_dataset": True}` so TRL does not re-template or overwrite Teich's labels.
+
+### Advanced load and format flow
+
+```python
+from teich import format_and_mask, load_traces
+
 tool_dataset = load_traces("badlogicgames/pi-mono", split="train")
 chat_dataset = load_traces("./chat-output/chat.jsonl")
 
-# Apply chat template and create masks across multiple datasets
 training_data = format_and_mask(
     [tool_dataset, chat_dataset],
     tokenizer,
-    chat_template_kwargs={"enable_thinking": True}
+    max_length=32768,
+    chat_template_kwargs={"enable_thinking": True},
+    strict=True,
 )
-
-# Preview a formatted example
-print(training_data.preview())
 ```
 
 ### Manual tokenizer flow with `load_traces`
@@ -194,12 +257,17 @@ Assistant messages capture:
 
 ```python
 from teich import (
-    load_traces,     # Load from folder, file, or HF dataset
-    format_and_mask, # Apply chat template + assistant masks
-    Config,          # Load config.yaml
-    TrainingExample  # Typed training example
+    prepare_sft_dataset, # Load, format, mask, collate, and audit for SFT
+    TeichDataCollator,   # Collator for pre-tokenized Teich SFT data
+    load_traces,         # Load from folder, file, or HF dataset
+    format_and_mask,     # Apply chat template + assistant masks
+    preview_sft_example, # Preview supervised vs masked tokens
+    Config,              # Load config.yaml
+    TrainingExample,     # Typed training example
 )
 ```
+
+`README.md` is the package readme used for PyPI, so these examples are the canonical public package docs.
 
 ## 📦 Trace-First Workflow
 
@@ -208,7 +276,7 @@ Teich preserves the **raw agent session** as the source of truth:
 1. **Collect**: Run agents on real tasks → raw `.jsonl` traces
 2. **Inspect/Share**: Traces are human-readable and uploadable
 3. **Convert**: Transform to structured examples when ready
-4. **Format**: Apply model-specific chat templates for training
+4. **Prepare**: Apply model-specific chat templates, mask labels, collate, and audit for training
 
 If you choose `agent.provider: chat`, Teich skips the trace-preservation step and writes structured text-only JSONL rows directly.
 
@@ -222,7 +290,7 @@ This means you can:
 
 ```bash
 uv pip install -e ".[dev]"
-pytest tests/test_formatter.py tests/test_loader.py -q
+uv run pytest --ignore=tests/test_integration.py -q
 ```
 
 ## 📌 Status

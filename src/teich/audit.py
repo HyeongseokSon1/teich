@@ -5,6 +5,8 @@ from typing import Any
 
 from datasets import Dataset
 
+from .collator import TeichDataCollator
+
 
 @dataclass
 class SFTAuditReport:
@@ -129,13 +131,9 @@ def audit_sft_trainer_batch(
 
     if data_collator is None:
         try:
-            from trl.trainer.sft_trainer import DataCollatorForLanguageModeling
-        except Exception as exc:
-            return SFTAuditReport(ok=False, errors=[f"unable to import TRL DataCollatorForLanguageModeling: {exc}"])
-        pad_token_id = getattr(tokenizer, "pad_token_id", None) or getattr(tokenizer, "eos_token_id", None)
-        if pad_token_id is None:
-            return SFTAuditReport(ok=False, errors=["tokenizer must define pad_token_id or eos_token_id for default collator"])
-        data_collator = DataCollatorForLanguageModeling(pad_token_id=pad_token_id)
+            data_collator = TeichDataCollator(tokenizer=tokenizer, return_tensors=None)
+        except ValueError as exc:
+            return SFTAuditReport(ok=False, errors=[str(exc)])
 
     limit = min(max(sample_size, 0), dataset.num_rows)
     examples = [
@@ -153,8 +151,7 @@ def audit_sft_trainer_batch(
             errors=errors
             + [
                 "data collator failed while batching precomputed input_ids/labels. "
-                "For Teich pre-tokenized SFT data, pass a collator that pads labels with -100, such as "
-                f"trl.trainer.sft_trainer.DataCollatorForLanguageModeling. Original error: {exc}"
+                f"For Teich pre-tokenized SFT data, pass TeichDataCollator. Original error: {exc}"
             ],
             warnings=warnings,
             samples=samples,
@@ -170,9 +167,18 @@ def audit_sft_trainer_batch(
         if hasattr(collated_labels, "tolist"):
             collated_labels = collated_labels.tolist()
         original_labels = list(example["labels"])
-        if list(collated_labels[: len(original_labels)]) != original_labels:
+        collated_labels = list(collated_labels)
+        right_padded = collated_labels[: len(original_labels)] == original_labels
+        left_padded = collated_labels[-len(original_labels) :] == original_labels
+        if not right_padded and not left_padded:
             errors.append(f"collated labels differ from dataset labels for sample {row_index}")
-        if any(label != -100 for label in collated_labels[len(original_labels) :]):
+            continue
+        padding_labels = (
+            collated_labels[len(original_labels) :]
+            if right_padded
+            else collated_labels[: -len(original_labels)]
+        )
+        if any(label != -100 for label in padding_labels):
             errors.append(f"collated padding labels are not masked for sample {row_index}")
 
     return SFTAuditReport(ok=not errors, errors=errors, warnings=warnings, samples=samples)

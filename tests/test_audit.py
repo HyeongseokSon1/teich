@@ -5,7 +5,7 @@ from pathlib import Path
 
 from datasets import Dataset
 
-from teich import audit_sft_dataset, audit_sft_trainer_batch
+from teich import TeichDataCollator, audit_sft_dataset, audit_sft_trainer_batch
 
 
 class TinyTokenizer:
@@ -114,17 +114,63 @@ def test_audit_sft_trainer_batch_accepts_preserved_labels():
     assert report.ok
 
 
+def test_audit_sft_trainer_batch_uses_teich_collator_by_default():
+    dataset = Dataset.from_list(
+        [
+            {
+                "input_ids": [1, 2, 4],
+                "attention_mask": [1, 1, 1],
+                "labels": [-100, 2, 4],
+            },
+            {
+                "input_ids": [4],
+                "attention_mask": [1],
+                "labels": [4],
+            },
+        ]
+    )
+
+    report = audit_sft_trainer_batch(dataset, TinyTokenizer())
+
+    assert report.ok
+
+
+def test_audit_sft_trainer_batch_accepts_left_padded_preserved_labels():
+    dataset = Dataset.from_list(
+        [
+            {
+                "input_ids": [1, 2, 4],
+                "attention_mask": [1, 1, 1],
+                "labels": [-100, 2, 4],
+            },
+            {
+                "input_ids": [4],
+                "attention_mask": [1],
+                "labels": [4],
+            },
+        ]
+    )
+
+    report = audit_sft_trainer_batch(
+        dataset,
+        TinyTokenizer(),
+        data_collator=TeichDataCollator(tokenizer=TinyTokenizer(), padding_side="left", return_tensors=None),
+    )
+
+    assert report.ok
+
+
 def test_teich_example_has_single_safe_training_flow():
     source = Path("teich_example.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
 
     assert source.count("FastLanguageModel.from_pretrained") == 1
-    assert source.count("DataCollatorForLanguageModeling") >= 2
+    assert "DataCollatorForLanguageModeling" not in source
     assert "hf_" not in source
     assert "strict=True" in source
     assert 'optim="muon"' in source
     assert 'optim_target_modules="all-linear"' in source
-    assert "audit_sft_dataset" in source
-    assert "audit_sft_trainer_batch" in source
-    assert "data_collator=data_collator" in source
+    assert "prepare_sft_dataset" in source
+    assert "data_collator=prepared.collator" in source
+    assert "**prepared.sft_config_kwargs" in source
     assert sum(isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "train" for node in ast.walk(tree)) == 1

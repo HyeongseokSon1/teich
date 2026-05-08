@@ -941,15 +941,20 @@ def _build_preview(text_tokenizer: Any, input_ids: list[int], labels: list[int])
 
 def _attach_preview(training_data: Dataset, text_tokenizer: Any) -> Dataset:
     def preview(index: int = 0) -> str:
-        if training_data.num_rows == 0:
-            raise IndexError("Cannot preview an empty dataset")
-        if index < 0 or index >= training_data.num_rows:
-            raise IndexError(f"Preview index {index} is out of range for dataset of size {training_data.num_rows}")
-        row = training_data[index]
-        return _build_preview(text_tokenizer, row["input_ids"], row["labels"])
+        return preview_sft_example(training_data, text_tokenizer, index=index)
 
     training_data.preview = preview
     return training_data
+
+
+def preview_sft_example(dataset: Dataset, tokenizer: Any, *, index: int = 0) -> str:
+    if dataset.num_rows == 0:
+        raise IndexError("Cannot preview an empty dataset")
+    if index < 0 or index >= dataset.num_rows:
+        raise IndexError(f"Preview index {index} is out of range for dataset of size {dataset.num_rows}")
+    row = dataset[index]
+    text_tokenizer = _resolve_text_tokenizer(tokenizer)
+    return _build_preview(text_tokenizer, row["input_ids"], row["labels"])
 
 
 def format_and_mask(
@@ -964,6 +969,7 @@ def format_and_mask(
     include_debug_columns: bool = False,
     drop_oversized_examples: bool = True,
     strict: bool = False,
+    verbose: bool = True,
 ) -> Dataset:
     if isinstance(dataset, Sequence) and not isinstance(dataset, Dataset):
         datasets = list(dataset)
@@ -987,6 +993,7 @@ def format_and_mask(
                         include_debug_columns=include_debug_columns,
                         drop_oversized_examples=drop_oversized_examples,
                         strict=strict,
+                        verbose=verbose,
                     )
                 )
             training_data = concatenate_datasets(formatted_datasets)
@@ -1079,15 +1086,16 @@ def format_and_mask(
             f"Dataset contains no conversations that fit within context window of {effective_max_length} tokens."
         )
 
-    console = Console()
-    table = Table(title="format_and_mask summary")
-    table.add_column("Metric", style="cyan")
-    table.add_column("Count", style="magenta", justify="right")
-    table.add_row("Input rows", str(dataset.num_rows))
-    table.add_row("Kept rows", str(training_data.num_rows))
-    table.add_row("Empty dropped", str(empty_dropped_count))
-    if drop_oversized_examples and effective_max_length is not None:
-        table.add_row("Oversized dropped", str(dropped_oversized_examples_count))
-    console.print(table)
+    if verbose:
+        console = Console()
+        table = Table(title="format_and_mask summary")
+        table.add_column("Metric", style="cyan")
+        table.add_column("Count", style="magenta", justify="right")
+        table.add_row("Input rows", str(dataset.num_rows))
+        table.add_row("Kept rows", str(training_data.num_rows))
+        table.add_row("Empty dropped", str(empty_dropped_count))
+        if drop_oversized_examples and effective_max_length is not None:
+            table.add_row("Oversized dropped", str(dropped_oversized_examples_count))
+        console.print(table)
 
     return _attach_preview(training_data, text_tokenizer)

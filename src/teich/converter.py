@@ -728,17 +728,6 @@ def _structured_training_example_from_row(
     )
 
 
-def load_trace_file(trace_file: Path) -> list[dict[str, Any]]:
-    events: list[dict[str, Any]] = []
-    with trace_file.open("r", encoding="utf-8") as handle:
-        for raw_line in handle:
-            line = raw_line.strip()
-            if not line:
-                continue
-            events.append(json.loads(line))
-    return events
-
-
 def convert_trace_to_training_example(trace_file: Path) -> TrainingExample:
     events = load_trace_file(trace_file)
     if events and all(_is_structured_training_row(event) for event in events):

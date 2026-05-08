@@ -10,6 +10,7 @@ venv/
 .deepeval/
 .mypy_cache/
 .ruff_cache/
+dist/
 output/
 sandbox/
 test_run/

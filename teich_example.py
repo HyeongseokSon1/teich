@@ -4,13 +4,12 @@ import os
 from unsloth import FastLanguageModel
 import torch
 from trl import SFTConfig, SFTTrainer
-from trl.trainer.sft_trainer import DataCollatorForLanguageModeling
 
-from teich import audit_sft_dataset, audit_sft_trainer_batch, format_and_mask, load_traces
+from teich import prepare_sft_dataset
 
 
 MAX_SEQ_LEN = 32768
-MODEL_NAME = "unsloth/Qwen3.5-4B"
+MODEL_NAME = "unsloth/Qwen3.5-0.8B"
 TRAIN_ON_REASONING = True
 CHAT_TEMPLATE_KWARGS = {"enable_thinking": True}
 PUSH_TO_HUB_REPO_ID = "armand0e/traces-test"
@@ -38,34 +37,26 @@ model = FastLanguageModel.get_peft_model(
     loftq_config=None,
 )
 
-datasets = [
-    load_traces("TeichAI/lordx64-claude-opus-4.7-max-cleaned", split="train", max_examples=500),
-]
-
-training_data = format_and_mask(
-    datasets,
+prepared = prepare_sft_dataset(
+    "TeichAI/lordx64-claude-opus-4.7-max-cleaned",
     tokenizer,
+    split="train",
+    max_examples=500,
     chat_template_kwargs=CHAT_TEMPLATE_KWARGS,
     train_on_reasoning=TRAIN_ON_REASONING,
     max_length=MAX_SEQ_LEN,
     strict=True,
 )
-
-dataset_audit = audit_sft_dataset(training_data, tokenizer)
-dataset_audit.raise_for_errors()
-print(training_data.preview())
-
-data_collator = DataCollatorForLanguageModeling(pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id)
+print(prepared.preview())
 
 trainer = SFTTrainer(
     model=model,
     tokenizer=tokenizer,
-    train_dataset=training_data,
+    train_dataset=prepared.dataset,
     eval_dataset=None,
-    data_collator=data_collator,
+    data_collator=prepared.collator,
     args=SFTConfig(
-        dataset_kwargs={"skip_prepare_dataset": True},
-        dataset_num_proc=1,
+        **prepared.sft_config_kwargs,
         per_device_train_batch_size=1,
         gradient_accumulation_steps=4,
         warmup_steps=5,
@@ -81,9 +72,6 @@ trainer = SFTTrainer(
         report_to="none",
     ),
 )
-
-batch_audit = audit_sft_trainer_batch(training_data, tokenizer, data_collator=data_collator)
-batch_audit.raise_for_errors()
 
 gpu_stats = torch.cuda.get_device_properties(0)
 start_gpu_memory = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
