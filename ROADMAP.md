@@ -179,8 +179,8 @@ training_data = format_and_mask(dataset, tokenizer, max_length=32768, strict=Tru
 - [x] Codex runner
 - [x] Pi runner
 - [x] Chat runner
-- [ ] Anthropic Claude coding-agent runner
-- [ ] Google Gemini coding-agent runner
+- [ ] Anthropic Claude Code runner
+- [ ] Hermes agent runner
 - [ ] Ollama/local model runner beyond Codex OSS mode
 
 ### 4.3 Chat Template Masking Coverage
