@@ -38,13 +38,13 @@ def _audit_training_row(row: dict[str, Any], tokenizer: Any, row_index: int) -> 
     warnings: list[str] = []
     sample: dict[str, Any] = {"row_index": row_index}
 
-    for column_name in ("input_ids", "attention_mask", "labels"):
+    for column_name in ("input_ids", "labels"):
         if column_name not in row:
             errors.append(f"row {row_index}: missing required column '{column_name}'")
             return errors, warnings, sample
 
     input_ids = _as_list(row["input_ids"])
-    attention_mask = _as_list(row["attention_mask"])
+    attention_mask = _as_list(row["attention_mask"]) if "attention_mask" in row else [1] * len(input_ids)
     labels = _as_list(row["labels"])
     sample["tokens"] = len(input_ids)
 
@@ -94,7 +94,7 @@ def audit_sft_dataset(dataset: Dataset, tokenizer: Any, *, sample_size: int = 8)
     warnings: list[str] = []
     samples: list[dict[str, Any]] = []
 
-    required_columns = {"input_ids", "attention_mask", "labels"}
+    required_columns = {"input_ids", "labels"}
     missing_columns = sorted(required_columns.difference(dataset.column_names))
     if missing_columns:
         return SFTAuditReport(ok=False, errors=[f"dataset missing required columns: {', '.join(missing_columns)}"])

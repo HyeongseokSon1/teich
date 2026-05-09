@@ -202,7 +202,7 @@ model.push_to_hub_merged(PUSH_TO_HUB_REPO_ID, tokenizer, save_method="merged_16b
 
 `prepare_data` loads local folders, local files, Hugging Face datasets, or a list mixing any of those with already-loaded `datasets.Dataset` objects; applies the tokenizer chat template; optionally tokenizes only to drop rows above `max_length`; and returns trainer-friendly `text` rows with Teich supervision metadata for multi-turn/tool-aware masking. Mixed chat-only and tool-call datasets are formatted separately before concatenation, so their schemas do not need to match beyond the normalized `messages`/`tools` fields.
 
-`mask_data` follows the same trainer-first shape as Unsloth's response-only helper, but uses Teich's span metadata so multi-turn tool calls and tool responses are masked correctly. Keep `packing=False` for this flow because packed datasets merge row boundaries before masking.
+`mask_data` follows the same trainer-first shape as Unsloth's response-only helper, but uses Teich's span metadata so multi-turn tool calls and tool responses are masked correctly. It returns a compact trainer dataset with only `input_ids` and `labels`; the trainer collator builds attention masks dynamically. Keep `packing=False` for this flow because packed datasets merge row boundaries before masking. For long-context runs, `max_supervised_tokens` defaults to the trainer's `max_length` to cap the number of trainable answer tokens per row; pass a lower value if loss memory is still too high.
 
 To combine datasets, pass a list of dataset IDs, local paths, or loaded `datasets.Dataset` objects:
 

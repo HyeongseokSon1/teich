@@ -1198,28 +1198,22 @@ def _mask_tokenized_row(
         encoded = _tokenize_trainer_text_with_offsets(text_tokenizer, text)
         if encoded is None:
             raise ValueError("mask_data requires a tokenizer that can return offset mappings for text tokenization.")
-        full_input_ids, full_attention_mask, offsets = encoded
+        full_input_ids, _, offsets = encoded
         full_labels = _labels_from_offsets(full_input_ids, offsets, supervised_spans)
         if input_ids == full_input_ids:
             labels = full_labels
-            attention_mask = full_attention_mask
         elif len(input_ids) <= len(full_input_ids) and input_ids == full_input_ids[: len(input_ids)]:
             labels = full_labels[: len(input_ids)]
-            attention_mask = full_attention_mask[: len(input_ids)]
         else:
             raise ValueError("Trainer tokenized input_ids do not align with the original Teich-rendered text.")
     else:
         text, offsets = _token_text_and_offsets(text_tokenizer, input_ids)
         supervised_spans = _infer_supervised_spans_from_rendered_text(text, train_on_reasoning=train_on_reasoning)
         labels = _labels_from_offsets(input_ids, offsets, supervised_spans)
-        attention_mask = [1] * len(input_ids)
-    assistant_masks = [0 if label == -100 else 1 for label in labels]
-    if 1 not in assistant_masks:
+    if all(label == -100 for label in labels):
         raise ValueError("Teich masking produced a fully masked row after trainer tokenization/truncation.")
     return {
         "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "assistant_masks": assistant_masks,
         "labels": labels,
     }
 
@@ -1230,14 +1224,24 @@ def mask_data(
     tokenizer: Any | None = None,
     text_column: str | None = None,
     train_on_reasoning: bool = True,
+    max_supervised_tokens: int | None = None,
     audit: bool = True,
     audit_sample_size: int = 8,
+    verbose: bool = True,
 ) -> Any:
     from .audit import audit_sft_dataset
 
     text_tokenizer = _resolve_text_tokenizer(tokenizer or getattr(trainer, "processing_class", None) or getattr(trainer, "tokenizer", None))
     trainer_args = getattr(trainer, "args", None)
     dataset_text_field = text_column or getattr(trainer_args, "dataset_text_field", "text")
+    trainer_max_length = getattr(trainer_args, "max_length", None)
+    effective_max_supervised_tokens = (
+        max_supervised_tokens
+        if isinstance(max_supervised_tokens, int) and max_supervised_tokens > 0
+        else trainer_max_length
+        if isinstance(trainer_max_length, int) and trainer_max_length > 0
+        else None
+    )
     if getattr(trainer_args, "packing", False):
         raise ValueError("mask_data does not support packed SFTTrainer datasets because packing merges row boundaries.")
 
@@ -1249,11 +1253,45 @@ def mask_data(
         missing = {"input_ids"}.difference(dataset.column_names)
         if missing:
             raise ValueError(f"trainer.{dataset_name} is missing required columns for mask_data: {', '.join(sorted(missing))}")
+        dropped_supervised_count = 0
+
+        def _empty_output_batch() -> dict[str, list[Any]]:
+            return {"input_ids": [], "labels": []}
+
+        def _mask_batch(batch: dict[str, list[Any]]) -> dict[str, list[Any]]:
+            nonlocal dropped_supervised_count
+            output_batch = _empty_output_batch()
+            batch_size = len(batch["input_ids"])
+            for index in range(batch_size):
+                row = {column_name: batch[column_name][index] for column_name in dataset.column_names}
+                masked_row = _mask_tokenized_row(row, text_tokenizer, dataset_text_field, train_on_reasoning)
+                supervised_tokens = sum(1 for label in masked_row["labels"] if label != -100)
+                if (
+                    effective_max_supervised_tokens is not None
+                    and supervised_tokens > effective_max_supervised_tokens
+                ):
+                    dropped_supervised_count += 1
+                    continue
+                output_batch["input_ids"].append(masked_row["input_ids"])
+                output_batch["labels"].append(masked_row["labels"])
+            return output_batch
+
         masked_dataset = dataset.map(
-            lambda row: _mask_tokenized_row(row, text_tokenizer, dataset_text_field, train_on_reasoning),
+            _mask_batch,
+            batched=True,
+            batch_size=_FORMAT_AND_MASK_BATCH_SIZE,
             desc=f"Applying Teich masks to {dataset_name}",
             remove_columns=dataset.column_names,
         )
+        if masked_dataset.num_rows == 0 and dropped_supervised_count > 0:
+            raise ValueError(
+                f"trainer.{dataset_name} contains no rows at or below max_supervised_tokens={effective_max_supervised_tokens}."
+            )
+        if verbose and dropped_supervised_count:
+            Console().print(
+                f"[yellow]Dropped {dropped_supervised_count} {dataset_name} rows above "
+                f"{effective_max_supervised_tokens} supervised tokens.[/yellow]"
+            )
         if audit:
             report = audit_sft_dataset(masked_dataset, text_tokenizer, sample_size=audit_sample_size)
             report.raise_for_errors()

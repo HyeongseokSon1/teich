@@ -800,7 +800,7 @@ def test_mask_data_applies_teich_labels_after_trainer_tokenization():
     trainer = mask_data(trainer, audit=True)
 
     row = trainer.train_dataset[0]
-    assert set(trainer.train_dataset.column_names) == {"input_ids", "attention_mask", "assistant_masks", "labels"}
+    assert set(trainer.train_dataset.column_names) == {"input_ids", "labels"}
     preview = trainer.train_dataset.preview()
     assert "\033[31m" in preview
     assert "<system>system rules</system>" in preview
@@ -812,6 +812,69 @@ def test_mask_data_applies_teich_labels_after_trainer_tokenization():
     assert "<system>system rules</system>" in masked_text
     assert "<user>first request</user>" in masked_text
     assert "<tool>file_a.py</tool>" in masked_text
+
+
+def test_mask_data_can_drop_rows_with_too_many_supervised_tokens():
+    tokenizer = TrainerStyleTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "short"},
+                    {"role": "assistant", "content": "ok"},
+                ],
+                "tools": [],
+            },
+            {
+                "messages": [
+                    {"role": "user", "content": "long"},
+                    {"role": "assistant", "content": "x" * 100},
+                ],
+                "tools": [],
+            },
+        ]
+    )
+    prepared = prepare_data(dataset, tokenizer, verbose=False)
+    trainer_dataset = prepared.map(lambda row: {"input_ids": tokenizer(text=row["text"])["input_ids"]})
+    trainer = SimpleNamespace(
+        train_dataset=trainer_dataset,
+        eval_dataset=None,
+        processing_class=tokenizer,
+        args=SimpleNamespace(dataset_text_field="text", packing=False, max_length=30),
+    )
+
+    trainer = mask_data(trainer, audit=True, verbose=False)
+
+    assert trainer.train_dataset.num_rows == 1
+    assert "ok</assistant>" in trainer.train_dataset.preview()
+    assert "x" * 100 not in trainer.train_dataset.preview()
+
+
+def test_mask_data_explicit_supervised_token_limit_overrides_trainer_max_length():
+    tokenizer = TrainerStyleTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "long"},
+                    {"role": "assistant", "content": "x" * 20},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+    prepared = prepare_data(dataset, tokenizer, verbose=False)
+    trainer_dataset = prepared.map(lambda row: {"input_ids": tokenizer(text=row["text"])["input_ids"]})
+    trainer = SimpleNamespace(
+        train_dataset=trainer_dataset,
+        eval_dataset=None,
+        processing_class=tokenizer,
+        args=SimpleNamespace(dataset_text_field="text", packing=False, max_length=5),
+    )
+
+    trainer = mask_data(trainer, max_supervised_tokens=50, audit=True, verbose=False)
+
+    assert trainer.train_dataset.num_rows == 1
 
 
 def test_mask_data_can_fallback_when_trainer_drops_text_columns():

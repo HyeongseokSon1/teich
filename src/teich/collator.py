@@ -30,7 +30,7 @@ class TeichDataCollator:
         if not examples:
             return self._tensorize({"input_ids": [], "attention_mask": [], "labels": []})
         for index, example in enumerate(examples):
-            missing = {"input_ids", "attention_mask", "labels"}.difference(example)
+            missing = {"input_ids", "labels"}.difference(example)
             if missing:
                 names = ", ".join(sorted(missing))
                 raise ValueError(f"example {index} is missing required columns: {names}")
@@ -38,7 +38,7 @@ class TeichDataCollator:
         batch = {"input_ids": [], "attention_mask": [], "labels": []}
         for example in examples:
             input_ids = _as_list(example["input_ids"])
-            attention_mask = _as_list(example["attention_mask"])
+            attention_mask = _as_list(example["attention_mask"]) if "attention_mask" in example else [1] * len(input_ids)
             labels = _as_list(example["labels"])
             if not (len(input_ids) == len(attention_mask) == len(labels)):
                 raise ValueError("input_ids, attention_mask, and labels must have equal lengths before collation")
