@@ -31,10 +31,20 @@ def test_build_traces_readme_includes_model_and_references_tools(tmp_path: Path)
     assert "tools.json" in readme
     assert '"name": "bash"' not in readme
     assert "## Conversion" in readme
+    assert "### Recommended: train with Unsloth and TRL `SFTTrainer`" in readme
+    assert "from unsloth import FastLanguageModel" in readme
+    assert "import torch" in readme
+    assert "MODEL_NAME = 'unsloth/Qwen3.5-0.8B'" in readme
     assert "prepare_data" in readme
     assert "mask_data" in readme
     assert "dataset_text_field='text'" in readme
+    assert "max_length=MAX_SEQ_LEN" in readme
+    assert "max_examples=500" in readme
     assert "packing=False" in readme
+    assert "trainer_stats = trainer.train(resume_from_checkpoint=False)" in readme
+    assert "torch.cuda.get_device_properties(0)" in readme
+    assert "Peak reserved memory for training % of max memory" in readme
+    assert "model.push_to_hub_merged" in readme
     assert "load_traces" in readme
     assert "format_and_mask" in readme
     assert "tokenizer.apply_chat_template" in readme

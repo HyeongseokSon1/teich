@@ -101,6 +101,41 @@ prompts:
     assert Config(api={"provider": "openrouter"}).get_api_key() == "sk-or-v1-test"
 
 
+def test_openrouter_api_key_env_alias_does_not_override_explicit_config(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("TEICH_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-env")
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("""
+api:
+  provider: openrouter
+  api_key: sk-or-v1-config
+prompts:
+  - Hello
+""")
+
+    config = Config.from_yaml(config_file)
+
+    assert config.api.api_key == "sk-or-v1-config"
+
+
+def test_teich_api_key_env_still_overrides_explicit_config(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("TEICH_API_KEY", "sk-teich-env")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-env")
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("""
+api:
+  provider: openrouter
+  api_key: sk-or-v1-config
+prompts:
+  - Hello
+""")
+
+    config = Config.from_yaml(config_file)
+
+    assert config.api.api_key == "sk-teich-env"
+
+
 def test_config_generates_chat_dataset_tags():
     config = Config(agent={"provider": "chat"}, model=ModelConfig(model="gpt-4.1-mini"))
 

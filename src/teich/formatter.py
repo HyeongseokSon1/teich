@@ -125,6 +125,19 @@ def _tokenize_text(text_tokenizer: Any, text: str) -> tuple[list[int], list[int]
     return list(input_ids), list(attention_mask)
 
 
+def _tokenized_length(text_tokenizer: Any, text: str) -> int:
+    try:
+        encoded = text_tokenizer(text, add_special_tokens=False, return_attention_mask=False)
+    except TypeError:
+        encoded = text_tokenizer(text, add_special_tokens=False)
+    input_ids = encoded["input_ids"]
+    if hasattr(input_ids, "shape") and len(input_ids.shape) > 0:
+        return int(input_ids.shape[-1])
+    if input_ids and isinstance(input_ids[0], list):
+        return len(input_ids[0])
+    return len(input_ids)
+
+
 def _tokenize_text_with_offsets(text_tokenizer: Any, text: str) -> tuple[list[int], list[int], list[tuple[int, int]]] | None:
     try:
         encoded = text_tokenizer(
@@ -1005,17 +1018,19 @@ def _supervised_text_and_spans(
     train_on_reasoning: bool,
     strict: bool,
 ) -> tuple[str, list[tuple[int, int]]]:
-    original_text = _render_chat(renderer, messages, tools, chat_template_kwargs)
     marked_messages, markers = _mark_supervised_messages(messages, train_on_reasoning=train_on_reasoning)
     marked_text = _render_chat(renderer, marked_messages, tools, chat_template_kwargs)
     stripped = _strip_markers_and_collect_spans(marked_text, markers)
+    del marked_text
     if stripped is None:
         raise ValueError("Unable to collect supervised spans from marker-injected chat template output.")
     formatted_text, supervised_spans = stripped
+    original_text = _render_chat(renderer, messages, tools, chat_template_kwargs)
     if formatted_text != original_text:
         if strict:
             raise ValueError("Marker-injected chat template output does not match the original rendered chat after marker removal.")
         return original_text, []
+    del original_text
     assistant_prompt_prefixes = _resolve_assistant_prompt_prefixes(
         renderer,
         messages,
@@ -1144,8 +1159,7 @@ def format_data(
                 dropped_count += 1
                 continue
             if drop_oversized_examples and effective_max_length is not None:
-                input_ids, _ = _tokenize_text(text_tokenizer, text)
-                if len(input_ids) > effective_max_length:
+                if _tokenized_length(text_tokenizer, text) > effective_max_length:
                     dropped_oversized_count += 1
                     continue
             output_batch[text_column].append(text)
@@ -1238,11 +1252,12 @@ def mask_data(
         masked_dataset = dataset.map(
             lambda row: _mask_tokenized_row(row, text_tokenizer, dataset_text_field, train_on_reasoning),
             desc=f"Applying Teich masks to {dataset_name}",
+            remove_columns=dataset.column_names,
         )
         if audit:
             report = audit_sft_dataset(masked_dataset, text_tokenizer, sample_size=audit_sample_size)
             report.raise_for_errors()
-        return masked_dataset
+        return _attach_preview(masked_dataset, text_tokenizer)
 
     trainer.train_dataset = _mask_dataset(getattr(trainer, "train_dataset", None), "train_dataset")
     eval_dataset = getattr(trainer, "eval_dataset", None)

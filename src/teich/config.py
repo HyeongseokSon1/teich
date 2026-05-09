@@ -215,8 +215,8 @@ class Config(BaseModel):
             TEICH_MODEL - Override model ID
             TEICH_BASE_URL - Override API base URL
             TEICH_API_KEY - Override API key
-            OPENROUTER_API_KEY - Override API key for OpenRouter configs
-            OPENAI_API_KEY - Override API key for OpenAI configs and legacy configs
+            OPENROUTER_API_KEY - API key fallback for OpenRouter configs
+            OPENAI_API_KEY - API key fallback for OpenAI configs and legacy configs
             TEICH_PROVIDER - Override provider name
         """
         with open(path, "r", encoding="utf-8") as f:
@@ -238,9 +238,19 @@ class Config(BaseModel):
             data.setdefault("model", {})["model"] = model_env
         if base_url_env := _get_env_alias("TEICH_BASE_URL"):
             data.setdefault("api", {})["base_url"] = base_url_env
-        provider_for_env = data.get("api", {}).get("provider") if isinstance(data.get("api"), dict) else None
-        if api_key_env := _get_env_alias(*_api_key_env_aliases(provider_for_env)):
-            data.setdefault("api", {})["api_key"] = api_key_env
+        api_section = data.setdefault("api", {})
+        provider_for_env = api_section.get("provider") if isinstance(api_section, dict) else None
+        configured_api_key = api_section.get("api_key") if isinstance(api_section, dict) else None
+        if api_key_env := _get_env_alias("TEICH_API_KEY"):
+            api_section["api_key"] = api_key_env
+        elif not (isinstance(configured_api_key, str) and configured_api_key.strip()):
+            provider_aliases = [
+                alias
+                for alias in _api_key_env_aliases(provider_for_env)
+                if alias != "TEICH_API_KEY"
+            ]
+            if api_key_env := _get_env_alias(*provider_aliases):
+                api_section["api_key"] = api_key_env
         if provider_env := _get_env_alias("TEICH_PROVIDER"):
             data.setdefault("api", {})["provider"] = provider_env
 

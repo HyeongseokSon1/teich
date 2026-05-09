@@ -108,6 +108,21 @@ class TrainerStyleTokenizer(OffsetCountingTokenizer):
         return self._vocab.setdefault(token, len(self._vocab) + 1)
 
 
+class LengthFilteringTokenizer(TrainerStyleTokenizer):
+    def __init__(self):
+        super().__init__()
+        self.return_attention_mask_values: list[bool] = []
+
+    def __call__(self, text, add_special_tokens=False, return_attention_mask=True, return_offsets_mapping=False):
+        self.return_attention_mask_values.append(return_attention_mask)
+        return super().__call__(
+            text,
+            add_special_tokens=add_special_tokens,
+            return_attention_mask=return_attention_mask,
+            return_offsets_mapping=return_offsets_mapping,
+        )
+
+
 class QwenLikeOffsetTokenizer(OffsetCountingTokenizer):
     def apply_chat_template(
         self,
@@ -623,7 +638,7 @@ def test_prepare_data_renders_text_and_supervised_spans_for_trainer_flow():
 
 
 def test_prepare_data_filters_oversized_rows_without_returning_tokens():
-    tokenizer = TrainerStyleTokenizer()
+    tokenizer = LengthFilteringTokenizer()
     dataset = Dataset.from_list(
         [
             {
@@ -651,6 +666,8 @@ def test_prepare_data_filters_oversized_rows_without_returning_tokens():
     assert "attention_mask" not in prepared.column_names
     assert "labels" not in prepared.column_names
     assert "ok</assistant>" in prepared[0]["text"]
+    assert tokenizer.return_attention_mask_values
+    assert set(tokenizer.return_attention_mask_values) == {False}
 
 
 def test_prepare_data_can_keep_oversized_rows_for_trainer_truncation():
@@ -783,6 +800,12 @@ def test_mask_data_applies_teich_labels_after_trainer_tokenization():
     trainer = mask_data(trainer, audit=True)
 
     row = trainer.train_dataset[0]
+    assert set(trainer.train_dataset.column_names) == {"input_ids", "attention_mask", "assistant_masks", "labels"}
+    preview = trainer.train_dataset.preview()
+    assert "\033[31m" in preview
+    assert "<system>system rules</system>" in preview
+    assert "<think>inspect repo</think><tool_call>bash</tool_call></assistant>" in preview
+    assert "done</assistant>" in preview
     supervised_text = tokenizer.decode([token for token in row["labels"] if token != -100])
     assert supervised_text == "<think>inspect repo</think><tool_call>bash</tool_call></assistant>done</assistant>"
     masked_text = tokenizer.decode([token_id for token_id, label in zip(row["input_ids"], row["labels"]) if label == -100])

@@ -711,6 +711,45 @@ def test_monitor_process_fails_fast_on_live_pi_tool_call_corruption(tmp_path: Pa
     process.wait.assert_called_once()
 
 
+def test_pi_trace_with_model_error_is_rejected_before_export(tmp_path: Path):
+    config = Config(agent={"provider": "pi"}, output={"traces_dir": tmp_path / "output"})
+    with patch.object(PiRunner, '_ensure_image'):
+        runner = PiRunner(config)
+
+    source = tmp_path / "bad-session.jsonl"
+    source.write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "session", "id": "pi-session"}),
+                json.dumps({"type": "model_change", "modelId": "deepseek/deepseek-v4-pro"}),
+                json.dumps(
+                    {
+                        "type": "message",
+                        "id": "assistant-error",
+                        "message": {
+                            "role": "assistant",
+                            "content": [],
+                            "api": "openai-completions",
+                            "model": "deepseek/deepseek-v4-pro",
+                            "usage": {"input": 0, "output": 0, "totalTokens": 0},
+                            "stopReason": "error",
+                            "errorMessage": "401 User not found.",
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    destination = tmp_path / "output" / "bad-session.jsonl"
+
+    with pytest.raises(RuntimeError, match="model/provider error: 401 User not found"):
+        runner._copy_normalized_session_file(source, destination)
+
+    assert not destination.exists()
+
+
 def test_custom_api_provider_command():
     """Test that custom API provider generates correct command."""
     config = Config(
