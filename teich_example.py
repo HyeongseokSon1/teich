@@ -55,7 +55,6 @@ train_dataset = prepare_data(
     split="train",
     hf_token=HF_TOKEN,
     chat_template_kwargs={"enable_thinking": True, "preserve_thinking": True},
-    train_on_reasoning=True,
     max_length=MAX_SEQ_LEN,
     drop_oversized_examples=True,
     tokenize=True,
@@ -90,7 +89,13 @@ trainer = SFTTrainer(
     ),
 )
 
-trainer = mask_data(trainer, tokenizer=tokenizer)
+trainer = mask_data(
+    trainer,
+    tokenizer=tokenizer,
+    train_on_reasoning=True,
+    train_on_final_answers=True,
+    train_on_tools=True,
+)
 
 print(trainer.train_dataset.preview())
 

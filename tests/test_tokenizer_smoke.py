@@ -78,7 +78,6 @@ def test_real_tokenizer_prepare_and_mask_tool_dataset(model_id: str, chat_templa
         tokenizer,
         tokenize=True,
         strict=True,
-        train_on_reasoning=True,
         chat_template_kwargs=chat_template_kwargs,
         max_length=4096,
         verbose=False,
@@ -90,7 +89,7 @@ def test_real_tokenizer_prepare_and_mask_tool_dataset(model_id: str, chat_templa
         args=SimpleNamespace(dataset_text_field="text", packing=False, max_length=4096),
     )
 
-    trainer = mask_data(trainer, tokenizer=tokenizer, audit=True, verbose=False)
+    trainer = mask_data(trainer, tokenizer=tokenizer, train_on_reasoning=True, audit=True, verbose=False)
 
     row = trainer.train_dataset[0]
     supervised_ids = [token for token in row["labels"] if token != -100]

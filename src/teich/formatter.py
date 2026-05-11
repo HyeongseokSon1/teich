@@ -46,6 +46,13 @@ _REASONING_BLOCK_PATTERNS = (
 _REASONING_START_TOKENS = ("<think>\n", "<think>")
 _DATASET_MAP_BATCH_SIZE = 8
 TEICH_SUPERVISED_SPANS_COLUMN = "teich_supervised_spans"
+_SPAN_KIND_REASONING = "reasoning"
+_SPAN_KIND_FINAL_ANSWER = "final_answer"
+_SPAN_KIND_TOOL_CALL = "tool_call"
+_SPAN_KIND_TOOL_RESPONSE = "tool_response"
+_SPAN_KIND_USER = "user"
+_SPAN_KIND_SYSTEM = "system"
+_SPAN_KIND_DEVELOPER = "developer"
 _MARKER_PREFERRED_DICT_KEYS = ("text", "content", "value", "arguments", "name")
 _MARKER_STRUCTURAL_DICT_KEYS = {"type"}
 _TEICH_LABEL_PAD_TOKEN_ID = -100
@@ -161,6 +168,41 @@ def _render_chat(
     if not isinstance(rendered, str):
         raise TypeError("tokenizer.apply_chat_template(..., tokenize=False) must return a string")
     return rendered
+
+
+def _normalize_tool_call_arguments_for_template(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized_messages: list[dict[str, Any]] | None = None
+    for message_index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+        for tool_call_index, tool_call in enumerate(tool_calls):
+            function = tool_call.get("function") if isinstance(tool_call, dict) else None
+            if not isinstance(function, dict):
+                continue
+            arguments = function.get("arguments")
+            if arguments is None:
+                parsed_arguments: Any = {}
+            elif isinstance(arguments, str):
+                stripped = arguments.strip()
+                if not stripped:
+                    parsed_arguments = {}
+                elif stripped[0] in "{[":
+                    try:
+                        parsed_arguments = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        continue
+                else:
+                    continue
+            else:
+                continue
+            if normalized_messages is None:
+                normalized_messages = deepcopy(messages)
+            normalized_function = normalized_messages[message_index]["tool_calls"][tool_call_index]["function"]
+            normalized_function["arguments"] = parsed_arguments
+    return normalized_messages if normalized_messages is not None else messages
 
 
 def _render_chat_with_generation_prompt(
@@ -446,56 +488,83 @@ def _wrap_with_markers(value: Any, start_marker: str, end_marker: str) -> tuple[
 def _mark_supervised_messages(
     messages: list[dict[str, Any]],
     *,
-    train_on_reasoning: bool,
-) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
+    include_context_spans: bool = True,
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     marked_messages = deepcopy(messages)
-    markers: list[tuple[str, str]] = []
+    markers: list[dict[str, str]] = []
     marker_index = 0
 
-    def mark_value(value: Any) -> tuple[Any, bool]:
+    def mark_value(value: Any, *, kind: str, role: str) -> tuple[Any, bool]:
         nonlocal marker_index
         start_marker = f"\ue000AGD{marker_index}S\ue001"
         end_marker = f"\ue000AGD{marker_index}E\ue001"
         updated_value, changed = _wrap_with_markers(value, start_marker, end_marker)
         if changed:
-            markers.append((start_marker, end_marker))
+            markers.append(
+                {
+                    "start_marker": start_marker,
+                    "end_marker": end_marker,
+                    "kind": kind,
+                    "role": role,
+                }
+            )
             marker_index += 1
         return updated_value, changed
 
     for message in marked_messages:
-        if not _is_assistant_message(message):
+        if not isinstance(message, dict):
             continue
-        if train_on_reasoning:
+        role = str(message.get("role") or "")
+        if _is_assistant_message(message):
             reasoning = message.get("reasoning_content")
-            updated_reasoning, changed = mark_value(reasoning)
+            updated_reasoning, changed = mark_value(reasoning, kind=_SPAN_KIND_REASONING, role=role)
             if changed:
                 message["reasoning_content"] = updated_reasoning
-        tool_calls = message.get("tool_calls") or []
-        for tool_call in tool_calls:
-            function = tool_call.get("function")
-            if not isinstance(function, dict):
-                continue
-            name = function.get("name")
-            updated_name, changed = mark_value(name)
+            tool_calls = message.get("tool_calls") or []
+            for tool_call in tool_calls:
+                function = tool_call.get("function")
+                if not isinstance(function, dict):
+                    continue
+                name = function.get("name")
+                updated_name, changed = mark_value(name, kind=_SPAN_KIND_TOOL_CALL, role=role)
+                if changed:
+                    function["name"] = updated_name
+                arguments = function.get("arguments")
+                updated_arguments, changed = mark_value(arguments, kind=_SPAN_KIND_TOOL_CALL, role=role)
+                if changed:
+                    function["arguments"] = updated_arguments
+            content = message.get("content")
+            updated_content, changed = mark_value(content, kind=_SPAN_KIND_FINAL_ANSWER, role=role)
             if changed:
-                function["name"] = updated_name
-            arguments = function.get("arguments")
-            updated_arguments, changed = mark_value(arguments)
-            if changed:
-                function["arguments"] = updated_arguments
+                message["content"] = updated_content
+            continue
+        if role == "tool":
+            kind = _SPAN_KIND_TOOL_RESPONSE
+        elif role == "developer":
+            kind = _SPAN_KIND_DEVELOPER
+        elif role == "system":
+            kind = _SPAN_KIND_SYSTEM
+        elif role == "user":
+            kind = _SPAN_KIND_USER
+        else:
+            continue
+        if not include_context_spans:
+            continue
         content = message.get("content")
-        updated_content, changed = mark_value(content)
+        updated_content, changed = mark_value(content, kind=kind, role=role)
         if changed:
             message["content"] = updated_content
     return marked_messages, markers
 
 
-def _strip_markers_and_collect_spans(text: str, markers: list[tuple[str, str]]) -> tuple[str, list[tuple[int, int]]] | None:
+def _strip_markers_and_collect_spans(text: str, markers: list[dict[str, str]]) -> tuple[str, list[dict[str, Any]]] | None:
     if not markers:
         return text, []
     marker_lookup: dict[str, tuple[str, int]] = {}
     pattern_parts: list[str] = []
-    for index, (start_marker, end_marker) in enumerate(markers):
+    for index, marker in enumerate(markers):
+        start_marker = marker["start_marker"]
+        end_marker = marker["end_marker"]
         marker_lookup[start_marker] = ("start", index)
         marker_lookup[end_marker] = ("end", index)
         pattern_parts.append(re.escape(start_marker))
@@ -503,7 +572,7 @@ def _strip_markers_and_collect_spans(text: str, markers: list[tuple[str, str]]) 
     pattern = re.compile("|".join(pattern_parts))
     cleaned_parts: list[str] = []
     active_starts: dict[int, int] = {}
-    spans: list[tuple[int, int]] = []
+    spans: list[dict[str, Any]] = []
     cursor = 0
     cleaned_length = 0
     for match in pattern.finditer(text):
@@ -520,7 +589,17 @@ def _strip_markers_and_collect_spans(text: str, markers: list[tuple[str, str]]) 
             if start is None:
                 return None
             if start < cleaned_length:
-                spans.append((start, cleaned_length))
+                marker = markers[index]
+                spans.append(
+                    {
+                        "start": start,
+                        "end": cleaned_length,
+                        "source_start": start,
+                        "source_end": cleaned_length,
+                        "kind": marker["kind"],
+                        "role": marker["role"],
+                    }
+                )
         cursor = match.end()
     tail = text[cursor:]
     if tail:
@@ -528,9 +607,7 @@ def _strip_markers_and_collect_spans(text: str, markers: list[tuple[str, str]]) 
     if active_starts:
         return None
     cleaned_text = "".join(cleaned_parts)
-    if not spans:
-        return cleaned_text, []
-    return cleaned_text, _merge_spans(spans)
+    return cleaned_text, spans
 
 
 def _merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -552,6 +629,35 @@ def _reasoning_spans(text: str) -> list[tuple[int, int]]:
     for pattern in _REASONING_BLOCK_PATTERNS:
         spans.extend((match.start(), match.end()) for match in pattern.finditer(text))
     return _merge_spans(spans)
+
+
+def _tool_call_spans(text: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    for start_token, end_token in (("<|tool_call>", "<tool_call|>"), ("<tool_call>", "</tool_call>")):
+        spans.extend(_find_delimited_spans(text, start_token, end_token))
+    return _merge_spans(spans)
+
+
+def _expand_span_to_containing_delimiters(
+    text: str,
+    span: tuple[int, int],
+    delimiters: tuple[tuple[str, str], ...],
+) -> tuple[int, int]:
+    start, end = span
+    best: tuple[int, int] | None = None
+    for start_token, end_token in delimiters:
+        block_start = text.rfind(start_token, 0, start + 1)
+        if block_start < 0:
+            continue
+        end_start = text.find(end_token, end)
+        if end_start < 0:
+            continue
+        block_end = end_start + len(end_token)
+        if block_start <= start and end <= block_end:
+            candidate = (block_start, block_end)
+            if best is None or candidate[1] - candidate[0] < best[1] - best[0]:
+                best = candidate
+    return best if best is not None else span
 
 
 def _assistant_prompt_probe_contexts(messages: list[dict[str, Any]]) -> tuple[str, ...]:
@@ -696,6 +802,122 @@ def _expand_supervised_spans(
     return _merge_spans(expanded_spans)
 
 
+def _expand_typed_spans(
+    text: str,
+    spans: list[dict[str, Any]],
+    assistant_prompt_prefixes: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    expanded_spans: list[dict[str, Any]] = []
+    for span in spans:
+        start = span["start"]
+        end = span["end"]
+        kind = span.get("kind")
+        expanded_start, expanded_end = start, end
+        if kind in {_SPAN_KIND_REASONING, _SPAN_KIND_FINAL_ANSWER, _SPAN_KIND_TOOL_CALL}:
+            expanded = _expand_supervised_spans(
+                text,
+                [(start, end)],
+                assistant_prompt_prefixes,
+                train_on_reasoning=True,
+            )
+            if expanded:
+                expanded_start, expanded_end = expanded[0]
+        elif kind == _SPAN_KIND_TOOL_RESPONSE:
+            expanded_start, expanded_end = _expand_span_to_containing_delimiters(text, (start, end), _TOOL_RESPONSE_DELIMITERS)
+        updated = dict(span)
+        updated["start"] = expanded_start
+        updated["end"] = expanded_end
+        updated.setdefault("source_start", start)
+        updated.setdefault("source_end", end)
+        if expanded_start < expanded_end:
+            expanded_spans.append(updated)
+    return expanded_spans
+
+
+def _span_kind_enabled(
+    kind: str | None,
+    *,
+    train_on_reasoning: bool,
+    train_on_final_answers: bool,
+    train_on_tools: bool,
+    train_on_user: bool,
+    train_on_system: bool,
+    train_on_developer: bool,
+    train_on_tool_responses: bool,
+) -> bool:
+    if kind in (None, ""):
+        return True
+    return {
+        _SPAN_KIND_REASONING: train_on_reasoning,
+        _SPAN_KIND_FINAL_ANSWER: train_on_final_answers,
+        _SPAN_KIND_TOOL_CALL: train_on_tools,
+        _SPAN_KIND_USER: train_on_user,
+        _SPAN_KIND_SYSTEM: train_on_system,
+        _SPAN_KIND_DEVELOPER: train_on_developer,
+        _SPAN_KIND_TOOL_RESPONSE: train_on_tool_responses,
+    }.get(kind, True)
+
+
+def _source_spans_for_kind(spans: list[dict[str, Any]], kind: str) -> list[tuple[int, int]]:
+    source_spans: list[tuple[int, int]] = []
+    for span in spans:
+        if span.get("kind") != kind:
+            continue
+        start = span.get("source_start", span.get("start"))
+        end = span.get("source_end", span.get("end"))
+        if isinstance(start, int) and isinstance(end, int) and start < end:
+            source_spans.append((start, end))
+    return _merge_spans(source_spans)
+
+
+def _select_supervised_spans(
+    text: str,
+    spans: list[dict[str, Any]],
+    *,
+    train_on_reasoning: bool,
+    train_on_final_answers: bool,
+    train_on_tools: bool,
+    train_on_user: bool,
+    train_on_system: bool,
+    train_on_developer: bool,
+    train_on_tool_responses: bool,
+) -> list[tuple[int, int]]:
+    selected = _merge_spans(
+        [
+            (span["start"], span["end"])
+            for span in spans
+            if _span_kind_enabled(
+                span.get("kind"),
+                train_on_reasoning=train_on_reasoning,
+                train_on_final_answers=train_on_final_answers,
+                train_on_tools=train_on_tools,
+                train_on_user=train_on_user,
+                train_on_system=train_on_system,
+                train_on_developer=train_on_developer,
+                train_on_tool_responses=train_on_tool_responses,
+            )
+        ]
+    )
+    if not selected:
+        return []
+    if not train_on_reasoning:
+        selected = _subtract_spans(selected, _reasoning_spans(text))
+    if not train_on_final_answers:
+        selected = _subtract_spans(selected, _source_spans_for_kind(spans, _SPAN_KIND_FINAL_ANSWER))
+    if not train_on_tools:
+        selected = _subtract_spans(selected, _tool_call_spans(text))
+        selected = _subtract_spans(selected, _source_spans_for_kind(spans, _SPAN_KIND_TOOL_CALL))
+    if not train_on_tool_responses:
+        selected = _subtract_spans(selected, _tool_response_spans(text))
+    if not train_on_user:
+        selected = _subtract_spans(selected, _source_spans_for_kind(spans, _SPAN_KIND_USER))
+    if not train_on_system:
+        selected = _subtract_spans(selected, _source_spans_for_kind(spans, _SPAN_KIND_SYSTEM))
+    if not train_on_developer:
+        selected = _subtract_spans(selected, _source_spans_for_kind(spans, _SPAN_KIND_DEVELOPER))
+    return _merge_spans(selected)
+
+
 def _labels_from_offsets(
     input_ids: list[int],
     offsets: list[tuple[int, int]],
@@ -818,43 +1040,57 @@ def _supervised_text_and_spans(
     tools: list[dict[str, Any]],
     chat_template_kwargs: dict[str, Any],
     assistant_prompt_prefix_cache: dict[str, tuple[str, ...]],
-    train_on_reasoning: bool,
     strict: bool,
-) -> tuple[str, list[tuple[int, int]]]:
-    marked_messages, markers = _mark_supervised_messages(messages, train_on_reasoning=train_on_reasoning)
+) -> tuple[str, list[dict[str, Any]]]:
+    original_text = _render_chat(renderer, messages, tools, chat_template_kwargs)
+    marked_messages, markers = _mark_supervised_messages(messages)
     marked_text = _render_chat(renderer, marked_messages, tools, chat_template_kwargs)
     stripped = _strip_markers_and_collect_spans(marked_text, markers)
     del marked_text
-    original_text = _render_chat(renderer, messages, tools, chat_template_kwargs)
     if stripped is None:
         inferred_spans = _infer_supervised_spans_from_rendered_text(
             original_text,
-            train_on_reasoning=train_on_reasoning,
+            train_on_reasoning=True,
         )
         if inferred_spans:
-            return original_text, inferred_spans
+            return original_text, _span_dicts(inferred_spans)
         if strict:
             raise ValueError("Unable to collect supervised spans from marker-injected chat template output.")
         return original_text, []
     formatted_text, supervised_spans = stripped
     if formatted_text != original_text:
-        if strict:
-            raise ValueError("Marker-injected chat template output does not match the original rendered chat after marker removal.")
-        return original_text, _infer_supervised_spans_from_rendered_text(
-            original_text,
-            train_on_reasoning=train_on_reasoning,
-        )
+        assistant_marked_messages, assistant_markers = _mark_supervised_messages(messages, include_context_spans=False)
+        assistant_marked_text = _render_chat(renderer, assistant_marked_messages, tools, chat_template_kwargs)
+        assistant_stripped = _strip_markers_and_collect_spans(assistant_marked_text, assistant_markers)
+        del assistant_marked_text
+        if assistant_stripped is not None and assistant_stripped[0] == original_text:
+            formatted_text, supervised_spans = assistant_stripped
+        else:
+            if strict:
+                raise ValueError("Marker-injected chat template output does not match the original rendered chat after marker removal.")
+            inferred_spans = _infer_supervised_spans_from_rendered_text(original_text, train_on_reasoning=True)
+            return original_text, _span_dicts(inferred_spans)
     del original_text
     if markers and not supervised_spans:
         inferred_spans = _infer_supervised_spans_from_rendered_text(
             formatted_text,
-            train_on_reasoning=train_on_reasoning,
+            train_on_reasoning=True,
         )
         if inferred_spans:
-            return formatted_text, inferred_spans
+            return formatted_text, _span_dicts(inferred_spans)
     gemma_spans = _gemma_like_supervised_spans(formatted_text)
     if gemma_spans:
-        supervised_spans = gemma_spans
+        supervised_spans.extend(
+            {
+                "start": start,
+                "end": end,
+                "source_start": start,
+                "source_end": end,
+                "kind": _SPAN_KIND_FINAL_ANSWER,
+                "role": "assistant",
+            }
+            for start, end in gemma_spans
+        )
     assistant_prompt_prefixes = _resolve_assistant_prompt_prefixes(
         renderer,
         messages,
@@ -862,33 +1098,73 @@ def _supervised_text_and_spans(
         chat_template_kwargs,
         assistant_prompt_prefix_cache,
     )
-    supervised_spans = _expand_supervised_spans(
+    supervised_spans = _expand_typed_spans(
         formatted_text,
         supervised_spans,
         assistant_prompt_prefixes,
-        train_on_reasoning,
     )
-    supervised_spans = _subtract_spans(supervised_spans, _tool_response_spans(formatted_text))
-    if not train_on_reasoning:
-        supervised_spans = _subtract_spans(supervised_spans, _reasoning_spans(formatted_text))
     return formatted_text, supervised_spans
 
 
-def _span_dicts(spans: list[tuple[int, int]]) -> list[dict[str, int]]:
-    return [{"start": start, "end": end} for start, end in spans if start < end]
+def _span_dicts(spans: list[tuple[int, int]] | list[dict[str, Any]]) -> list[dict[str, Any]]:
+    span_dicts: list[dict[str, Any]] = []
+    for item in spans:
+        if isinstance(item, dict):
+            start = item.get("start")
+            end = item.get("end")
+            if not isinstance(start, int) or not isinstance(end, int) or start >= end:
+                continue
+            span = {"start": start, "end": end}
+            source_start = item.get("source_start", start)
+            source_end = item.get("source_end", end)
+            if isinstance(source_start, int) and isinstance(source_end, int) and source_start < source_end:
+                span["source_start"] = source_start
+                span["source_end"] = source_end
+            kind = item.get("kind")
+            if isinstance(kind, str) and kind:
+                span["kind"] = kind
+            role = item.get("role")
+            if isinstance(role, str) and role:
+                span["role"] = role
+            span_dicts.append(span)
+            continue
+        start, end = item
+        if start < end:
+            span_dicts.append({"start": start, "end": end})
+    return span_dicts
 
 
-def _normalize_span_dicts(value: Any) -> list[tuple[int, int]]:
-    spans: list[tuple[int, int]] = []
+def _normalize_span_metadata(value: Any) -> list[dict[str, Any]]:
+    spans: list[dict[str, Any]] = []
     for item in value or []:
         if isinstance(item, dict):
             start = item.get("start")
             end = item.get("end")
+            kind = item.get("kind")
+            role = item.get("role")
+            source_start = item.get("source_start", start)
+            source_end = item.get("source_end", end)
         else:
             start, end = item
+            kind = None
+            role = None
+            source_start = start
+            source_end = end
         if isinstance(start, int) and isinstance(end, int) and start < end:
-            spans.append((start, end))
-    return _merge_spans(spans)
+            span: dict[str, Any] = {"start": start, "end": end}
+            if isinstance(source_start, int) and isinstance(source_end, int) and source_start < source_end:
+                span["source_start"] = source_start
+                span["source_end"] = source_end
+            if isinstance(kind, str) and kind:
+                span["kind"] = kind
+            if isinstance(role, str) and role:
+                span["role"] = role
+            spans.append(span)
+    return spans
+
+
+def _normalize_span_dicts(value: Any) -> list[tuple[int, int]]:
+    return _merge_spans([(span["start"], span["end"]) for span in _normalize_span_metadata(value)])
 
 
 def format_data(
@@ -899,7 +1175,8 @@ def format_data(
     tools_column: str = "tools",
     text_column: str = "text",
     chat_template_kwargs: dict[str, Any] | None = None,
-    train_on_reasoning: bool = True,
+    train_on_reasoning: bool | None = None,
+    teich_masking: bool = True,
     max_length: int | None = None,
     drop_oversized_examples: bool = True,
     tokenize: bool = False,
@@ -924,6 +1201,7 @@ def format_data(
                         text_column=text_column,
                         chat_template_kwargs=chat_template_kwargs,
                         train_on_reasoning=train_on_reasoning,
+                        teich_masking=teich_masking,
                         max_length=max_length,
                         drop_oversized_examples=drop_oversized_examples,
                         tokenize=tokenize,
@@ -947,7 +1225,9 @@ def format_data(
     if messages_column not in dataset.column_names:
         raise TypeError(f"Dataset is missing required '{messages_column}' column")
 
-    output_columns = [text_column, TEICH_SUPERVISED_SPANS_COLUMN]
+    output_columns = [text_column]
+    if teich_masking:
+        output_columns.append(TEICH_SUPERVISED_SPANS_COLUMN)
     if tokenize:
         output_columns.extend(["input_ids", "attention_mask"])
 
@@ -970,21 +1250,25 @@ def format_data(
             if len(messages) == 0:
                 dropped_count += 1
                 continue
+            messages = _normalize_tool_call_arguments_for_template(messages)
             tools = tools_batch[index] or []
             if not isinstance(tools, list):
                 raise TypeError(f"Row is missing a list-valued '{tools_column}' column")
-            text, supervised_spans = _supervised_text_and_spans(
-                renderer,
-                messages,
-                tools,
-                template_kwargs,
-                assistant_prompt_prefix_cache,
-                train_on_reasoning,
-                strict,
-            )
-            if not supervised_spans:
-                dropped_count += 1
-                continue
+            if teich_masking:
+                text, supervised_spans = _supervised_text_and_spans(
+                    renderer,
+                    messages,
+                    tools,
+                    template_kwargs,
+                    assistant_prompt_prefix_cache,
+                    strict,
+                )
+                if not supervised_spans:
+                    dropped_count += 1
+                    continue
+            else:
+                text = _render_chat(renderer, messages, tools, template_kwargs)
+                supervised_spans = []
             tokenized: tuple[list[int], list[int]] | None = None
             if tokenize:
                 tokenized = _tokenize_trainer_text(text_tokenizer, text)
@@ -996,7 +1280,8 @@ def format_data(
                     dropped_oversized_count += 1
                     continue
             output_batch[text_column].append(text)
-            output_batch[TEICH_SUPERVISED_SPANS_COLUMN].append(_span_dicts(supervised_spans))
+            if teich_masking:
+                output_batch[TEICH_SUPERVISED_SPANS_COLUMN].append(_span_dicts(supervised_spans))
             if tokenized is not None:
                 input_ids, attention_mask = tokenized
                 output_batch["input_ids"].append(input_ids)
@@ -1010,12 +1295,14 @@ def format_data(
         remove_columns=dataset.column_names,
     )
     if formatted_data.num_rows == 0 and dropped_count > 0:
-        raise ValueError("Dataset contains no rows with trainable assistant spans.")
+        if teich_masking:
+            raise ValueError("Dataset contains no rows with trainable assistant spans.")
+        raise ValueError("Dataset contains no non-empty conversations.")
     if formatted_data.num_rows == 0 and drop_oversized_examples and effective_max_length is not None and dropped_oversized_count > 0:
         raise ValueError(
             f"Dataset contains no conversations that fit within context window of {effective_max_length} tokens."
         )
-    if verbose and dropped_count:
+    if verbose and dropped_count and teich_masking:
         Console().print(f"[yellow]Dropped {dropped_count} rows without trainable assistant spans.[/yellow]")
     if verbose and dropped_oversized_count:
         Console().print(f"[yellow]Dropped {dropped_oversized_count} rows above {effective_max_length} tokens.[/yellow]")
@@ -1026,14 +1313,34 @@ def _mask_tokenized_row(
     row: dict[str, Any],
     text_tokenizer: Any,
     text_column: str,
+    *,
     train_on_reasoning: bool,
-) -> dict[str, Any]:
+    train_on_final_answers: bool,
+    train_on_tools: bool,
+    train_on_user: bool,
+    train_on_system: bool,
+    train_on_developer: bool,
+    train_on_tool_responses: bool,
+) -> dict[str, Any] | None:
     input_ids = _extract_token_sequence(row.get("input_ids"))
     if input_ids is None:
         raise TypeError("Trainer dataset row is missing tokenized 'input_ids'.")
     text = row.get(text_column)
-    supervised_spans = _normalize_span_dicts(row.get(TEICH_SUPERVISED_SPANS_COLUMN))
-    if isinstance(text, str) and supervised_spans:
+    span_metadata = _normalize_span_metadata(row.get(TEICH_SUPERVISED_SPANS_COLUMN))
+    if isinstance(text, str) and span_metadata:
+        supervised_spans = _select_supervised_spans(
+            text,
+            span_metadata,
+            train_on_reasoning=train_on_reasoning,
+            train_on_final_answers=train_on_final_answers,
+            train_on_tools=train_on_tools,
+            train_on_user=train_on_user,
+            train_on_system=train_on_system,
+            train_on_developer=train_on_developer,
+            train_on_tool_responses=train_on_tool_responses,
+        )
+        if not supervised_spans:
+            return None
         encoded = _tokenize_trainer_text_with_offsets(text_tokenizer, text)
         if encoded is None:
             decoded_text, offsets = _token_text_and_offsets(text_tokenizer, input_ids)
@@ -1052,6 +1359,20 @@ def _mask_tokenized_row(
     else:
         text, offsets = _token_text_and_offsets(text_tokenizer, input_ids)
         supervised_spans = _infer_supervised_spans_from_rendered_text(text, train_on_reasoning=train_on_reasoning)
+        inferred_metadata = _span_dicts(supervised_spans)
+        supervised_spans = _select_supervised_spans(
+            text,
+            inferred_metadata,
+            train_on_reasoning=train_on_reasoning,
+            train_on_final_answers=train_on_final_answers,
+            train_on_tools=train_on_tools,
+            train_on_user=train_on_user,
+            train_on_system=train_on_system,
+            train_on_developer=train_on_developer,
+            train_on_tool_responses=train_on_tool_responses,
+        )
+        if not supervised_spans:
+            return None
         labels = _labels_from_offsets(input_ids, offsets, supervised_spans)
     if all(label == -100 for label in labels):
         raise ValueError("Teich masking produced a fully masked row after trainer tokenization/truncation.")
@@ -1164,6 +1485,12 @@ def mask_data(
     tokenizer: Any | None = None,
     text_column: str | None = None,
     train_on_reasoning: bool = True,
+    train_on_final_answers: bool = True,
+    train_on_tools: bool = True,
+    train_on_user: bool = False,
+    train_on_system: bool = False,
+    train_on_developer: bool = False,
+    train_on_tool_responses: bool = False,
     max_supervised_tokens: int | None = None,
     audit: bool = True,
     audit_sample_size: int = 8,
@@ -1218,17 +1545,33 @@ def mask_data(
         if missing:
             raise ValueError(f"trainer.{dataset_name} is missing required columns for mask_data: {', '.join(sorted(missing))}")
         dropped_supervised_count = 0
+        dropped_untrainable_count = 0
 
         def _empty_output_batch() -> dict[str, list[Any]]:
             return {"input_ids": [], "labels": []}
 
         def _mask_batch(batch: dict[str, list[Any]]) -> dict[str, list[Any]]:
             nonlocal dropped_supervised_count
+            nonlocal dropped_untrainable_count
             output_batch = _empty_output_batch()
             batch_size = len(batch["input_ids"])
             for index in range(batch_size):
                 row = {column_name: batch[column_name][index] for column_name in dataset.column_names}
-                masked_row = _mask_tokenized_row(row, text_tokenizer, dataset_text_field, train_on_reasoning)
+                masked_row = _mask_tokenized_row(
+                    row,
+                    text_tokenizer,
+                    dataset_text_field,
+                    train_on_reasoning=train_on_reasoning,
+                    train_on_final_answers=train_on_final_answers,
+                    train_on_tools=train_on_tools,
+                    train_on_user=train_on_user,
+                    train_on_system=train_on_system,
+                    train_on_developer=train_on_developer,
+                    train_on_tool_responses=train_on_tool_responses,
+                )
+                if masked_row is None:
+                    dropped_untrainable_count += 1
+                    continue
                 supervised_tokens = sum(1 for label in masked_row["labels"] if label != -100)
                 if (
                     effective_max_supervised_tokens is not None
@@ -1254,6 +1597,13 @@ def mask_data(
             raise ValueError(
                 f"trainer.{dataset_name} contains no rows at or below max_supervised_tokens={effective_max_supervised_tokens}."
             )
+        if masked_dataset.num_rows == 0 and dropped_untrainable_count > 0:
+            raise ValueError(
+                f"trainer.{dataset_name} contains no rows selected by the Teich masking policy; "
+                "Teich masking produced fully masked rows."
+            )
+        if verbose and dropped_untrainable_count:
+            Console().print(f"[yellow]Dropped {dropped_untrainable_count} {dataset_name} rows with no selected training spans.[/yellow]")
         if verbose and dropped_supervised_count:
             Console().print(
                 f"[yellow]Dropped {dropped_supervised_count} {dataset_name} rows above "

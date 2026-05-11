@@ -145,7 +145,6 @@ train_dataset = prepare_data(
     split="train",
     max_examples=500,
     chat_template_kwargs=CHAT_TEMPLATE_KWARGS,
-    train_on_reasoning=TRAIN_ON_REASONING,
     max_length=MAX_SEQ_LEN,
     drop_oversized_examples=True,
     tokenize=True,
@@ -177,7 +176,13 @@ trainer = SFTTrainer(
         report_to="none",
     ),
 )
-trainer = mask_data(trainer, tokenizer=tokenizer)
+trainer = mask_data(
+    trainer,
+    tokenizer=tokenizer,
+    train_on_reasoning=TRAIN_ON_REASONING,
+    train_on_final_answers=True,
+    train_on_tools=True,
+)
 
 gpu_stats = torch.cuda.get_device_properties(0)
 start_gpu_memory = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
@@ -201,9 +206,9 @@ print(f"Peak reserved memory for training % of max memory = {lora_percentage} %.
 model.push_to_hub_merged(PUSH_TO_HUB_REPO_ID, tokenizer, save_method="merged_16bit", token=HF_TOKEN)
 ```
 
-`prepare_data` loads local folders, local files, Hugging Face datasets, or a list mixing any of those with already-loaded `datasets.Dataset` objects; applies the tokenizer chat template; optionally tokenizes only to drop rows above `max_length`; and returns trainer-friendly `text` rows with Teich supervision metadata for multi-turn/tool-aware masking. Pass `tokenize=True` for the Unsloth/TRL flow so trainer setup treats the dataset as already tokenized and preserves Teich's supervision metadata for `mask_data`. Mixed chat-only and tool-call datasets are formatted separately before concatenation, so their schemas do not need to match beyond the normalized `messages`/`tools` fields.
+`prepare_data` loads local folders, local files, Hugging Face datasets, or a list mixing any of those with already-loaded `datasets.Dataset` objects; applies the tokenizer chat template; optionally tokenizes only to drop rows above `max_length`; and returns trainer-friendly `text` rows with typed Teich span metadata for multi-turn/tool-aware masking. Pass `tokenize=True` for the Unsloth/TRL flow so trainer setup treats the dataset as already tokenized and preserves Teich's span metadata for `mask_data`. If you do not want Teich response-only masking, pass `teich_masking=False`; `prepare_data()` will return plain rendered `text` rows, plus `input_ids` and `attention_mask` when `tokenize=True`, ready for a standard trainer flow. Mixed chat-only and tool-call datasets are formatted separately before concatenation, so their schemas do not need to match beyond the normalized `messages`/`tools` fields.
 
-`mask_data` follows the same trainer-first shape as Unsloth's response-only helper, but uses Teich's span metadata so multi-turn tool calls and tool responses are masked correctly. It returns a compact trainer dataset with only `input_ids` and `labels`; the trainer collator builds attention masks dynamically. Keep `packing=False` for this flow because packed datasets merge row boundaries before masking. For long-context runs, `max_supervised_tokens` defaults to the trainer's `max_length` to cap the number of trainable answer tokens per row; pass a lower value if loss memory is still too high.
+`mask_data` follows the same trainer-first shape as Unsloth's response-only helper, but uses Teich's typed span metadata so multi-turn tool calls and tool responses are masked correctly. By default it trains on assistant reasoning, assistant final answers, and assistant tool calls, while keeping user/system/developer/tool-response text masked. You can override that policy with `train_on_reasoning`, `train_on_final_answers`, `train_on_tools`, `train_on_user`, `train_on_system`, `train_on_developer`, and `train_on_tool_responses`. It returns a compact trainer dataset with only `input_ids` and `labels`; the trainer collator builds attention masks dynamically. Keep `packing=False` for this flow because packed datasets merge row boundaries before masking. For long-context runs, `max_supervised_tokens` defaults to the trainer's `max_length` to cap the number of trainable answer tokens per row; pass a lower value if loss memory is still too high.
 
 To combine datasets, pass a list of dataset IDs, local paths, or loaded `datasets.Dataset` objects:
 

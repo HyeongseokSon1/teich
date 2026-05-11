@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from datasets import Dataset
 import pytest
 
-from teich import mask_data, prepare_data, preview_sft_example
+from teich import load_traces, mask_data, prepare_data, preview_sft_example
 from teich.formatter import _labels_from_offsets
 
 
@@ -846,8 +846,166 @@ def test_prepare_data_renders_text_and_supervised_spans_for_trainer_flow():
     assert prepared.column_names == ["text", "teich_supervised_spans"]
     assert prepared[0]["text"] == "<user>hello</user><assistant><think>think</think>world</assistant>"
     spans = prepared[0]["teich_supervised_spans"]
-    supervised_text = "".join(prepared[0]["text"][span["start"] : span["end"]] for span in spans)
-    assert supervised_text == "<think>think</think>world</assistant>"
+    assert {span.get("kind") for span in spans} == {"user", "reasoning", "final_answer"}
+    source_text_by_kind = {
+        span["kind"]: prepared[0]["text"][span["source_start"] : span["source_end"]]
+        for span in spans
+    }
+    assert source_text_by_kind["user"] == "hello"
+    assert source_text_by_kind["reasoning"] == "think"
+    assert source_text_by_kind["final_answer"] == "world"
+
+
+def test_mask_data_applies_policy_flags_to_typed_prepare_spans():
+    tokenizer = FakeTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "system", "content": "system rules"},
+                    {"role": "user", "content": "run command"},
+                    {
+                        "role": "assistant",
+                        "content": "final answer",
+                        "reasoning_content": "private reasoning",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "bash", "arguments": {"command": "ls"}},
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call_1", "name": "bash", "content": "tool output"},
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+    prepared = prepare_data(dataset, tokenizer, verbose=False)
+
+    def supervised_text(**mask_kwargs):
+        trainer = SimpleNamespace(
+            train_dataset=prepared,
+            eval_dataset=None,
+            tokenizer=tokenizer,
+            args=SimpleNamespace(dataset_text_field="text", packing=False),
+        )
+        trainer = mask_data(trainer, tokenizer=tokenizer, audit=False, verbose=False, **mask_kwargs)
+        row = trainer.train_dataset[0]
+        return tokenizer.decode([token for token in row["labels"] if token != -100])
+
+    default_text = supervised_text()
+    assert "private reasoning" in default_text
+    assert "<tool_call>bash</tool_call>" in default_text
+    assert "final answer" in default_text
+    assert "system rules" not in default_text
+    assert "run command" not in default_text
+    assert "tool output" not in default_text
+
+    no_reasoning = supervised_text(train_on_reasoning=False)
+    assert "private reasoning" not in no_reasoning
+    assert "<tool_call>bash</tool_call>" in no_reasoning
+    assert "final answer" in no_reasoning
+
+    no_tools = supervised_text(train_on_tools=False)
+    assert "<tool_call>bash</tool_call>" not in no_tools
+    assert "private reasoning" in no_tools
+    assert "final answer" in no_tools
+
+    no_final = supervised_text(train_on_final_answers=False)
+    assert "final answer" not in no_final
+    assert "private reasoning" in no_final
+    assert "<tool_call>bash</tool_call>" in no_final
+
+    non_model_text = supervised_text(
+        train_on_reasoning=False,
+        train_on_final_answers=False,
+        train_on_tools=False,
+        train_on_user=True,
+        train_on_system=True,
+        train_on_tool_responses=True,
+    )
+    assert "system rules" in non_model_text
+    assert "run command" in non_model_text
+    assert "tool output" in non_model_text
+    assert "private reasoning" not in non_model_text
+    assert "final answer" not in non_model_text
+    assert "<tool_call>bash</tool_call>" not in non_model_text
+
+
+def test_prepare_data_can_return_plain_rendered_text_without_teich_masking():
+    tokenizer = FakeTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "system", "content": "system rules"},
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "world", "reasoning_content": "think"},
+                ],
+                "tools": [],
+            },
+            {
+                "messages": [
+                    {"role": "user", "content": "question without assistant"},
+                ],
+                "tools": [],
+            },
+        ]
+    )
+
+    prepared = prepare_data(dataset, tokenizer, teich_masking=False, verbose=False)
+
+    assert prepared.column_names == ["text"]
+    assert prepared.num_rows == 2
+    assert prepared[0]["text"] == "<system>system rules</system><user>hello</user><assistant><think>think</think>world</assistant>"
+    assert prepared[1]["text"] == "<user>question without assistant</user>"
+
+
+def test_prepare_data_plain_text_mode_can_still_tokenize_and_filter_by_length():
+    tokenizer = TrainerStyleTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "world"},
+                ],
+                "tools": [],
+            },
+            {
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "x" * 100},
+                ],
+                "tools": [],
+            },
+        ]
+    )
+
+    prepared = prepare_data(
+        dataset,
+        tokenizer,
+        teich_masking=False,
+        tokenize=True,
+        max_length=60,
+        verbose=False,
+    )
+
+    assert prepared.column_names == ["text", "input_ids", "attention_mask"]
+    assert prepared.num_rows == 1
+    assert prepared[0]["text"] == "<user>hello</user><assistant>world</assistant>"
+    assert prepared[0]["input_ids"]
+    assert prepared[0]["attention_mask"] == [1] * len(prepared[0]["input_ids"])
 
 
 def test_prepare_data_can_emit_tokenized_rows_for_trainer_skip_prepare_flow():
@@ -2239,7 +2397,7 @@ _REAL_TEMPLATE_COMPATIBILITY_CASES = [
             "template_path": "gemma-4-chat-template.jinja",
             "chat_template_kwargs": {"enable_thinking": False},
             "train_on_reasoning": False,
-            "expected_supervised_substrings": ["<|tool_call>call:bash", "command:<|", "ls", "done"],
+            "expected_supervised_substrings": ["<|tool_call>call:bash", '"command":', "ls", "done"],
             "forbidden_supervised_substrings": ["inspect repo", "response:bash", "file_a.py"],
         },
         id="gemma4-thinking-off-no-reasoning-labels",
@@ -2332,6 +2490,138 @@ def test_prepare_and_mask_actual_gemma4_keeps_reasoning_on_earlier_tool_turns():
     assert "final reasoning" in supervised_text
     assert "SECRET_TOOL_OUTPUT" not in supervised_text
     assert "SECRET_TOOL_OUTPUT" in masked_text
+
+
+def test_actual_gemma4_template_keeps_tool_responses_out_of_model_turns_and_uses_json_arguments():
+    jinja2 = pytest.importorskip("jinja2")
+    template_path = Path("gemma-4-chat-template.jinja")
+    if not template_path.exists():
+        pytest.skip(f"{template_path} is not available")
+
+    tokenizer = RealJinjaChatTemplateTokenizer(template_path, jinja2)
+    rendered = tokenizer.apply_chat_template(
+        _real_template_tool_call_dataset()[0]["messages"],
+        tools=_real_template_tool_call_dataset()[0]["tools"],
+        enable_thinking=True,
+    )
+
+    assert '<|tool_call>call:bash{"command": "ls"}<tool_call|><turn|>\n<|turn>user\n<|tool_response>' in rendered
+    assert "<|tool_response>" not in rendered.split("<|turn>model\n", 2)[1].split("<turn|>", 1)[0]
+    assert "<|turn>user\n<|tool_response>" in rendered
+    assert "<|turn>model\ndone<turn|>" in rendered
+
+
+def test_actual_qwen_template_receives_normalized_mapping_tool_arguments():
+    jinja2 = pytest.importorskip("jinja2")
+    template_path = Path("qwen3.6_chat_template.jinja")
+    if not template_path.exists():
+        pytest.skip(f"{template_path} is not available")
+
+    tokenizer = RealJinjaChatTemplateTokenizer(template_path, jinja2)
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "list files"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": "inspect repo",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "bash", "arguments": '{"command":"ls"}'},
+                            }
+                        ],
+                    },
+                ],
+                "tools": _real_template_tool_call_dataset()[0]["tools"],
+            }
+        ]
+    )
+
+    prepared = prepare_data(
+        dataset,
+        tokenizer,
+        chat_template_kwargs={"enable_thinking": True, "preserve_thinking": True},
+        strict=True,
+        verbose=False,
+    )
+
+    rendered = prepared[0]["text"]
+    assert "<function=bash>" in rendered
+    assert "<parameter=command>\nls\n</parameter>" in rendered
+    assert "<function=bash>\n</function>" not in rendered
+
+
+def test_codex_trace_conversion_to_qwen_template_keeps_tool_arguments_parseable(tmp_path: Path):
+    jinja2 = pytest.importorskip("jinja2")
+    template_path = Path("qwen3.6_chat_template.jinja")
+    if not template_path.exists():
+        pytest.skip(f"{template_path} is not available")
+
+    trace_file = tmp_path / "trace.jsonl"
+    events = [
+        {
+            "type": "session_meta",
+            "payload": {
+                "base_instructions": {
+                    "text": "You are a coding agent.\n\nAvailable tools:\n- bash: Execute shell commands\n"
+                },
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "List files"}],
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "bash",
+                "call_id": "call_1",
+                "arguments": '{"command":"ls -la"}',
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": [{"type": "output_text", "text": "file_a.py"}],
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Found file_a.py."}],
+            },
+        },
+    ]
+    trace_file.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+
+    tokenizer = RealJinjaChatTemplateTokenizer(template_path, jinja2)
+    dataset = load_traces(tmp_path, split=None)
+    prepared = prepare_data(
+        dataset,
+        tokenizer,
+        chat_template_kwargs={"enable_thinking": True, "preserve_thinking": True},
+        strict=True,
+        verbose=False,
+    )
+
+    rendered = prepared[0]["text"]
+    assert "<function=bash>" in rendered
+    assert "<parameter=command>\nls -la\n</parameter>" in rendered
+    assert "<function=bash>\n</function>" not in rendered
+    assert "<tool_response>\nfile_a.py\n</tool_response>" in rendered
 
 
 def test_prepare_and_mask_drops_untrainable_rows_with_actual_gemma4_template_under_strict_mode():

@@ -145,6 +145,34 @@
         {{- argument -}}
     {%- endif -%}
 {%- endmacro -%}
+{%- macro format_json_argument(argument) -%}
+    {%- if argument is string -%}
+        {{- '"' + argument | replace('\\', '\\\\') | replace('"', '\\"') | replace('\n', '\\n') + '"' -}}
+    {%- elif argument is boolean -%}
+        {{- 'true' if argument else 'false' -}}
+    {%- elif argument is mapping -%}
+        {{- '{' -}}
+        {%- set ns = namespace(found_first=false) -%}
+        {%- for key, value in argument | dictsort -%}
+            {%- if ns.found_first %},{% endif -%}
+            {%- set ns.found_first = true -%}
+            {{- '"' + key | replace('\\', '\\\\') | replace('"', '\\"') + '": ' -}}
+            {{- format_json_argument(value) -}}
+        {%- endfor -%}
+        {{- '}' -}}
+    {%- elif argument is sequence -%}
+        {{- '[' -}}
+        {%- for item in argument -%}
+            {{- format_json_argument(item) -}}
+            {%- if not loop.last %},{% endif -%}
+        {%- endfor -%}
+        {{- ']' -}}
+    {%- elif argument is none -%}
+        {{- 'null' -}}
+    {%- else -%}
+        {{- argument -}}
+    {%- endif -%}
+{%- endmacro -%}
 {%- macro strip_thinking(text) -%}
     {%- set ns = namespace(result='') -%}
     {%- for part in text.split('<channel|>') -%}
@@ -214,7 +242,25 @@
 
 {#- Loop through messages -#}
 {%- for message in loop_messages -%}
-    {%- if message['role'] != 'tool' -%}
+    {%- if message['role'] == 'tool' -%}
+        {{- '<|turn>user\n' -}}
+        {%- set tool_body = message.get('content') -%}
+        {%- if tool_body is string -%}
+            {{- format_tool_response_block(message.get('name') | default('unknown'), tool_body) -}}
+        {%- elif tool_body is sequence and tool_body is not string -%}
+            {%- set ns_txt = namespace(s='') -%}
+            {%- for part in tool_body -%}
+                {%- if part.get('type') == 'text' -%}
+                    {%- set ns_txt.s = ns_txt.s + (part.get('text') | default('')) -%}
+                {%- endif -%}
+            {%- endfor -%}
+            {{- format_tool_response_block(message.get('name') | default('unknown'), ns_txt.s) -}}
+        {%- else -%}
+            {{- format_tool_response_block(message.get('name') | default('unknown'), tool_body) -}}
+        {%- endif -%}
+        {{- '<turn|>\n' -}}
+        {%- set ns.prev_message_type = 'tool_response' -%}
+    {%- else -%}
     {%- set ns.prev_message_type = None -%}
     {%- set role = 'model' if message['role'] == 'assistant' else message['role'] -%}
     {#- Detect continuation: suppress duplicate <|turn>model when previous non-tool message was also assistant -#}
@@ -229,7 +275,8 @@
             {%- endif -%}
         {%- endfor -%}
     {%- endif -%}
-    {%- set continue_same_model_turn = (role == 'model' and prev_nt.role == 'assistant') -%}
+    {%- set prev_role = loop_messages[loop.index0 - 1]['role'] if loop.index0 > 0 else none -%}
+    {%- set continue_same_model_turn = (role == 'model' and prev_nt.role == 'assistant' and prev_role != 'tool') -%}
     {%- if not continue_same_model_turn -%}
         {{- '<|turn>' + role + '\n' }}
     {%- endif -%}
@@ -243,18 +290,15 @@
             {%- if message['tool_calls'] -%}
                 {%- for tool_call in message['tool_calls'] -%}
                     {%- set function = tool_call['function'] -%}
-                    {{- '<|tool_call>call:' + function['name'] + '{' -}}
+                    {{- '<|tool_call>call:' + function['name'] -}}
                     {%- if function['arguments'] is mapping -%}
-                        {%- set ns_args = namespace(found_first=false) -%}
-                        {%- for key, value in function['arguments'] | dictsort -%}
-                            {%- if ns_args.found_first %},{% endif -%}
-                            {%- set ns_args.found_first = true -%}
-                            {{- key -}}:{{- format_argument(value, escape_keys=False) -}}
-                        {%- endfor -%}
+                        {{- format_json_argument(function['arguments']) -}}
                     {%- elif function['arguments'] is string -%}
                         {{- function['arguments'] -}}
+                    {%- else -%}
+                        {{- '{}' -}}
                     {%- endif -%}
-                    {{- '}<tool_call|>' -}}
+                    {{- '<tool_call|>' -}}
                 {%- endfor -%}
                 {%- set ns.prev_message_type = 'tool_call' -%}
             {%- endif -%}
@@ -266,41 +310,6 @@
                     {{- format_tool_response_block(tool_response['name'] | default('unknown'), tool_response['response']) -}}
                     {%- set ns_tr_out.flag = true -%}
                     {%- set ns.prev_message_type = 'tool_response' -%}
-                {%- endfor -%}
-            {%- elif message.get('tool_calls') -%}
-                {#- OpenAI Chat Completions: forward-scan consecutive role:tool messages -#}
-                {%- set ns_tool_scan = namespace(stopped=false) -%}
-                {%- for k in range(loop.index0 + 1, loop_messages | length) -%}
-                    {%- if ns_tool_scan.stopped -%}
-                    {%- elif loop_messages[k]['role'] != 'tool' -%}
-                        {%- set ns_tool_scan.stopped = true -%}
-                    {%- else -%}
-                        {%- set follow = loop_messages[k] -%}
-                        {#- Resolve tool_call_id to function name -#}
-                        {%- set ns_tname = namespace(name=follow.get('name') | default('unknown')) -%}
-                        {%- for tc in message['tool_calls'] -%}
-                            {%- if tc.get('id') == follow.get('tool_call_id') -%}
-                                {%- set ns_tname.name = tc['function']['name'] -%}
-                            {%- endif -%}
-                        {%- endfor -%}
-                        {#- Handle content as string or content-parts array -#}
-                        {%- set tool_body = follow.get('content') -%}
-                        {%- if tool_body is string -%}
-                            {{- format_tool_response_block(ns_tname.name, tool_body) -}}
-                        {%- elif tool_body is sequence and tool_body is not string -%}
-                            {%- set ns_txt = namespace(s='') -%}
-                            {%- for part in tool_body -%}
-                                {%- if part.get('type') == 'text' -%}
-                                    {%- set ns_txt.s = ns_txt.s + (part.get('text') | default('')) -%}
-                                {%- endif -%}
-                            {%- endfor -%}
-                            {{- format_tool_response_block(ns_tname.name, ns_txt.s) -}}
-                        {%- else -%}
-                            {{- format_tool_response_block(ns_tname.name, tool_body) -}}
-                        {%- endif -%}
-                        {%- set ns_tr_out.flag = true -%}
-                        {%- set ns.prev_message_type = 'tool_response' -%}
-                    {%- endif -%}
                 {%- endfor -%}
             {%- endif -%}
 
@@ -336,9 +345,7 @@
             {{- captured_content -}}
             {%- set has_content = captured_content | trim | length > 0 -%}
 
-        {%- if ns.prev_message_type == 'tool_call' and not ns_tr_out.flag -%}
-            {{- '<|tool_response>' -}}
-        {%- elif not (ns_tr_out.flag and not has_content) -%}
+        {%- if not (ns_tr_out.flag and not has_content) -%}
             {{- '<turn|>\n' -}}
         {%- endif -%}
     {%- endif -%}

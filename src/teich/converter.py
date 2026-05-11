@@ -67,6 +67,16 @@ def _tool_result_content_text(payload: dict[str, Any]) -> str:
     return _first_text_block(payload.get("content"))
 
 
+def _function_call_output_text(payload: dict[str, Any]) -> str:
+    output = payload.get("output")
+    if isinstance(output, str):
+        return output
+    text = _first_text_block(output)
+    if text:
+        return text
+    return str(output or "")
+
+
 def _is_tool_not_found_result(tool_name: str | None, payload: dict[str, Any]) -> bool:
     content = _tool_result_content_text(payload).strip()
     if tool_name:
@@ -414,7 +424,7 @@ def _convert_codex_trace_to_training_example(
                     "role": "tool",
                     "tool_call_id": call_id,
                     "name": tool_name or "unknown_tool",
-                    "content": str(payload.get("output") or ""),
+                    "content": _function_call_output_text(payload),
                 }
             )
             continue

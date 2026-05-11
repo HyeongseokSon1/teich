@@ -107,7 +107,9 @@ def test_write_traces_readme_for_structured_chat_dataset_skips_tools_json(tmp_pa
     assert "train_dataset = prepare_data(" in readme
     assert "You can combine this dataset with other Teich chat-only or tool-call datasets" in readme
     assert "['username/repo', 'username/other-teich-dataset']" in readme
-    assert "trainer = mask_data(trainer, tokenizer=tokenizer)" in readme
+    assert "trainer = mask_data(" in readme
+    assert "train_on_reasoning=TRAIN_ON_REASONING" in readme
+    assert "prepare_data(..., teich_masking=False)" in readme
     assert "tools=example.get('tools') or []" not in readme
     assert "Chat-only datasets include `messages` plus convenience fields like `system`, `prompt`, `thinking`, and `response`." in readme
     assert "## Training-ready tools" not in readme

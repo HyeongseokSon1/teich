@@ -57,14 +57,10 @@ flowchart TD
     Q --> R["Validate tools column is a list or default []"]
     R --> S["_supervised_text_and_spans"]
 
-    S --> S1["Deep-copy assistant messages"]
-    S1 --> S2["Inject invisible markers around trainable assistant fields"]
-    S2 --> S3["Trainable fields: assistant content, tool call name, tool call arguments"]
-    S3 --> S4{"train_on_reasoning?"}
-    S4 -->|"true"| S5["Also mark assistant reasoning_content"]
-    S4 -->|"false"| S6["Do not mark reasoning_content"]
-    S5 --> S7["Render marked chat template"]
-    S6 --> S7
+    S --> S1["Deep-copy messages"]
+    S1 --> S2["Inject invisible markers around typed candidate fields"]
+    S2 --> S3["Candidate fields: assistant reasoning, final answers, tool calls, tool responses, user/system/developer text"]
+    S3 --> S7["Render marked chat template"]
     S7 --> S8["Strip markers and collect character spans"]
     S8 --> S8A{"Markers collected cleanly?"}
     S8A -->|"no"| S8B["Render original chat template and infer assistant/model spans"]
@@ -77,12 +73,8 @@ flowchart TD
     S10 -->|"no and strict=True"| S11["Raise ValueError"]
     S10 -->|"no and strict=False"| S12["Infer assistant/model spans from original text"]
     S10 -->|"yes"| S13["Infer assistant prompt prefixes"]
-    S13 --> S14["Expand spans to include desired assistant output wrappers"]
-    S14 --> S15{"train_on_reasoning?"}
-    S15 -->|"true"| S16["Keep reasoning spans; Qwen <think> start tag is supervised"]
-    S15 -->|"false"| S17["Subtract reasoning blocks from supervised spans"]
-    S16 --> T["Return text + supervised spans"]
-    S17 --> T
+    S13 --> S14["Expand candidate spans to include relevant template wrappers"]
+    S14 --> T["Return text + typed span metadata"]
     S12 --> T
 
     T --> U{"Any supervised spans?"}
@@ -95,8 +87,11 @@ flowchart TD
     V2 -->|"no"| W["Emit prepared row"]
     V -->|"no"| W
 
-    W --> X["Output columns only: text + teich_supervised_spans"]
-    X --> Z
+    W --> X{"teich_masking?"}
+    X -->|"true"| X1["Output: text + teich_supervised_spans, plus tokens when tokenize=True"]
+    X -->|"false"| X2["Output: text only, plus tokens when tokenize=True"]
+    X1 --> Z
+    X2 --> Z
 ```
 
 ## What [prepare_data](cci:1://file:///c:/Users/aranr/Documents/github/agentic-datagen/v2/src/teich/prepare.py:141:0-206:5) returns
@@ -109,18 +104,21 @@ Each row looks conceptually like:
 {
     "text": "<rendered chat template string>",
     "teich_supervised_spans": [
-        {"start": 123, "end": 180},
-        {"start": 220, "end": 260},
+        {"start": 123, "end": 180, "source_start": 140, "source_end": 170, "kind": "tool_call", "role": "assistant"},
+        {"start": 220, "end": 260, "source_start": 230, "source_end": 250, "kind": "final_answer", "role": "assistant"},
     ],
 }
 ```
+
+With `teich_masking=False`, rows contain only the rendered `text` column unless `tokenize=True` is also set.
 
 With `tokenize=True`, rows also include `input_ids` and `attention_mask`. Use this mode for the recommended Unsloth / TRL flow so trainer setup treats the dataset as already tokenized and preserves `teich_supervised_spans` until `mask_data()` runs.
 
 Important details:
 
 - **`text`** is what `SFTTrainer` / Unsloth tokenizes when `tokenize=False`; with `tokenize=True`, it stays available for Teich span alignment and preview.
-- **`teich_supervised_spans`** are character spans telling Teich what assistant/tool tokens should become labels later.
+- **`teich_supervised_spans`** are typed character span metadata. `prepare_data()` records candidate spans; `mask_data()` decides which kinds become labels.
+- **`teich_masking=False`** skips span metadata and returns plain rendered `text` rows for standard next-token training without Teich labels.
 - **Original columns are removed** after formatting.
 - **Oversized examples are measured and dropped** if `drop_oversized_examples=True`; token IDs are kept only when `tokenize=True`.
 
@@ -244,10 +242,10 @@ After [mask_data](cci:1://file:///c:/Users/aranr/Documents/github/agentic-datage
 Where:
 
 - **`-100`** means “ignore this token in loss.”
-- **Non-`-100` labels** are the exact assistant/tool/reasoning tokens Teich wants the model to learn.
-- Prompt/user/system/tool-output context stays masked.
-- Assistant answer content and tool calls become supervised.
-- If `train_on_reasoning=True`, reasoning content is supervised too.
+- **Non-`-100` labels** are the exact tokens selected by the `mask_data()` training policy.
+- By default, prompt/user/system/developer/tool-output context stays masked.
+- By default, assistant reasoning, final answers, and tool calls become supervised.
+- You can override this with `train_on_reasoning`, `train_on_final_answers`, `train_on_tools`, `train_on_user`, `train_on_system`, `train_on_developer`, and `train_on_tool_responses`.
 - For Qwen-style templates, the initial `<think>` tag is intentionally included in supervision.
 
 # Compact Combined Flow
@@ -278,25 +276,25 @@ flowchart TD
 - **[prepare_data](cci:1://file:///c:/Users/aranr/Documents/github/agentic-datagen/v2/src/teich/prepare.py:141:0-206:5) is the formatting stage**
   - It loads raw traces or datasets.
   - It renders them with the model tokenizer’s chat template.
-  - It records exactly which character ranges should be trained on.
+  - It records typed character ranges that can be trained on.
   - It returns a clean text dataset for the trainer.
 
 - **`SFTTrainer` is the tokenization stage**
   - The trainer turns `text` into `input_ids`.
 
 - **[mask_data](cci:1://file:///c:/Users/aranr/Documents/github/agentic-datagen/v2/src/teich/formatter.py:1252:0-1360:18) is the label stage**
-  - It aligns Teich’s saved character spans to token offsets.
+  - It applies the masking policy, then aligns Teich’s saved character spans to token offsets.
   - It creates `labels`.
   - It masks prompt/context tokens with `-100`.
-  - It leaves assistant/tool/reasoning targets unmasked.
+  - It leaves the selected assistant/tool/reasoning targets unmasked by default.
 
 # Key Guarantee
 
 The important design is:
 
 ```text
-prepare_data keeps human-readable text + supervision spans.
-mask_data converts those spans into exact token-level labels after trainer tokenization.
+prepare_data keeps human-readable text + typed span metadata.
+mask_data converts the selected spans into exact token-level labels after trainer tokenization.
 ```
 
 This lets Teich stay compatible with Unsloth / TRL trainer flows while still controlling exactly what the model learns.
