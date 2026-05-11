@@ -39,4 +39,5 @@ pythonpath = ["src"]
 markers = [
     "integration: marks tests as integration tests (requires Docker, API keys)",
     "slow: marks tests as slow (Docker builds, real API calls)",
+    "tokenizer_smoke: marks tests as real Hugging Face tokenizer smoke tests",
 ]

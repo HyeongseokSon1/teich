@@ -1,0 +1,110 @@
+from __future__ import annotations
+
+import os
+from types import SimpleNamespace
+
+from datasets import Dataset
+import pytest
+
+from teich import mask_data, prepare_data
+
+
+TOKENIZER_SMOKE_MODELS = [
+    pytest.param("unsloth/Qwen3.5-0.8B", {"enable_thinking": True}, id="unsloth-qwen3.5"),
+    pytest.param("google/gemma-4-31B-it", {"enable_thinking": True}, id="gemma-4-31b-it"),
+]
+
+
+def _tokenizer_smokes_enabled() -> bool:
+    return os.environ.get("TEICH_RUN_TOKENIZER_SMOKES") == "1"
+
+
+def _tool_call_dataset() -> Dataset:
+    return Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "system", "content": "You are a coding agent."},
+                    {"role": "user", "content": "List files"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": "I should inspect the workspace.",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "bash", "arguments": {"command": "ls"}},
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call_1", "name": "bash", "content": "SECRET_TOOL_OUTPUT"},
+                    {"role": "assistant", "content": "Found project files."},
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "description": "Run shell commands",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"command": {"type": "string"}},
+                                "required": ["command"],
+                            },
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.tokenizer_smoke
+@pytest.mark.parametrize("model_id, chat_template_kwargs", TOKENIZER_SMOKE_MODELS)
+def test_real_tokenizer_prepare_and_mask_tool_dataset(model_id: str, chat_template_kwargs: dict[str, object]):
+    if not _tokenizer_smokes_enabled():
+        pytest.skip("Set TEICH_RUN_TOKENIZER_SMOKES=1 to run real Hugging Face tokenizer smokes.")
+    transformers = pytest.importorskip("transformers")
+
+    try:
+        tokenizer = transformers.AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    except Exception as exc:
+        pytest.skip(f"Could not load tokenizer for {model_id}: {exc}")
+
+    prepared = prepare_data(
+        _tool_call_dataset(),
+        tokenizer,
+        tokenize=True,
+        strict=True,
+        train_on_reasoning=True,
+        chat_template_kwargs=chat_template_kwargs,
+        max_length=4096,
+        verbose=False,
+    )
+    trainer = SimpleNamespace(
+        train_dataset=prepared,
+        eval_dataset=None,
+        processing_class=tokenizer,
+        args=SimpleNamespace(dataset_text_field="text", packing=False, max_length=4096),
+    )
+
+    trainer = mask_data(trainer, tokenizer=tokenizer, audit=True, verbose=False)
+
+    row = trainer.train_dataset[0]
+    supervised_ids = [token for token in row["labels"] if token != -100]
+    supervised_text = tokenizer.decode(supervised_ids, skip_special_tokens=False)
+    masked_text = tokenizer.decode(
+        [token_id for token_id, label in zip(row["input_ids"], row["labels"]) if label == -100],
+        skip_special_tokens=False,
+    )
+
+    assert prepared.column_names == ["text", "teich_supervised_spans", "input_ids", "attention_mask"]
+    assert trainer.train_dataset.column_names == ["input_ids", "labels"]
+    assert supervised_ids
+    assert "bash" in supervised_text
+    assert "ls" in supervised_text
+    assert "Found project files." in supervised_text
+    assert "SECRET_TOOL_OUTPUT" not in supervised_text
+    assert "SECRET_TOOL_OUTPUT" in masked_text
