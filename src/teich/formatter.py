@@ -711,8 +711,8 @@ def _labels_from_offsets(
             span_index += 1
         is_supervised = (
             span_index < len(supervised_spans)
-            and supervised_spans[span_index][0] < end
-            and start < supervised_spans[span_index][1]
+            and supervised_spans[span_index][0] <= start
+            and end <= supervised_spans[span_index][1]
         )
         labels.append(token_id if is_supervised else -100)
     return labels
@@ -852,6 +852,9 @@ def _supervised_text_and_spans(
         )
         if inferred_spans:
             return formatted_text, inferred_spans
+    gemma_spans = _gemma_like_supervised_spans(formatted_text)
+    if gemma_spans:
+        supervised_spans = gemma_spans
     assistant_prompt_prefixes = _resolve_assistant_prompt_prefixes(
         renderer,
         messages,
@@ -1033,12 +1036,19 @@ def _mask_tokenized_row(
     if isinstance(text, str) and supervised_spans:
         encoded = _tokenize_trainer_text_with_offsets(text_tokenizer, text)
         if encoded is None:
-            raise ValueError("mask_data requires a tokenizer that can return offset mappings for text tokenization.")
-        full_input_ids, _, offsets = encoded
-        full_labels = _labels_from_offsets(full_input_ids, offsets, supervised_spans)
-        labels = _align_labels_to_input_ids(input_ids, full_input_ids, full_labels)
-        if labels is None:
-            raise ValueError("Trainer tokenized input_ids do not align with the original Teich-rendered text.")
+            decoded_text, offsets = _token_text_and_offsets(text_tokenizer, input_ids)
+            if decoded_text != text and not text.startswith(decoded_text):
+                raise ValueError(
+                    "mask_data requires offset mappings when decoded trainer input_ids do not match "
+                    "the original Teich-rendered text."
+                )
+            labels = _labels_from_offsets(input_ids, offsets, supervised_spans)
+        else:
+            full_input_ids, _, offsets = encoded
+            full_labels = _labels_from_offsets(full_input_ids, offsets, supervised_spans)
+            labels = _align_labels_to_input_ids(input_ids, full_input_ids, full_labels)
+            if labels is None:
+                raise ValueError("Trainer tokenized input_ids do not align with the original Teich-rendered text.")
     else:
         text, offsets = _token_text_and_offsets(text_tokenizer, input_ids)
         supervised_spans = _infer_supervised_spans_from_rendered_text(text, train_on_reasoning=train_on_reasoning)
@@ -1087,6 +1097,28 @@ def _list_padded_labels(labels: list[list[int]], target_length: int, padding_sid
         else:
             padded_labels.append(values + padding)
     return padded_labels
+
+
+def _truncate_masked_row(
+    masked_row: dict[str, list[int]],
+    max_length: int | None,
+    truncation_mode: str | None,
+) -> dict[str, list[int]]:
+    if not isinstance(max_length, int) or max_length <= 0:
+        return masked_row
+    input_ids = masked_row["input_ids"]
+    labels = masked_row["labels"]
+    if len(input_ids) <= max_length:
+        return masked_row
+    if truncation_mode == "keep_end":
+        return {
+            "input_ids": input_ids[-max_length:],
+            "labels": labels[-max_length:],
+        }
+    return {
+        "input_ids": input_ids[:max_length],
+        "labels": labels[:max_length],
+    }
 
 
 class _TeichLabelPaddingCollator:
@@ -1143,6 +1175,7 @@ def mask_data(
     trainer_args = getattr(trainer, "args", None)
     dataset_text_field = text_column or getattr(trainer_args, "dataset_text_field", "text")
     trainer_max_length = getattr(trainer_args, "max_length", None)
+    truncation_mode = getattr(trainer_args, "truncation_mode", None)
     effective_max_supervised_tokens = (
         max_supervised_tokens
         if isinstance(max_supervised_tokens, int) and max_supervised_tokens > 0
@@ -1203,6 +1236,9 @@ def mask_data(
                 ):
                     dropped_supervised_count += 1
                     continue
+                masked_row = _truncate_masked_row(masked_row, trainer_max_length, truncation_mode)
+                if all(label == -100 for label in masked_row["labels"]):
+                    raise ValueError("Teich masking produced a fully masked row after trainer max_length truncation.")
                 output_batch["input_ids"].append(masked_row["input_ids"])
                 output_batch["labels"].append(masked_row["labels"])
             return output_batch
@@ -1226,6 +1262,10 @@ def mask_data(
         if audit:
             report = audit_sft_dataset(masked_dataset, text_tokenizer, sample_size=audit_sample_size)
             report.raise_for_errors()
+            if verbose and report.warnings:
+                console = Console()
+                for warning in report.warnings:
+                    console.print(f"[yellow]Teich audit warning for {dataset_name}: {warning}[/yellow]")
         return _attach_preview(masked_dataset, text_tokenizer)
 
     trainer.train_dataset = _mask_dataset(getattr(trainer, "train_dataset", None), "train_dataset")

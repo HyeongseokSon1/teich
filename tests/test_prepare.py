@@ -163,3 +163,19 @@ def test_prepare_data_source_mix_uses_equal_defaults_and_redistributes_capacity(
     assert prepared.num_rows == 8
     assert sum("small answer" in text for text in texts) == 2
     assert sum("large answer" in text for text in texts) == 6
+
+
+def test_prepare_data_plain_source_list_applies_max_examples_globally():
+    tokenizer = TinyChatTokenizer()
+
+    prepared = prepare_data(
+        [
+            _dataset_with_answers("first", 5),
+            _dataset_with_answers("second", 5),
+        ],
+        tokenizer,
+        max_examples=3,
+        verbose=False,
+    )
+
+    assert prepared.num_rows == 3

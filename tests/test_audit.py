@@ -13,7 +13,15 @@ class TinyTokenizer:
     eos_token_id = 0
 
     def __init__(self):
-        self._reverse_vocab = {1: "a", 2: "b", 3: "<|im_start|>user", 4: "<tool_call>", 5: "</think>"}
+        self._reverse_vocab = {
+            1: "a",
+            2: "b",
+            3: "<|im_start|>user",
+            4: "<tool_call>",
+            5: "</think>",
+            6: "<|turn>user",
+            7: "<|tool_response>",
+        }
 
     def decode(self, token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False):
         return "".join(self._reverse_vocab[token_id] for token_id in token_ids)
@@ -70,6 +78,25 @@ def test_audit_sft_dataset_rejects_supervised_user_marker():
     assert not report.ok
     assert "<|im_start|>user" in report.errors[0]
 
+
+def test_audit_sft_dataset_rejects_gemma_context_markers():
+    dataset = Dataset.from_list(
+        [
+            {
+                "input_ids": [6, 7, 2],
+                "attention_mask": [1, 1, 1],
+                "labels": [6, 7, 2],
+            }
+        ]
+    )
+
+    report = audit_sft_dataset(dataset, TinyTokenizer())
+
+    assert not report.ok
+    assert "<|turn>user" in report.errors[0]
+    assert "<|tool_response>" in report.errors[1]
+
+
 def test_teich_example_has_single_safe_training_flow():
     source = Path("teich_example.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
@@ -86,6 +113,5 @@ def test_teich_example_has_single_safe_training_flow():
     assert "data_collator=" not in source
     assert "prepare_sft_dataset" not in source
     assert sum(isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "train" for node in ast.walk(tree)) == 1
-
 
 

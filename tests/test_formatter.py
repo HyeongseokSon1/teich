@@ -8,6 +8,7 @@ from datasets import Dataset
 import pytest
 
 from teich import mask_data, prepare_data, preview_sft_example
+from teich.formatter import _labels_from_offsets
 
 
 def prepare_and_mask_for_test(
@@ -117,6 +118,16 @@ class FakeTokenizer:
         return "".join(self._reverse_vocab[token_id] for token_id in token_ids)
 
 
+def test_labels_from_offsets_masks_tokens_that_cross_supervision_boundaries():
+    labels = _labels_from_offsets(
+        [1, 2, 3],
+        [(0, 1), (1, 3), (3, 4)],
+        [(2, 4)],
+    )
+
+    assert labels == [-100, -100, 3]
+
+
 class RequiresUserTokenizer(FakeTokenizer):
     def apply_chat_template(self, messages, **kwargs):
         if not any(message.get("role") == "user" for message in messages):
@@ -155,6 +166,19 @@ class TrainerStyleTokenizer(OffsetCountingTokenizer):
         if token == self.pad_token:
             return self.pad_token_id
         return self._vocab.setdefault(token, len(self._vocab) + 1)
+
+
+class NoOffsetTrainerStyleTokenizer(TrainerStyleTokenizer):
+    def __call__(self, text=None, add_special_tokens=False, return_attention_mask=True, return_offsets_mapping=False, **kwargs):
+        if return_offsets_mapping:
+            raise NotImplementedError("offsets unavailable")
+        return super().__call__(
+            text,
+            add_special_tokens=add_special_tokens,
+            return_attention_mask=return_attention_mask,
+            return_offsets_mapping=False,
+            **kwargs,
+        )
 
 
 class SpecialTokenWrappingTokenizer(TrainerStyleTokenizer):
@@ -857,6 +881,33 @@ def test_prepare_data_can_emit_tokenized_rows_for_trainer_skip_prepare_flow():
     assert supervised_text == "<think>think</think>world</assistant>"
 
 
+def test_mask_data_can_use_decoded_token_offsets_when_tokenizer_lacks_offsets():
+    tokenizer = NoOffsetTrainerStyleTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "world"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+    prepared = prepare_data(dataset, tokenizer, tokenize=True, verbose=False)
+    trainer = SimpleNamespace(
+        train_dataset=prepared,
+        eval_dataset=None,
+        processing_class=tokenizer,
+        args=SimpleNamespace(dataset_text_field="text", packing=False),
+    )
+
+    trainer = mask_data(trainer, audit=True, verbose=False)
+
+    supervised_text = tokenizer.decode([token for token in trainer.train_dataset[0]["labels"] if token != -100])
+    assert supervised_text == "world</assistant>"
+
+
 def test_tokenized_prepare_data_survives_unsloth_style_skip_prepare_columns():
     tokenizer = TrainerStyleTokenizer()
     dataset = Dataset.from_list(
@@ -1319,7 +1370,7 @@ def test_mask_data_can_drop_rows_with_too_many_supervised_tokens():
         train_dataset=trainer_dataset,
         eval_dataset=None,
         processing_class=tokenizer,
-        args=SimpleNamespace(dataset_text_field="text", packing=False, max_length=30),
+        args=SimpleNamespace(dataset_text_field="text", packing=False, max_length=30, truncation_mode="keep_end"),
     )
 
     trainer = mask_data(trainer, audit=True, verbose=False)
@@ -1348,12 +1399,66 @@ def test_mask_data_explicit_supervised_token_limit_overrides_trainer_max_length(
         train_dataset=trainer_dataset,
         eval_dataset=None,
         processing_class=tokenizer,
-        args=SimpleNamespace(dataset_text_field="text", packing=False, max_length=5),
+        args=SimpleNamespace(dataset_text_field="text", packing=False, max_length=5, truncation_mode="keep_end"),
     )
 
     trainer = mask_data(trainer, max_supervised_tokens=50, audit=True, verbose=False)
 
     assert trainer.train_dataset.num_rows == 1
+
+
+def test_mask_data_applies_trainer_keep_end_truncation_before_audit():
+    tokenizer = TrainerStyleTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "x" * 80},
+                    {"role": "assistant", "content": "final answer"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+    prepared = prepare_data(dataset, tokenizer, drop_oversized_examples=False, verbose=False)
+    trainer = SimpleNamespace(
+        train_dataset=prepared,
+        eval_dataset=None,
+        processing_class=tokenizer,
+        args=SimpleNamespace(dataset_text_field="text", packing=False, max_length=40, truncation_mode="keep_end"),
+    )
+
+    trainer = mask_data(trainer, audit=True, verbose=False)
+
+    row = trainer.train_dataset[0]
+    assert len(row["input_ids"]) == 40
+    assert len(row["labels"]) == 40
+    assert "final answer</assistant>" in trainer.train_dataset.preview()
+
+
+def test_mask_data_rejects_truncation_that_removes_all_supervised_tokens():
+    tokenizer = TrainerStyleTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "x" * 80},
+                    {"role": "assistant", "content": "final answer"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+    prepared = prepare_data(dataset, tokenizer, drop_oversized_examples=False, verbose=False)
+    trainer = SimpleNamespace(
+        train_dataset=prepared,
+        eval_dataset=None,
+        processing_class=tokenizer,
+        args=SimpleNamespace(dataset_text_field="text", packing=False, max_length=40),
+    )
+
+    with pytest.raises(ValueError, match="trainer max_length truncation"):
+        mask_data(trainer, audit=False, verbose=False)
 
 
 def test_mask_data_can_fallback_when_trainer_drops_text_columns():
@@ -1680,11 +1785,11 @@ def test_prepare_and_mask_uses_gemma_structured_mask_path():
 
     row = training_data[0]
     supervised_text = tokenizer.decode([token for token in row["labels"] if token != -100])
-    assert "inspect repo" in supervised_text
-    assert "bash" in supervised_text
-    assert "ls" in supervised_text
+    assert "<|channel>thought\ninspect repo\n<channel|>" in supervised_text
+    assert '<|tool_call>call:bash{command:"ls"}<tool_call|>' in supervised_text
     assert "done" in supervised_text
     assert "response:bash" not in supervised_text
+    assert "file_a.py" not in supervised_text
     masked_text = tokenizer.decode(
         [token_id for token_id, label in zip(row["input_ids"], row["labels"]) if label == -100]
     )
@@ -2134,7 +2239,7 @@ _REAL_TEMPLATE_COMPATIBILITY_CASES = [
             "template_path": "gemma-4-chat-template.jinja",
             "chat_template_kwargs": {"enable_thinking": False},
             "train_on_reasoning": False,
-            "expected_supervised_substrings": ["bash", "ls", "done"],
+            "expected_supervised_substrings": ["<|tool_call>call:bash", "command:<|", "ls", "done"],
             "forbidden_supervised_substrings": ["inspect repo", "response:bash", "file_a.py"],
         },
         id="gemma4-thinking-off-no-reasoning-labels",
@@ -2165,6 +2270,68 @@ def test_prepare_and_mask_supports_real_chat_template_file(case):
         assert substring in supervised_text, case["name"]
     for substring in case["forbidden_supervised_substrings"]:
         assert substring not in supervised_text, case["name"]
+
+
+def test_prepare_and_mask_actual_gemma4_keeps_reasoning_on_earlier_tool_turns():
+    jinja2 = pytest.importorskip("jinja2")
+    template_path = Path("gemma-4-chat-template.jinja")
+    if not template_path.exists():
+        pytest.skip(f"{template_path} is not available")
+
+    tokenizer = RealJinjaChatTemplateTokenizer(template_path, jinja2)
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "inspect"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": "earlier reasoning",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "bash", "arguments": {"command": "ls"}},
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call_1", "name": "bash", "content": "SECRET_TOOL_OUTPUT"},
+                    {"role": "user", "content": "summarize"},
+                    {"role": "assistant", "content": "done", "reasoning_content": "final reasoning"},
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "description": "run shell",
+                            "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+
+    training_data = prepare_and_mask_for_test(
+        dataset,
+        tokenizer,
+        chat_template_kwargs={"enable_thinking": True},
+        train_on_reasoning=True,
+        strict=True,
+        include_debug_columns=True,
+    )
+
+    row = training_data[0]
+    assert "earlier reasoning" in row["text"]
+    supervised_text = tokenizer.decode([token for token in row["labels"] if token != -100])
+    masked_text = tokenizer.decode([token_id for token_id, label in zip(row["input_ids"], row["labels"]) if label == -100])
+    assert "earlier reasoning" in supervised_text
+    assert "<|tool_call>call:bash" in supervised_text
+    assert "final reasoning" in supervised_text
+    assert "SECRET_TOOL_OUTPUT" not in supervised_text
+    assert "SECRET_TOOL_OUTPUT" in masked_text
 
 
 def test_prepare_and_mask_drops_untrainable_rows_with_actual_gemma4_template_under_strict_mode():

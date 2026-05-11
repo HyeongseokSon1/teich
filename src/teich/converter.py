@@ -265,6 +265,8 @@ def _parse_tool_descriptions_from_text(text: str) -> dict[str, str]:
 def _normalize_role(role: str) -> str:
     if role == "developer":
         return "system"
+    if role == "model":
+        return "assistant"
     return role
 
 
@@ -314,7 +316,7 @@ def _convert_codex_trace_to_training_example(
     events: list[dict[str, Any]],
 ) -> TrainingExample:
     messages: list[dict[str, Any]] = []
-    pending_reasoning: str | None = None
+    pending_reasoning_parts: list[str] = []
     tool_names: set[str] = set()
     tool_schemas: dict[str, dict[str, Any]] = {}
     tool_argument_samples: dict[str, list[Any]] = {}
@@ -346,7 +348,9 @@ def _convert_codex_trace_to_training_example(
 
         payload_type = payload.get("type")
         if payload_type == "reasoning":
-            pending_reasoning = _reasoning_summary(payload)
+            reasoning = _reasoning_summary(payload)
+            if reasoning:
+                pending_reasoning_parts.append(reasoning)
             continue
 
         if payload_type == "message":
@@ -361,9 +365,9 @@ def _convert_codex_trace_to_training_example(
                 "role": normalized_role,
                 "content": content,
             }
-            if normalized_role == "assistant" and pending_reasoning:
-                message["reasoning_content"] = pending_reasoning
-                pending_reasoning = None
+            if normalized_role == "assistant" and pending_reasoning_parts:
+                message["reasoning_content"] = "\n\n".join(pending_reasoning_parts)
+                pending_reasoning_parts = []
             messages.append(message)
             continue
 
@@ -392,9 +396,9 @@ def _convert_codex_trace_to_training_example(
                     "content": "",
                     "tool_calls": [tool_call],
                 }
-                if pending_reasoning:
-                    assistant_message["reasoning_content"] = pending_reasoning
-                    pending_reasoning = None
+                if pending_reasoning_parts:
+                    assistant_message["reasoning_content"] = "\n\n".join(pending_reasoning_parts)
+                    pending_reasoning_parts = []
                 messages.append(assistant_message)
             continue
 
@@ -745,7 +749,11 @@ def convert_trace_to_training_example(trace_file: Path) -> TrainingExample:
 def _jsonl_files(source: Path) -> list[Path]:
     if source.is_file():
         return [source]
-    return sorted(path for path in source.glob("*.jsonl") if path.is_file())
+    return sorted(
+        path
+        for path in source.rglob("*.jsonl")
+        if path.is_file() and "partials" not in path.relative_to(source).parts
+    )
 
 
 def _convert_jsonl_file_to_training_rows(jsonl_file: Path) -> list[dict[str, Any]]:

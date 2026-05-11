@@ -444,7 +444,9 @@ def write_traces_readme(
     tools: list[dict[str, Any]] | None = None,
 ) -> Path:
     trace_files = sorted(
-        path for path in traces_dir.glob("*.jsonl") if path.is_file()
+        path
+        for path in traces_dir.rglob("*.jsonl")
+        if path.is_file() and "partials" not in path.relative_to(traces_dir).parts
     )
     dataset_tools = tools if tools is not None else _dataset_tools(trace_files)
     readme_path = traces_dir / "README.md"

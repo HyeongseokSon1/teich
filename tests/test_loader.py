@@ -57,6 +57,21 @@ def test_load_traces_from_local_split_directory(tmp_path: Path):
     assert row["tools"][0]["function"]["name"] == "bash"
 
 
+def test_load_traces_reads_nested_jsonl_files_and_skips_partials(tmp_path: Path):
+    train_dir = tmp_path / "train"
+    nested_dir = train_dir / "nested"
+    partials_dir = train_dir / "partials"
+    nested_dir.mkdir(parents=True)
+    partials_dir.mkdir(parents=True)
+    _write_codex_trace(nested_dir / "trace.jsonl", prompt="Nested prompt")
+    _write_codex_trace(partials_dir / "partial.jsonl", prompt="Partial prompt")
+
+    dataset = load_traces(tmp_path, split="train")
+
+    assert dataset.num_rows == 1
+    assert dataset[0]["prompt"] == "Nested prompt"
+
+
 def test_load_traces_downloads_dataset_repo_and_converts_split(tmp_path: Path):
     repo_dir = tmp_path / "downloaded-repo"
     split_dir = repo_dir / "train"
@@ -256,6 +271,27 @@ def test_load_traces_loads_structured_chat_dataset_file(tmp_path: Path):
     assert row["metadata"]["trace_type"] == "chat"
     assert row["metadata"]["model"] == "gpt-4.1-mini"
     assert row["metadata"]["usage"]["prompt_tokens"] == 4
+
+
+def test_load_traces_normalizes_structured_model_role_to_assistant(tmp_path: Path):
+    dataset_file = tmp_path / "gemma-chat.jsonl"
+    dataset_file.write_text(
+        json.dumps(
+            {
+                "messages": [
+                    {"role": "user", "content": "Hello"},
+                    {"role": "model", "content": "Hi"},
+                ],
+                "prompt": "Hello",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    dataset = load_traces(dataset_file)
+
+    assert dataset[0]["messages"][-1]["role"] == "assistant"
 
 
 def test_load_traces_max_examples_shuffles_structured_rows_deterministically(tmp_path: Path):

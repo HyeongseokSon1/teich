@@ -188,6 +188,49 @@ def test_convert_trace_uses_reasoning_text_when_summary_is_empty(tmp_path: Path)
     assert example.messages[-1]["reasoning_content"] == "This is a simple factorial task."
 
 
+def test_convert_trace_accumulates_multiple_reasoning_events(tmp_path: Path):
+    trace_file = tmp_path / "trace.jsonl"
+    events = [
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Inspect repo"}],
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "reasoning",
+                "summary": [{"text": "First thought."}],
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "reasoning",
+                "summary": [{"text": "Second thought."}],
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "bash",
+                "call_id": "call_1",
+                "arguments": '{"command":"ls"}',
+            },
+        },
+    ]
+    trace_file.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+
+    example = convert_trace_to_training_example(trace_file)
+
+    assert example.messages[-1]["role"] == "assistant"
+    assert example.messages[-1]["reasoning_content"] == "First thought.\n\nSecond thought."
+
+
 def test_convert_trace_normalizes_nested_json_encoded_tool_arguments(tmp_path: Path):
     trace_file = tmp_path / "codex-nested-tool-args.jsonl"
     events = [

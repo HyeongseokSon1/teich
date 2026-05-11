@@ -29,6 +29,13 @@ class _ResolvedSourceMix:
     max_examples: int | None
     names: list[str]
 
+
+@dataclass(slots=True)
+class _ResolvedSourceList:
+    datasets: list[Dataset]
+    max_examples: int | None
+
+
 def prepare_data(
     source_or_dataset: str | Path | Dataset | Mapping[str, Any] | Sequence[str | Path | Dataset | Mapping[str, Any]],
     tokenizer: Any,
@@ -84,6 +91,25 @@ def prepare_data(
             probabilities=dataset.probabilities,
             max_examples=dataset.max_examples,
         )
+    if isinstance(dataset, _ResolvedSourceList):
+        formatted = format_data(
+            dataset.datasets,
+            tokenizer,
+            messages_column=messages_column,
+            tools_column=tools_column,
+            text_column=text_column,
+            chat_template_kwargs=chat_template_kwargs,
+            train_on_reasoning=train_on_reasoning,
+            max_length=max_length,
+            drop_oversized_examples=drop_oversized_examples,
+            tokenize=tokenize,
+            strict=strict,
+            verbose=verbose,
+        )
+        if dataset.max_examples is None:
+            return formatted
+        limit = min(dataset.max_examples, formatted.num_rows)
+        return formatted.shuffle(seed=_DATASET_MIX_SEED).select(range(limit))
     return format_data(
         dataset,
         tokenizer,
@@ -109,7 +135,7 @@ def _resolve_source_dataset(
     cache_dir: str | Path | None,
     local_dir: str | Path | None,
     max_examples: int | None,
-) -> Dataset | Sequence[Dataset] | _ResolvedSourceMix:
+) -> Dataset | _ResolvedSourceList | _ResolvedSourceMix:
     if isinstance(source_or_dataset, Dataset):
         return _resolve_single_source_dataset(
             source_or_dataset,
@@ -146,18 +172,23 @@ def _resolve_source_dataset(
                 local_dir=local_dir,
                 max_examples=max_examples,
             )
-        return [
-            _resolve_single_source_dataset(
-                source,
-                split=split,
-                revision=revision,
-                token=token,
-                cache_dir=cache_dir,
-                local_dir=local_dir,
-                max_examples=max_examples,
-            )
-            for source in sources
-        ]
+        if max_examples is not None and max_examples < 0:
+            raise ValueError("max_examples must be non-negative.")
+        return _ResolvedSourceList(
+            datasets=[
+                _resolve_single_source_dataset(
+                    source,
+                    split=split,
+                    revision=revision,
+                    token=token,
+                    cache_dir=cache_dir,
+                    local_dir=local_dir,
+                    max_examples=None,
+                )
+                for source in sources
+            ],
+            max_examples=max_examples,
+        )
     return _resolve_single_source_dataset(
         source_or_dataset,
         split=split,

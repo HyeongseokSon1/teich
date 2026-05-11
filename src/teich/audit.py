@@ -73,12 +73,23 @@ def _audit_training_row(row: dict[str, Any], tokenizer: Any, row_index: int) -> 
     masked_text = _decode(tokenizer, masked_ids[-200:]) if masked_ids else ""
     sample["masked_suffix_preview"] = masked_text[-500:]
 
-    suspicious_masked_markers = ("<|im_start|>user", "<tool_response>", "# Tools")
+    suspicious_masked_markers = (
+        "<|im_start|>user",
+        "<|start_header_id|>user<|end_header_id|>",
+        "<start_of_turn>user",
+        "<|start_of_role|>user<|end_of_role|>",
+        "<|turn>user",
+        "<tool_response>",
+        "</tool_response>",
+        "<|tool_response>",
+        "<tool_response|>",
+        "# Tools",
+    )
     for marker in suspicious_masked_markers:
         if marker in supervised_text:
             errors.append(f"row {row_index}: supervised text contains masked-context marker {marker!r}")
 
-    useful_targets = ("<tool_call>", "</think>", "<|im_end|>")
+    useful_targets = ("<tool_call>", "<|tool_call>", "<tool_call|>", "</think>", "<|channel>thought", "<|im_end|>", "<turn|>")
     if not any(target in supervised_text for target in useful_targets):
         warnings.append(f"row {row_index}: supervised text lacks common assistant/tool/reasoning delimiters")
 
@@ -111,4 +122,3 @@ def audit_sft_dataset(dataset: Dataset, tokenizer: Any, *, sample_size: int = 8)
         samples.append(sample)
 
     return SFTAuditReport(ok=not errors, errors=errors, warnings=warnings, samples=samples)
-
