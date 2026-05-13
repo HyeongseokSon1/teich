@@ -18,7 +18,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlencode, urlsplit, urlunsplit
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from typing import TYPE_CHECKING, Any
@@ -324,6 +324,9 @@ class TraceMetrics:
             if "total" in cost and cost.get("total") is not None:
                 self.has_cost = True
             self.total_cost += self._float_value(cost.get("total"))
+        elif isinstance(cost, (int, float)) and not isinstance(cost, bool):
+            self.has_cost = True
+            self.total_cost += float(cost)
 
     def add_codex_last_usage(self, usage: dict[str, Any]) -> None:
         if self._has_any_key(
@@ -943,6 +946,121 @@ class DockerRuntimeRunner:
             delta[key] = max(0, current_value - previous_value)
         return delta
 
+    @staticmethod
+    def _openrouter_generation_ids_from_value(value: Any) -> set[str]:
+        generation_ids: set[str] = set()
+        if isinstance(value, dict):
+            for key, nested_value in value.items():
+                if key in {"id", "generation_id"} and isinstance(nested_value, str) and nested_value.startswith("gen-"):
+                    generation_ids.add(nested_value)
+                    continue
+                if key == "generation_ids" and isinstance(nested_value, list):
+                    generation_ids.update(
+                        item
+                        for item in nested_value
+                        if isinstance(item, str) and item.startswith("gen-")
+                    )
+                    continue
+                if isinstance(nested_value, (dict, list)):
+                    generation_ids.update(DockerRuntimeRunner._openrouter_generation_ids_from_value(nested_value))
+            return generation_ids
+        if isinstance(value, list):
+            for nested_value in value:
+                if isinstance(nested_value, (dict, list)):
+                    generation_ids.update(DockerRuntimeRunner._openrouter_generation_ids_from_value(nested_value))
+        return generation_ids
+
+    @staticmethod
+    def _openrouter_usage_from_generation_data(data: dict[str, Any]) -> dict[str, Any] | None:
+        input_tokens = TraceMetrics._int_value(data.get("native_tokens_prompt") or data.get("tokens_prompt"))
+        output_tokens = TraceMetrics._int_value(
+            data.get("native_tokens_completion") or data.get("tokens_completion")
+        )
+        reasoning_tokens = TraceMetrics._int_value(data.get("native_tokens_reasoning"))
+        cache_read_tokens = TraceMetrics._int_value(data.get("native_tokens_cached"))
+        total_tokens = input_tokens + output_tokens + reasoning_tokens
+        cost = data.get("total_cost")
+        if not total_tokens and not isinstance(cost, (int, float)):
+            return None
+        usage: dict[str, Any] = {
+            "input": input_tokens,
+            "output": output_tokens,
+            "reasoning": reasoning_tokens,
+            "cacheRead": cache_read_tokens,
+            "totalTokens": total_tokens,
+        }
+        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+            usage["cost"] = {"total": float(cost)}
+        generation_id = data.get("id")
+        if isinstance(generation_id, str) and generation_id.strip():
+            usage["generation_id"] = generation_id.strip()
+        provider_name = data.get("provider_name")
+        if isinstance(provider_name, str) and provider_name.strip():
+            usage["provider_name"] = provider_name.strip()
+        return usage
+
+    def _openrouter_generation_usage(self, generation_id: str) -> dict[str, Any] | None:
+        if self.config.api.provider.strip().lower() != "openrouter":
+            return None
+        api_key = self.config.get_api_key()
+        if not api_key:
+            return None
+        base_url = (self.config.get_base_url() or "https://openrouter.ai/api/v1").rstrip("/")
+        endpoint = f"{base_url}/generation?{urlencode({'id': generation_id})}"
+        request = Request(
+            endpoint,
+            headers={
+                "accept": "application/json",
+                "authorization": f"Bearer {api_key}",
+            },
+            method="GET",
+        )
+        attempts = 3
+        for attempt in range(attempts):
+            try:
+                with urlopen(request, timeout=min(10, self.config.timeout_seconds)) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+            except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
+                if attempt < attempts - 1:
+                    time.sleep(0.4 * (attempt + 1))
+                    continue
+                return None
+            if not isinstance(payload, dict):
+                return None
+            data = payload.get("data")
+            if isinstance(data, dict):
+                usage = self._openrouter_usage_from_generation_data(data)
+                if usage is not None:
+                    return usage
+            if attempt < attempts - 1:
+                time.sleep(0.4 * (attempt + 1))
+        return None
+
+    def _openrouter_usage_from_generation_ids(self, generation_ids: set[str]) -> dict[str, Any] | None:
+        usages = [
+            usage
+            for generation_id in sorted(generation_ids)
+            if (usage := self._openrouter_generation_usage(generation_id)) is not None
+        ]
+        return ChatRunner._merge_usage_totals(usages)
+
+    def _openrouter_generation_ids_from_trace(self, trace_file: Path) -> set[str]:
+        generation_ids: set[str] = set()
+        try:
+            with trace_file.open("r", encoding="utf-8") as handle:
+                for raw_line in handle:
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    generation_ids.update(self._openrouter_generation_ids_from_value(event))
+        except OSError:
+            return set()
+        return generation_ids
+
     @classmethod
     def _summarize_trace_file(cls, trace_file: Path) -> TraceMetrics:
         metrics = TraceMetrics()
@@ -1095,6 +1213,24 @@ class DockerRuntimeRunner:
         metrics.finalize()
         return metrics
 
+    def _summarize_trace_file_with_provider_stats(self, trace_file: Path) -> TraceMetrics:
+        metrics = self._summarize_trace_file(trace_file)
+        provider_stats = self._openrouter_usage_from_generation_ids(self._openrouter_generation_ids_from_trace(trace_file))
+        if provider_stats is not None:
+            metrics.input_tokens = 0
+            metrics.output_tokens = 0
+            metrics.reasoning_tokens = 0
+            metrics.cache_read_tokens = 0
+            metrics.cache_write_tokens = 0
+            metrics.total_tokens = 0
+            metrics.est_total_tokens = 0
+            metrics.total_cost = 0.0
+            metrics.has_token_usage = False
+            metrics.has_cost = False
+            metrics.add_structured_usage(provider_stats)
+            metrics.finalize()
+        return metrics
+
     def _run_prompt_task(
         self,
         prompt_id: str,
@@ -1126,7 +1262,7 @@ class DockerRuntimeRunner:
                 progress_base=progress_base,
                 prompt_input=prompt_input,
             )
-            metrics = self._summarize_trace_file(result)
+            metrics = self._summarize_trace_file_with_provider_stats(result)
             sandbox_path = self._sandbox_destination(result)
             if progress_callback:
                 progress_callback(
@@ -2706,6 +2842,8 @@ class ChatRunner(DockerRuntimeRunner):
             or usage.get("reasoning_output_tokens")
             or (usage.get("output_tokens_details") or {}).get("reasoning_tokens")
         )
+        cache_read_tokens = TraceMetrics._int_value(usage.get("cacheRead") or usage.get("cached_input_tokens"))
+        cache_write_tokens = TraceMetrics._int_value(usage.get("cacheWrite"))
         total_tokens = TraceMetrics._int_value(usage.get("totalTokens") or usage.get("total_tokens"))
         normalized = {
             "input": input_tokens,
@@ -2713,6 +2851,26 @@ class ChatRunner(DockerRuntimeRunner):
             "reasoning": reasoning_tokens,
             "totalTokens": total_tokens or (input_tokens + output_tokens + reasoning_tokens),
         }
+        if cache_read_tokens:
+            normalized["cacheRead"] = cache_read_tokens
+        if cache_write_tokens:
+            normalized["cacheWrite"] = cache_write_tokens
+        cost = usage.get("cost")
+        if isinstance(cost, dict) and cost.get("total") is not None:
+            normalized["cost"] = {"total": TraceMetrics._float_value(cost.get("total"))}
+        elif isinstance(cost, (int, float)) and not isinstance(cost, bool):
+            normalized["cost"] = {"total": float(cost)}
+        for passthrough_key in ("generation_id", "provider_name"):
+            passthrough_value = usage.get(passthrough_key)
+            if isinstance(passthrough_value, str) and passthrough_value.strip():
+                normalized[passthrough_key] = passthrough_value.strip()
+        generation_ids = usage.get("generation_ids")
+        if isinstance(generation_ids, list):
+            normalized["generation_ids"] = [
+                generation_id
+                for generation_id in generation_ids
+                if isinstance(generation_id, str) and generation_id.strip()
+            ]
         return normalized
 
     @staticmethod
@@ -2781,6 +2939,10 @@ class ChatRunner(DockerRuntimeRunner):
         content, thinking, usage, model = self._parse_chat_response(payload)
         if not content and not thinking:
             raise RuntimeError("Chat request returned neither assistant content nor thinking.")
+        generation_ids = self._openrouter_generation_ids_from_value(payload)
+        provider_usage = self._openrouter_usage_from_generation_ids(generation_ids)
+        if provider_usage is not None:
+            usage = provider_usage
         return content, thinking, usage, model
 
     def _request_chat_completion(self, prompt: str) -> dict[str, Any]:
@@ -2812,14 +2974,48 @@ class ChatRunner(DockerRuntimeRunner):
         normalized_usages = [usage for usage in normalized_usages if usage is not None]
         if not normalized_usages:
             return None
-        totals = {"input": 0, "output": 0, "reasoning": 0, "totalTokens": 0}
+        totals: dict[str, Any] = {
+            "input": 0,
+            "output": 0,
+            "reasoning": 0,
+            "totalTokens": 0,
+        }
+        cache_read_tokens = 0
+        cache_write_tokens = 0
+        total_cost = 0.0
+        has_cost = False
+        generation_ids: list[str] = []
         for usage in normalized_usages:
             totals["input"] += TraceMetrics._int_value(usage.get("input"))
             totals["output"] += TraceMetrics._int_value(usage.get("output"))
             totals["reasoning"] += TraceMetrics._int_value(usage.get("reasoning"))
+            cache_read_tokens += TraceMetrics._int_value(usage.get("cacheRead"))
+            cache_write_tokens += TraceMetrics._int_value(usage.get("cacheWrite"))
             totals["totalTokens"] += TraceMetrics._int_value(usage.get("totalTokens"))
+            cost = usage.get("cost")
+            if isinstance(cost, dict) and cost.get("total") is not None:
+                total_cost += TraceMetrics._float_value(cost.get("total"))
+                has_cost = True
+            generation_id = usage.get("generation_id")
+            if isinstance(generation_id, str) and generation_id.strip():
+                generation_ids.append(generation_id.strip())
+            usage_generation_ids = usage.get("generation_ids")
+            if isinstance(usage_generation_ids, list):
+                generation_ids.extend(
+                    generation_id.strip()
+                    for generation_id in usage_generation_ids
+                    if isinstance(generation_id, str) and generation_id.strip()
+                )
         if not totals["totalTokens"]:
             totals["totalTokens"] = totals["input"] + totals["output"] + totals["reasoning"]
+        if cache_read_tokens:
+            totals["cacheRead"] = cache_read_tokens
+        if cache_write_tokens:
+            totals["cacheWrite"] = cache_write_tokens
+        if has_cost:
+            totals["cost"] = {"total": total_cost}
+        if generation_ids:
+            totals["generation_ids"] = list(dict.fromkeys(generation_ids))
         return totals
 
     @staticmethod

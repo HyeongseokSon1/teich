@@ -1686,6 +1686,68 @@ def test_chat_runner_writes_structured_dataset_row_from_responses_api(tmp_path: 
     assert request.full_url == "https://api.openai.com/v1/responses"
 
 
+def test_chat_runner_prefers_openrouter_generation_stats_usage(tmp_path: Path):
+    config = Config(
+        agent={"provider": "chat"},
+        model=ModelConfig(model="minimax/minimax-m2.5:free"),
+        api=APIConfig(
+            provider="openrouter",
+            api_key="sk-or-test",
+            base_url="https://openrouter.ai/api/v1",
+            wire_api="chat_completions",
+        ),
+        output={"traces_dir": tmp_path / "output"},
+    )
+    runner = ChatRunner(config)
+    completion_payload = {
+        "id": "gen-openrouter-123",
+        "model": "minimax/minimax-m2.5:free",
+        "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+    }
+    stats_payload = {
+        "data": {
+            "id": "gen-openrouter-123",
+            "model": "minimax/minimax-m2.5:free",
+            "provider_name": "MiniMax",
+            "native_tokens_prompt": 12,
+            "native_tokens_completion": 8,
+            "native_tokens_reasoning": 3,
+            "native_tokens_cached": 4,
+            "total_cost": 0.00042,
+        }
+    }
+    completion_response = MagicMock()
+    completion_response.read.return_value = json.dumps(completion_payload).encode("utf-8")
+    completion_response.__enter__.return_value = completion_response
+    completion_response.__exit__.return_value = False
+    stats_response = MagicMock()
+    stats_response.read.return_value = json.dumps(stats_payload).encode("utf-8")
+    stats_response.__enter__.return_value = stats_response
+    stats_response.__exit__.return_value = False
+
+    with patch("teich.runner.urlopen", side_effect=[completion_response, stats_response]) as mock_urlopen:
+        result = runner.run_session("Hello", "chat-session")
+
+    row = json.loads(result.read_text(encoding="utf-8").strip())
+    assert row["usage"] == {
+        "input": 12,
+        "output": 8,
+        "reasoning": 3,
+        "cacheRead": 4,
+        "totalTokens": 23,
+        "cost": {"total": 0.00042},
+        "generation_ids": ["gen-openrouter-123"],
+    }
+    metrics = runner._metrics_from_training_row(row)
+    assert metrics.total_tokens == 23
+    assert metrics.total_cost == 0.00042
+    assert metrics.has_token_usage is True
+    assert metrics.has_cost is True
+    stats_request = mock_urlopen.call_args_list[1].args[0]
+    assert stats_request.full_url == "https://openrouter.ai/api/v1/generation?id=gen-openrouter-123"
+
+
 def test_chat_runner_supports_follow_up_prompts_as_multiturn_rows(tmp_path: Path):
     config = Config(
         agent={"provider": "chat"},
