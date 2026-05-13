@@ -1,18 +1,59 @@
 # Teich
 
-Turn coding agent sessions into auditable supervised fine-tuning data.
+Agent SFT data infrastructure for generation, normalization, chat-template rendering, response masking, and training audits.
 
----
+Teich is not only a dataset generator. It is a bridge between messy agent/chat data and model-specific supervised fine-tuning. You can start from fresh Codex/Pi traces, text-only chat generations, local JSONL files, Hugging Face datasets, or already-loaded `datasets.Dataset` objects. Teich normalizes those sources into OpenAI-style `messages` / `tools`, renders them through the target tokenizer chat template, and then applies typed response-only labels after the trainer has tokenized the data.
 
-Run `codex` or `pi` to capture raw coding-agent traces, or use `chat` mode to generate text-only training rows directly.
+That means the same package can:
 
-Load local folders, local files, or Hugging Face dataset repos; normalize them into `messages`/`tools`; and prepare trainer-friendly `text` rows that `mask_data` converts into audited response-only labels after `SFTTrainer` tokenization.
+- Generate new agent traces or chat-only distillation data.
+- Load and normalize existing local or Hub datasets.
+- Mix chat-only and tool-call datasets with explicit ratios.
+- Preserve raw traces as source-of-truth artifacts.
+- Render with arbitrary tokenizer chat templates.
+- Mask assistant reasoning, final answers, and tool calls while keeping prompts/tool responses ignored.
+- Audit labels before training so fully masked or misaligned rows fail early.
 
-## ⚡ Quick Start
+## Mental Model
+
+```text
+prompts / traces / JSONL / HF datasets / Dataset objects
+        ↓
+load_traces() or prepare_data()
+        ↓
+normalized messages + tools
+        ↓
+tokenizer chat template rendering
+        ↓
+trainer-friendly text + Teich supervision spans
+        ↓
+SFTTrainer tokenization
+        ↓
+mask_data()
+        ↓
+audited input_ids + labels
+```
+
+You can use only the pieces you need. If you already have a dataset, skip generation and go straight to `prepare_data()`. If you want raw trace preservation, use the CLI. If you want standard next-token training without Teich labels, use `prepare_data(..., teich_masking=False)` and skip `mask_data()`.
+
+## Entry Points
+
+| Goal | Use |
+| --- | --- |
+| Generate coding-agent traces | `teich generate` with `agent.provider: codex` or `pi` |
+| Generate text-only chat rows | `teich generate` with `agent.provider: chat` |
+| Load raw traces manually | `load_traces()` |
+| Prepare local/HF/mixed datasets for training | `prepare_data()` |
+| Apply response-only labels after TRL/Unsloth tokenization | `mask_data()` |
+| Inspect supervised vs masked tokens | `preview_sft_example()` / `trainer.train_dataset.preview()` |
+
+## Install
 
 ```bash
 pip install teich
 ```
+
+To create a new generation project:
 
 ```bash
 teich init my-project && cd my-project
@@ -26,15 +67,18 @@ uvx teich init my-project && cd my-project
 uvx teich generate -c config.yaml
 ```
 
-> Be sure to edit your config.yaml and prompts.jsonl file as needed
+> Edit `config.yaml` and `prompts.jsonl` before running a real generation batch.
 
-## ⭐ What Teich Does
+## Core Capabilities
 
-- **Trace-first data collection**: Run real coding agents and keep raw session traces as the source of truth
-- **Multi-agent support**: Works with Codex, Pi, and a text-only `chat` mode
-- **Structured conversion**: Converts traces into chat messages with tool calls, reasoning, tool results, metadata, and configured tool snapshots
-- **SFT-ready preparation**: Applies tokenizer chat templates, masks labels, builds a Teich collator, and audits the dataset before training
-- **Hugging Face integration**: Publishes dataset cards with embedded tool-schema snapshots, and loads local or Hub datasets through one API
+- **Trace-first data collection**: Run real coding agents and keep raw session traces as the source of truth.
+- **Dataset-first training**: Load existing JSONL files, folders, Hugging Face repos, or `datasets.Dataset` objects without using the generator.
+- **Multi-provider generation**: Works with Docker-backed Codex/Pi and a direct OpenAI-compatible `chat` mode.
+- **Structured conversion**: Converts traces into chat messages with tool calls, reasoning, tool results, metadata, and configured tool snapshots.
+- **Universal masking surface**: Supports assistant reasoning, final answers, tool calls, user/system/developer text, and tool responses as independently configurable masking targets.
+- **Multi-turn and tool-aware labels**: Avoids Unsloth-style single-span masking pitfalls by storing typed spans before tokenization and aligning them after trainer tokenization.
+- **Source mixing**: Mix local paths, Hub datasets, and in-memory datasets; explicit percentages stay true by scaling to the limiting source instead of silently changing ratios.
+- **Hugging Face integration**: Publishes dataset cards with embedded tool-schema snapshots, and loads local or Hub datasets through one API.
 
 ## 📥 Prerequisites
 
@@ -47,9 +91,47 @@ Requirements for agent trace generation:
 
 Training examples use your existing finetuning stack. For the TRL example below, install compatible versions of `transformers`, `trl`, and your model-loading stack separately.
 
-## 🚀 Usage
+## Common Workflows
 
-### Generate traces from prompts
+### Prepare an existing dataset for training
+
+You do not need to generate data with Teich first. If a local file, folder, Hugging Face dataset, or `datasets.Dataset` has a `messages` column, Teich can usually prepare it directly.
+
+```python
+from teich import prepare_data
+
+train_dataset = prepare_data(
+    "TeichAI/Claude-Opus-4.6-Reasoning-887x",
+    tokenizer,
+    max_length=32768,
+    drop_oversized_examples=True,
+    tokenize=True,
+    chat_template_kwargs={"enable_thinking": True, "preserve_thinking": True},
+)
+```
+
+`prepare_data()` returns rendered `text`, Teich span metadata, and optionally `input_ids` / `attention_mask`. Call `mask_data()` after constructing your trainer to convert those spans into labels.
+
+### Mix agent and chat datasets
+
+```python
+train_dataset = prepare_data(
+    {
+        "max_examples": 1000,
+        "agent": {"source": "badlogicgames/pi-mono", "percentage": 80},
+        "chat": {"source": "TeichAI/Claude-Opus-4.6-Reasoning-887x", "percentage": 20},
+    },
+    tokenizer,
+    max_length=32768,
+    drop_oversized_examples=True,
+    tokenize=True,
+    chat_template_kwargs={"enable_thinking": True, "preserve_thinking": True},
+)
+```
+
+Explicit `percentage`, `proportion`, and `weight` values are treated as true ratios. If one source cannot fill its share after filtering or context-window drops, Teich scales the total row count down instead of silently changing the realized mix.
+
+### Generate new data from prompts
 
 ```bash
 # Initialize project
