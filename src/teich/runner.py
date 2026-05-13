@@ -2231,6 +2231,36 @@ class ClaudeCodeRunner(ExternalCliRunner):
     source_name = "claude-code"
     default_model_provider = "anthropic"
 
+    @staticmethod
+    def _list_native_session_files(home_dir: Path) -> list[Path]:
+        projects_dir = home_dir / "projects"
+        if not projects_dir.exists():
+            return []
+        return sorted(path for path in projects_dir.rglob("*.jsonl") if path.is_file())
+
+    def _extract_native_session_file(
+        self,
+        session_id: str,
+        home_dir: Path,
+        existing_sessions: set[Path],
+        started_at: datetime,
+    ) -> Path:
+        session_files = self._list_native_session_files(home_dir)
+        fresh_files = [path for path in session_files if path.resolve() not in existing_sessions]
+        if not fresh_files:
+            fresh_files = [
+                path
+                for path in session_files
+                if datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc) >= started_at
+            ]
+        if not fresh_files:
+            raise RuntimeError(f"No Claude Code native session file found for {session_id}")
+        source_path = max(fresh_files, key=lambda path: path.stat().st_mtime)
+        destination = self._resolve_output_path(source_path.name)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_path, destination)
+        return destination
+
     def _needs_openrouter_model_proxy(self) -> bool:
         if self._provider_env_key(self.config.api.provider) != "OPENROUTER_API_KEY":
             return False
@@ -2358,6 +2388,58 @@ class ClaudeCodeRunner(ExternalCliRunner):
         command = self._build_external_docker_base_command(workspace, home_dir, container_name, detached=True)
         command.extend(["bash", "-lc", f"{self._openrouter_proxy_shell_prefix()}exec sleep infinity"])
         return command
+
+    def run_session(
+        self,
+        prompt: str,
+        session_id: str | None = None,
+        progress_callback: SessionProgressCallback | None = None,
+        progress_base: SessionProgressUpdate | None = None,
+        prompt_input: PromptInput | None = None,
+    ) -> Path:
+        if session_id is None:
+            session_id = str(uuid.uuid4())
+        workspace_root, workspace = self._prepare_workspace(session_id, prompt_input, self.container_kind)
+        home_dir = Path(tempfile.mkdtemp(prefix=f"{self.container_kind}-home-{session_id}-"))
+        home_dir.chmod(0o777)
+        started_at = datetime.now(timezone.utc)
+        container_name = self._container_name(self.container_kind, session_id)
+        turn_prompts = _agent_turn_prompts(prompt, prompt_input)
+        try:
+            workspace.mkdir(parents=True, exist_ok=True)
+            existing_sessions = {path.resolve() for path in self._list_native_session_files(home_dir)}
+            if len(turn_prompts) > 1:
+                self._start_container(self._build_external_persistent_container_command(workspace, home_dir, container_name))
+            for turn_index, turn_prompt in enumerate(turn_prompts):
+                (workspace / TEICH_PROMPT_FILE_NAME).write_text(turn_prompt, encoding="utf-8")
+                (workspace / TEICH_PROMPT_FILE_NAME).chmod(0o666)
+                if len(turn_prompts) > 1:
+                    command = self._build_external_exec_command(container_name, continue_session=turn_index > 0)
+                else:
+                    command = self._build_external_command(
+                        workspace,
+                        home_dir,
+                        container_name,
+                        continue_session=turn_index > 0,
+                    )
+                try:
+                    self._run_external_process(command, container_name)
+                except subprocess.CalledProcessError as exc:
+                    stderr = exc.stderr if isinstance(exc.stderr, str) else (exc.stderr or "")
+                    stdout = exc.output if isinstance(exc.output, str) else (exc.output or "")
+                    details = stderr.strip() or stdout.strip()
+                    raise RuntimeError(f"Session {session_id[:8]} failed: {details}") from exc
+            trace_path = self._extract_native_session_file(session_id, home_dir, existing_sessions, started_at)
+            self._copy_workspace_snapshot(workspace, self._sandbox_destination(trace_path))
+            return trace_path
+        except BaseException:
+            self._preserve_partial_session_files(home_dir / "projects", session_id, self.source_name)
+            raise
+        finally:
+            if len(turn_prompts) > 1:
+                self._remove_container(container_name)
+            shutil.rmtree(workspace_root, ignore_errors=True)
+            shutil.rmtree(home_dir, ignore_errors=True)
 
     def _events_from_turn_output(
         self,

@@ -17,6 +17,64 @@ from teich.config import APIConfig, Config, MCPConfig, ModelConfig, PromptInput
 from teich.runner import ChatRunner, ClaudeCodeRunner, CodexRunner, HermesRunner, PiRunner, pending_prompt_inputs_for_resume
 
 
+def _claude_home_from_command(command: list[str]) -> Path:
+    for index, item in enumerate(command):
+        if item == "-v" and index + 1 < len(command):
+            mount = command[index + 1]
+            suffix = ":/home/codex/.claude"
+            if mount.endswith(suffix):
+                return Path(mount[: -len(suffix)])
+    raise AssertionError(f"Claude home mount not found in command: {command}")
+
+
+def _write_fake_claude_native_session(
+    command: list[str],
+    *,
+    prompt: str = "smoke",
+    model: str = "claude-sonnet-4-6",
+) -> None:
+    home_dir = _claude_home_from_command(command)
+    session_id = "native-claude-session"
+    session_file = home_dir / "projects" / "-workspace" / f"{session_id}.jsonl"
+    session_file.parent.mkdir(parents=True, exist_ok=True)
+    rows = [
+        {
+            "type": "user",
+            "message": {"role": "user", "content": prompt},
+            "uuid": "user-uuid",
+            "parentUuid": None,
+            "sessionId": session_id,
+            "timestamp": "2026-05-13T00:00:00.000Z",
+        },
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "model": model,
+                "content": [{"type": "text", "text": "done"}],
+            },
+            "uuid": "assistant-uuid",
+            "parentUuid": "user-uuid",
+            "sessionId": session_id,
+            "timestamp": "2026-05-13T00:00:01.000Z",
+        },
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "duration_ms": 1000,
+            "result": "done",
+            "session_id": session_id,
+            "total_cost_usd": 0.01,
+            "usage": {"input_tokens": 4, "output_tokens": 2, "total_tokens": 6},
+        },
+    ]
+    session_file.write_text(
+        "\n".join(json.dumps(row, separators=(",", ":")) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+
 def test_codex_runner_init():
     """Test CodexRunner initialization."""
     config = Config()
@@ -195,7 +253,11 @@ def test_claude_code_runner_uses_stream_json_and_prompt_file(tmp_path: Path):
     with patch.object(ClaudeCodeRunner, "_ensure_image"):
         runner = ClaudeCodeRunner(config)
 
-    with patch.object(runner, "_run_external_process", return_value=('{"type":"result","result":"done"}\n', "")) as mock_run, \
+    def fake_run(command: list[str], _container_name: str | None) -> tuple[str, str]:
+        _write_fake_claude_native_session(command, prompt=long_prompt)
+        return '{"type":"result","result":"done"}\n', ""
+
+    with patch.object(runner, "_run_external_process", side_effect=fake_run) as mock_run, \
          patch.object(runner, "_copy_workspace_snapshot"):
         trace_path = runner.run_session(long_prompt, "claude-session")
 
@@ -208,10 +270,11 @@ def test_claude_code_runner_uses_stream_json_and_prompt_file(tmp_path: Path):
     assert "< /workspace/.teich-prompt.txt" in command_text
     assert "ANTHROPIC_API_KEY=sk-ant-test" in command
     rows = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
-    assert rows[0]["type"] == "external_session_meta"
-    assert rows[1]["type"] == "external_message"
-    assert rows[1]["role"] == "user"
+    assert rows[0]["type"] == "user"
+    assert rows[0]["message"]["content"] == long_prompt
+    assert rows[1]["type"] == "assistant"
     assert rows[2]["type"] == "result"
+    assert "external_session_meta" not in {row["type"] for row in rows}
 
 
 def test_claude_code_runner_uses_openrouter_anthropic_skin_auth(tmp_path: Path):
@@ -228,7 +291,11 @@ def test_claude_code_runner_uses_openrouter_anthropic_skin_auth(tmp_path: Path):
     with patch.object(ClaudeCodeRunner, "_ensure_image"):
         runner = ClaudeCodeRunner(config)
 
-    with patch.object(runner, "_run_external_process", return_value=('{"type":"result","result":"done"}\n', "")) as mock_run, \
+    def fake_run(command: list[str], _container_name: str | None) -> tuple[str, str]:
+        _write_fake_claude_native_session(command, prompt="smoke", model="minimax/minimax-m2.5:free")
+        return '{"type":"result","result":"done"}\n', ""
+
+    with patch.object(runner, "_run_external_process", side_effect=fake_run) as mock_run, \
          patch.object(runner, "_copy_workspace_snapshot"):
         trace_path = runner.run_session("smoke", "claude-openrouter-session")
 
@@ -247,8 +314,9 @@ def test_claude_code_runner_uses_openrouter_anthropic_skin_auth(tmp_path: Path):
     assert "sleep 1" not in command_text
     assert "/dev/tcp/127.0.0.1/17891" in command_text
     rows = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
-    assert rows[0]["payload"]["model_provider"] == "openrouter"
-    assert rows[0]["payload"]["model"] == "minimax/minimax-m2.5:free"
+    assert rows[0]["type"] == "user"
+    assert rows[0]["message"]["content"] == "smoke"
+    assert rows[1]["message"]["model"] == "minimax/minimax-m2.5:free"
 
 
 def test_claude_code_runner_uses_continue_for_followups(tmp_path: Path):
@@ -260,8 +328,36 @@ def test_claude_code_runner_uses_continue_for_followups(tmp_path: Path):
     prompt_input = PromptInput(prompt="Build app", follow_up_prompts=["Add tests"])
     with patch.object(ClaudeCodeRunner, "_ensure_image"):
         runner = ClaudeCodeRunner(config)
-    with patch.object(runner, "_start_container") as mock_start, \
-         patch.object(runner, "_run_external_process", return_value=('{"type":"result","result":"done"}\n', "")) as mock_run, \
+    native_home: Path | None = None
+
+    def fake_start(command: list[str]) -> None:
+        nonlocal native_home
+        native_home = _claude_home_from_command(command)
+
+    def fake_run(command: list[str], _container_name: str | None) -> tuple[str, str]:
+        if native_home is None:
+            _write_fake_claude_native_session(command, prompt="Build app")
+        else:
+            session_file = native_home / "projects" / "-workspace" / "native-claude-session.jsonl"
+            session_file.parent.mkdir(parents=True, exist_ok=True)
+            session_file.write_text(
+                json.dumps(
+                    {
+                        "type": "user",
+                        "message": {"role": "user", "content": "Build app"},
+                        "uuid": "user-uuid",
+                        "parentUuid": None,
+                        "sessionId": "native-claude-session",
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        return '{"type":"result","result":"done"}\n', ""
+
+    with patch.object(runner, "_start_container", side_effect=fake_start) as mock_start, \
+         patch.object(runner, "_run_external_process", side_effect=fake_run) as mock_run, \
          patch.object(runner, "_copy_workspace_snapshot"), \
          patch.object(runner, "_remove_container") as mock_remove:
         runner.run_session(prompt_input.prompt, "claude-followups", prompt_input=prompt_input)

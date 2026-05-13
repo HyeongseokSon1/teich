@@ -25,7 +25,7 @@ Teich now has a usable trace-first generation and SFT preparation flow:
 ### 1.1 Integration Testing
 
 - [x] Test actual Docker image build
-- [x] Validate live provider smoke tests for Codex/Pi-style native extraction plus Claude Code/Hermes external traces, including Hermes delegated child-session export
+- [x] Validate live provider smoke tests for Codex/Pi/Claude Code-style native extraction plus Hermes external traces, including Hermes delegated child-session export
 - [x] Verify session files are extracted correctly with real or provider-native sessions
 - [x] Verify trace format matches HF expectations on generated trace examples
 - [ ] Test MCP server configuration with real servers
@@ -198,6 +198,7 @@ tokenized = tokenizer(rendered, truncation=True, max_length=32768)
 - [x] Pi runner
 - [x] Chat runner
 - [x] Anthropic Claude Code runner
+- [x] Native Claude Code transcript export from `.claude/projects/...`
 - [x] Hermes agent runner with built-in toolsets and separate delegated subagent trace export
 - [ ] Ollama/local model runner beyond Codex OSS mode
 

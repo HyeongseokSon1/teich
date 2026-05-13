@@ -425,7 +425,9 @@ def _detect_trace_type(events: list[dict[str, Any]]) -> str:
             if isinstance(source, str) and source.strip().lower() in {"claude", "claude-code", "claude_code"}:
                 return "claude_code"
             return "external_agent"
-        if event_type in {"assistant", "user", "system", "result"} and isinstance(event.get("session_id"), str):
+        if event_type in {"assistant", "user", "system", "result"} and (
+            isinstance(event.get("session_id"), str) or isinstance(event.get("sessionId"), str)
+        ):
             return "claude_code"
         if event_type in {"session_meta", "turn_context", "response_item", "event_msg"}:
             return "codex"
@@ -515,6 +517,8 @@ def _convert_claude_code_trace_to_training_example(
         if event_type == "system":
             if isinstance(event.get("session_id"), str):
                 session_id = event["session_id"]
+            elif isinstance(event.get("sessionId"), str):
+                session_id = event["sessionId"]
             if event.get("subtype") == "init":
                 value = event.get("model")
                 if isinstance(value, str) and value.strip():
@@ -529,8 +533,11 @@ def _convert_claude_code_trace_to_training_example(
                             if isinstance(name, str) and name.strip():
                                 tool_names.add(name.strip())
             continue
-        if event_type in {"user", "assistant"} and isinstance(event.get("session_id"), str):
-            session_id = event["session_id"]
+        if event_type in {"user", "assistant"}:
+            if isinstance(event.get("session_id"), str):
+                session_id = event["session_id"]
+            elif isinstance(event.get("sessionId"), str):
+                session_id = event["sessionId"]
 
         if event_type == "user":
             payload = event.get("message")
@@ -608,6 +615,8 @@ def _convert_claude_code_trace_to_training_example(
 
         if event_type == "result":
             value = event.get("session_id")
+            if not isinstance(value, str):
+                value = event.get("sessionId")
             if isinstance(value, str) and value.strip():
                 session_id = value.strip()
             payload_usage = event.get("usage")

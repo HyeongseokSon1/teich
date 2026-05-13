@@ -300,6 +300,63 @@ def test_convert_claude_code_stream_json_trace(tmp_path: Path):
     assert {tool["function"]["name"] for tool in example.tools} == {"Bash", "Edit"}
 
 
+def test_convert_native_claude_code_transcript_with_camel_session_id(tmp_path: Path):
+    trace_file = tmp_path / "native-claude.jsonl"
+    events = [
+        {
+            "type": "user",
+            "message": {"role": "user", "content": "Inspect the project"},
+            "uuid": "user-uuid",
+            "parentUuid": None,
+            "sessionId": "claude-session",
+        },
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "model": "claude-sonnet-4-6",
+                "content": [
+                    {"type": "text", "text": "I'll inspect the files."},
+                    {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls"}},
+                ],
+            },
+            "uuid": "assistant-uuid",
+            "parentUuid": "user-uuid",
+            "sessionId": "claude-session",
+        },
+        {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "README.md\nsrc"},
+                ],
+            },
+            "uuid": "tool-result-uuid",
+            "parentUuid": "assistant-uuid",
+            "sessionId": "claude-session",
+        },
+        {
+            "type": "result",
+            "sessionId": "claude-session",
+            "result": "Done.",
+            "usage": {"input_tokens": 12, "output_tokens": 7, "total_tokens": 19},
+            "total_cost_usd": 0.01,
+        },
+    ]
+    trace_file.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+
+    example = convert_trace_to_training_example(trace_file)
+
+    assert example.metadata["trace_type"] == "claude-code"
+    assert example.metadata["session_id"] == "claude-session"
+    assert example.prompt == "Inspect the project"
+    assert example.messages[0] == {"role": "user", "content": "Inspect the project"}
+    assert example.messages[1]["tool_calls"][0]["function"] == {"name": "Bash", "arguments": {"command": "ls"}}
+    assert example.messages[2]["role"] == "tool"
+    assert example.messages[3] == {"role": "assistant", "content": "Done."}
+
+
 def test_convert_external_agent_trace(tmp_path: Path):
     trace_file = tmp_path / "hermes.jsonl"
     events = [

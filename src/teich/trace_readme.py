@@ -271,7 +271,7 @@ def build_traces_readme(
                 "- `external_message`",
                 "- `external_stderr`",
                 "",
-                "`external_*` events are used for providers that expose stream or database-backed native session output instead of Codex/Pi-style JSONL files, such as Claude Code and Hermes.",
+                "`claude-code` outputs native Claude Code transcript JSONL from `.claude/projects/...`. `external_*` events are used for providers that expose stream or database-backed native session output instead of Codex/Pi-style JSONL files, such as Hermes.",
                 "Hermes delegated subagent sessions are exported as their own trace files and linked to the orchestrator trace with `parent_session_id`.",
                 "Failed or interrupted traces are quarantined under `partials/` and are excluded from this README, conversion, resume detection, and uploads.",
                 "",
