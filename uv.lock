@@ -1705,7 +1705,7 @@ wheels = [
 
 [[package]]
 name = "teich"
-version = "0.1.1a48"
+version = "0.1.1a49"
 source = { editable = "." }
 dependencies = [
     { name = "datasets" },

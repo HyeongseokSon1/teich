@@ -1273,6 +1273,8 @@ class CodexRunner(DockerRuntimeRunner):
             "codex",
             "--ask-for-approval",
             self.config.model.approval_policy,
+            "--sandbox",
+            self.config.model.sandbox,
         ]
         if self._is_oss_local_provider(provider_name):
             codex_cmd.extend(
@@ -1286,8 +1288,6 @@ class CodexRunner(DockerRuntimeRunner):
         if resume:
             codex_cmd.extend(["resume", "--last"])
         codex_cmd.extend(["--model", model])
-        if not resume:
-            codex_cmd.extend(["--sandbox", self.config.model.sandbox])
         codex_cmd.append("--skip-git-repo-check")
         if base_url and not self._is_oss_local_provider(provider_name):
             provider_key = self._custom_provider_key(provider_name)

@@ -328,6 +328,10 @@ def test_codex_run_session_runs_follow_up_prompts_by_resuming_session():
     assert "resume" not in first_command
     assert "resume" in second_command
     assert "--last" in second_command
+    assert second_command[second_command.index("--sandbox") + 1] == "danger-full-access"
+    codex_index = second_command.index("codex")
+    codex_exec_index = second_command.index("exec", codex_index)
+    assert second_command.index("--sandbox") < codex_exec_index
     assert mock_start_container.call_count == 1
     assert codex_home is not None
     assert mock_remove_container.call_args.args == ("teich-codex-test-session",)
