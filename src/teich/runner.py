@@ -305,6 +305,7 @@ def _training_example_has_answer(example: dict[str, Any]) -> bool:
 
 def _structured_rows_from_jsonl(path: Path) -> list[dict[str, Any]] | None:
     rows: list[dict[str, Any]] = []
+    structured_rows: list[dict[str, Any]] = []
     with path.open("r", encoding="utf-8") as handle:
         for raw_line in handle:
             line = raw_line.strip()
@@ -314,9 +315,22 @@ def _structured_rows_from_jsonl(path: Path) -> list[dict[str, Any]] | None:
             if not isinstance(event, dict):
                 return None
             rows.append(event)
-    if rows and all(isinstance(row.get("messages"), list) and isinstance(row.get("prompt"), str) for row in rows):
-        return rows
-    return None
+            if isinstance(event.get("messages"), list):
+                structured_rows.append(event)
+    return structured_rows or None
+
+
+def _prompt_from_training_messages(messages: Any) -> str:
+    if not isinstance(messages, list):
+        return ""
+    return next(
+        (
+            _message_text(message.get("content"))
+            for message in messages
+            if isinstance(message, dict) and message.get("role") == "user"
+        ),
+        "",
+    )
 
 
 def completed_prompt_keys_from_outputs(traces_dir: Path) -> set[str]:
@@ -340,7 +354,9 @@ def completed_prompt_keys_from_outputs(traces_dir: Path) -> set[str]:
         except (OSError, json.JSONDecodeError, ValueError):
             continue
         for example in examples:
-            prompt = example.get("prompt")
+            prompt = example.get("prompt") if isinstance(example.get("prompt"), str) else ""
+            if not prompt.strip():
+                prompt = _prompt_from_training_messages(example.get("messages"))
             if isinstance(prompt, str) and prompt.strip() and _training_example_has_answer(example):
                 completed.add(_prompt_completion_key(_prompt_input_from_training_example(example, prompt)))
     return completed

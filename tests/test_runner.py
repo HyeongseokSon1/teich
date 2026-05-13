@@ -1626,6 +1626,32 @@ def test_resume_detects_completed_chat_prompts(tmp_path: Path):
     assert [item.prompt for item in pending] == ["Who are you?"]
 
 
+def test_resume_detects_completed_structured_rows_without_top_level_prompt(tmp_path: Path):
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "chat.jsonl").write_text(
+        json.dumps(
+            {
+                "messages": [
+                    {"role": "system", "content": "You are helpful"},
+                    {"role": "user", "content": "Hello"},
+                    {"role": "assistant", "content": "Hi"},
+                ],
+                "response": "Hi",
+            }
+        )
+        + "\n"
+        + json.dumps({"metadata": {"note": "legacy sidecar row without messages"}})
+        + "\n",
+        encoding="utf-8",
+    )
+    prompt_inputs = [PromptInput(prompt="Hello"), PromptInput(prompt="Who are you?")]
+
+    pending = pending_prompt_inputs_for_resume(prompt_inputs, output_dir)
+
+    assert [item.prompt for item in pending] == ["Who are you?"]
+
+
 def test_resume_detects_completed_chat_follow_up_prompt_sets(tmp_path: Path):
     output_dir = tmp_path / "output"
     output_dir.mkdir()
@@ -1798,6 +1824,40 @@ def test_chat_runner_resume_appends_existing_chat_file(tmp_path: Path):
 
     rows = [json.loads(line) for line in destination.read_text(encoding="utf-8").splitlines()]
     assert [row["prompt"] for row in rows] == ["Hello", "Who are you?"]
+
+
+def test_chat_runner_resume_continues_queue_after_first_concurrency_window(tmp_path: Path):
+    config = Config(
+        agent={"provider": "chat"},
+        model=ModelConfig(model="gpt-4.1-mini"),
+        api=APIConfig(provider="openai", api_key="sk-test", wire_api="responses"),
+        output={"traces_dir": tmp_path / "output"},
+    )
+    runner = ChatRunner(config)
+    prompt_inputs = [PromptInput(prompt=f"Prompt {index}") for index in range(5)]
+    claimed = []
+
+    def fake_task(prompt_id, prompt_index, total_prompts, prompt_input, destination, progress_callback, append_lock=None):
+        claimed.append(prompt_input.prompt)
+        training_row = {
+            "prompt": prompt_input.prompt,
+            "response": "Done",
+            "messages": [
+                {"role": "user", "content": prompt_input.prompt},
+                {"role": "assistant", "content": "Done"},
+            ],
+        }
+        if append_lock is not None:
+            with append_lock:
+                runner._append_chat_training_row(destination, training_row)
+        return prompt_index, training_row
+
+    with patch.object(runner, "_run_chat_prompt_task", side_effect=fake_task):
+        assert runner.run_all(max_concurrency=2, prompt_inputs=prompt_inputs, resume=True) == [
+            tmp_path / "output" / "chat.jsonl"
+        ]
+
+    assert claimed == [item.prompt for item in prompt_inputs]
 
 
 def test_chat_runner_stops_claiming_new_prompts_after_failure(tmp_path: Path):
