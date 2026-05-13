@@ -201,7 +201,7 @@ Recommended `prompts.jsonl`:
 {"prompt":"Draft a compact project plan","follow_up_prompts":["Revise it for a solo developer","Add a risk checklist"]}
 ```
 
-`follow_up_prompts` is supported across providers. `chat` sends each follow-up as a real additional user turn in one generated training row. `codex` and `pi` run the initial prompt, then resume the same saved agent session for each follow-up so the trace captures the ordered turns.
+`follow_up_prompts` is supported across providers. `chat` sends each follow-up as a real additional user turn in one generated training row. `codex` and `pi` keep one Docker container alive for the full prompt sequence, run the initial prompt, then resume the same saved agent session for each follow-up so workspace edits, tool caches, and in-container installs remain available across turns.
 
 ### Generate a text-only chat dataset
 

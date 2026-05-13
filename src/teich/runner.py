@@ -522,6 +522,22 @@ class DockerRuntimeRunner:
         for process, container_name in active:
             self._terminate_process(process, container_name)
 
+    @staticmethod
+    def _start_container(command: list[str]) -> None:
+        try:
+            subprocess.run(command, capture_output=True, text=True, check=True)
+        except FileNotFoundError as exc:
+            if shutil.which(command[0]) is None:
+                raise RuntimeError(
+                    "Docker runtime not available. Ensure Docker is installed and the runtime image can be built."
+                ) from exc
+            raise RuntimeError(f"Failed to start Docker runtime process: {exc}") from exc
+        except subprocess.CalledProcessError as exc:
+            stderr = exc.stderr if isinstance(exc.stderr, str) else (exc.stderr or "")
+            stdout = exc.stdout if isinstance(exc.stdout, str) else (exc.stdout or "")
+            details = stderr.strip() or stdout.strip() or str(exc)
+            raise RuntimeError(f"Failed to start Docker runtime container: {details}") from exc
+
     def _preserve_partial_session_files(self, session_dir: Path, session_id: str, prefix: str) -> list[Path]:
         return []
 
@@ -1188,28 +1204,33 @@ class CodexRunner(DockerRuntimeRunner):
                 normalized_lines.append(json.dumps(cls._normalize_trace_event(event), separators=(",", ":")))
         destination.write_text("\n".join(normalized_lines) + "\n", encoding="utf-8")
 
-    def _build_codex_command(
-        self,
-        prompt: str,
-        workspace: Path,
-        codex_home: Path,
-        container_name: str,
-        resume: bool = False,
-    ) -> list[str]:
-        api_key = self.config.get_api_key() or ""
+    def _codex_base_url_and_proxy_target(self) -> tuple[str | None, str | None]:
         configured_base_url = self.config.get_base_url()
         base_url = configured_base_url
-        model = self.config.get_effective_model()
         provider_name = self.config.api.provider
-        provider_env_key = self._provider_env_key(provider_name)
         proxy_target = self._local_provider_proxy_target(provider_name, configured_base_url)
         if configured_base_url and not self._is_oss_local_provider(provider_name):
             base_url = self._container_base_url(configured_base_url)
+        return base_url, proxy_target
+
+    def _build_codex_docker_base_command(
+        self,
+        workspace: Path,
+        codex_home: Path,
+        container_name: str,
+        *,
+        detached: bool = False,
+    ) -> tuple[list[str], str | None]:
+        api_key = self.config.get_api_key() or ""
+        configured_base_url = self.config.get_base_url()
+        base_url, proxy_target = self._codex_base_url_and_proxy_target()
+        provider_name = self.config.api.provider
+        provider_env_key = self._provider_env_key(provider_name)
         cmd = [
             "docker",
             "run",
-            "--rm",
-            "-i",
+            *([] if detached else ["--rm", "-i"]),
+            *(["-d"] if detached else []),
             "--name",
             container_name,
             "--user",
@@ -1241,6 +1262,13 @@ class CodexRunner(DockerRuntimeRunner):
             )
         if api_key:
             cmd.extend(["-e", f"{provider_env_key}={api_key}"])
+        return cmd, proxy_target
+
+    def _build_codex_agent_command(self, resume: bool = False) -> list[str]:
+        base_url, _proxy_target = self._codex_base_url_and_proxy_target()
+        model = self.config.get_effective_model()
+        provider_name = self.config.api.provider
+        provider_env_key = self._provider_env_key(provider_name)
         codex_cmd = [
             "codex",
             "--ask-for-approval",
@@ -1271,7 +1299,7 @@ class CodexRunner(DockerRuntimeRunner):
                 f"wire_api={self._toml_string(self.config.api.wire_api)}"
                 "}"
             )
-            cmd.extend(
+            codex_cmd.extend(
                 [
                     "--config",
                     f"model_providers.{provider_key}={provider_literal}",
@@ -1279,9 +1307,19 @@ class CodexRunner(DockerRuntimeRunner):
                     f"model_provider={self._toml_string(provider_key)}",
                 ]
             )
-            codex_cmd.extend(cmd[-4:])
-            cmd = cmd[:-4]
         codex_cmd.append("-")
+        return codex_cmd
+
+    def _build_codex_command(
+        self,
+        prompt: str,
+        workspace: Path,
+        codex_home: Path,
+        container_name: str,
+        resume: bool = False,
+    ) -> list[str]:
+        cmd, proxy_target = self._build_codex_docker_base_command(workspace, codex_home, container_name)
+        codex_cmd = self._build_codex_agent_command(resume=resume)
         cmd.append(self.image_name)
         if proxy_target:
             proxy_script = f"{CODEX_HOME_IN_CONTAINER}/{LOCAL_PROVIDER_PROXY_SCRIPT_NAME}"
@@ -1293,6 +1331,43 @@ class CodexRunner(DockerRuntimeRunner):
         else:
             cmd.extend(codex_cmd)
         return cmd
+
+    def _build_codex_persistent_container_command(
+        self,
+        workspace: Path,
+        codex_home: Path,
+        container_name: str,
+    ) -> list[str]:
+        cmd, proxy_target = self._build_codex_docker_base_command(
+            workspace,
+            codex_home,
+            container_name,
+            detached=True,
+        )
+        cmd.append(self.image_name)
+        if proxy_target:
+            proxy_script = f"{CODEX_HOME_IN_CONTAINER}/{LOCAL_PROVIDER_PROXY_SCRIPT_NAME}"
+            shell_command = (
+                f"node {shlex.quote(proxy_script)} >/tmp/local-provider-proxy.log 2>&1 & "
+                "exec sleep infinity"
+            )
+            cmd.extend(["bash", "-lc", shell_command])
+        else:
+            cmd.extend(["sleep", "infinity"])
+        return cmd
+
+    def _build_codex_exec_command(self, container_name: str, resume: bool = False) -> list[str]:
+        return [
+            "docker",
+            "exec",
+            "-i",
+            "--user",
+            "codex",
+            "-w",
+            WORKSPACE_IN_CONTAINER,
+            container_name,
+            *self._build_codex_agent_command(resume=resume),
+        ]
 
     def _extract_session_file(
         self,
@@ -1354,14 +1429,25 @@ class CodexRunner(DockerRuntimeRunner):
             if self._local_provider_proxy_target(self.config.api.provider, self.config.get_base_url()):
                 self._write_local_provider_proxy(codex_home)
             existing_sessions = {path.resolve() for path in self._list_session_files(codex_home)}
-            for turn_index, turn_prompt in enumerate(turn_prompts):
-                cmd = self._build_codex_command(
-                    turn_prompt,
-                    workspace,
-                    codex_home,
-                    container_name,
-                    resume=turn_index > 0,
+            if len(turn_prompts) > 1:
+                self._start_container(
+                    self._build_codex_persistent_container_command(
+                        workspace,
+                        codex_home,
+                        container_name,
+                    )
                 )
+            for turn_index, turn_prompt in enumerate(turn_prompts):
+                if len(turn_prompts) > 1:
+                    cmd = self._build_codex_exec_command(container_name, resume=turn_index > 0)
+                else:
+                    cmd = self._build_codex_command(
+                        turn_prompt,
+                        workspace,
+                        codex_home,
+                        container_name,
+                        resume=turn_index > 0,
+                    )
                 try:
                     self._run_process(
                         cmd,
@@ -1397,6 +1483,8 @@ class CodexRunner(DockerRuntimeRunner):
             self._preserve_partial_session_files(codex_home / "sessions", session_id, "codex")
             raise
         finally:
+            if len(turn_prompts) > 1:
+                self._remove_container(container_name)
             shutil.rmtree(workspace_root, ignore_errors=True)
             shutil.rmtree(codex_home, ignore_errors=True)
 
@@ -2149,6 +2237,13 @@ class PiRunner(DockerRuntimeRunner):
         configured_base_url = self.config.get_base_url()
         if configured_base_url and self._container_base_url(configured_base_url) != configured_base_url:
             command.extend(["--add-host", "host.docker.internal:host-gateway"])
+        pi_command = self._build_pi_agent_command(continue_session=continue_session)
+        command.append(self.image_name)
+        command.extend(pi_command)
+        return command
+
+    def _build_pi_agent_command(self, continue_session: bool = False) -> list[str]:
+        configured_base_url = self.config.get_base_url()
         pi_command = [
             "npx",
             "-y",
@@ -2176,9 +2271,55 @@ class PiRunner(DockerRuntimeRunner):
         if continue_session:
             pi_command.append("--continue")
         pi_command.extend(["--print", f"@{WORKSPACE_IN_CONTAINER}/{TEICH_PROMPT_FILE_NAME}"])
+        return pi_command
+
+    def _build_pi_persistent_container_command(
+        self,
+        workspace: Path,
+        agent_dir: Path,
+        session_dir: Path,
+        container_name: str,
+    ) -> list[str]:
+        command = [
+            "docker",
+            "run",
+            "-d",
+            "--name",
+            container_name,
+            "--user",
+            "codex",
+            "-e",
+            "HOME=/home/codex",
+            "-e",
+            f"PI_CODING_AGENT_DIR={PI_AGENT_DIR_IN_CONTAINER}",
+            "-v",
+            f"{workspace}:{WORKSPACE_IN_CONTAINER}",
+            "-v",
+            f"{agent_dir}:{PI_AGENT_DIR_IN_CONTAINER}",
+            "-v",
+            f"{session_dir}:{PI_SESSIONS_DIR_IN_CONTAINER}",
+            "-w",
+            WORKSPACE_IN_CONTAINER,
+        ]
+        configured_base_url = self.config.get_base_url()
+        if configured_base_url and self._container_base_url(configured_base_url) != configured_base_url:
+            command.extend(["--add-host", "host.docker.internal:host-gateway"])
         command.append(self.image_name)
-        command.extend(pi_command)
+        command.extend(["sleep", "infinity"])
         return command
+
+    def _build_pi_exec_command(self, container_name: str, continue_session: bool = False) -> list[str]:
+        return [
+            "docker",
+            "exec",
+            "-i",
+            "--user",
+            "codex",
+            "-w",
+            WORKSPACE_IN_CONTAINER,
+            container_name,
+            *self._build_pi_agent_command(continue_session=continue_session),
+        ]
 
     @classmethod
     def _normalize_pi_trace_event(cls, event: dict[str, object]) -> dict[str, object]:
@@ -2393,16 +2534,28 @@ class PiRunner(DockerRuntimeRunner):
             self._write_pi_agent_settings(agent_dir)
             workspace.mkdir(parents=True, exist_ok=True)
             self._write_pi_project_settings(workspace)
+            if len(turn_prompts) > 1:
+                self._start_container(
+                    self._build_pi_persistent_container_command(
+                        workspace,
+                        agent_dir,
+                        session_dir,
+                        container_name,
+                    )
+                )
             for turn_index, turn_prompt in enumerate(turn_prompts):
                 (workspace / TEICH_PROMPT_FILE_NAME).write_text(turn_prompt, encoding="utf-8")
-                command = self._build_pi_command(
-                    turn_prompt,
-                    workspace,
-                    agent_dir,
-                    session_dir,
-                    container_name,
-                    continue_session=turn_index > 0,
-                )
+                if len(turn_prompts) > 1:
+                    command = self._build_pi_exec_command(container_name, continue_session=turn_index > 0)
+                else:
+                    command = self._build_pi_command(
+                        turn_prompt,
+                        workspace,
+                        agent_dir,
+                        session_dir,
+                        container_name,
+                        continue_session=turn_index > 0,
+                    )
                 try:
                     self._run_process(
                         command,
@@ -2429,6 +2582,8 @@ class PiRunner(DockerRuntimeRunner):
             self._preserve_partial_session_files(session_dir, session_id, "pi")
             raise
         finally:
+            if len(turn_prompts) > 1:
+                self._remove_container(container_name)
             shutil.rmtree(workspace_root, ignore_errors=True)
             shutil.rmtree(agent_dir, ignore_errors=True)
             shutil.rmtree(session_dir, ignore_errors=True)

@@ -284,23 +284,35 @@ def test_codex_run_session_runs_follow_up_prompts_by_resuming_session():
         runner = CodexRunner(config)
 
     prompt_input = PromptInput(prompt="Build app", follow_up_prompts=["Add tests", "Polish UI"])
-    mounted_workspaces = []
+    container_workspace = None
+    codex_home = None
 
     def mounted_path(command: list[str], target: str) -> Path:
         mounts = [command[index + 1] for index, item in enumerate(command) if item == "-v"]
         match = next(mount for mount in mounts if mount.endswith(f":{target}"))
         return Path(match.rsplit(":", maxsplit=1)[0])
 
-    def record_process(command, *args) -> None:
-        stdin_text = args[6]
-        workspace = mounted_path(command, "/workspace")
-        mounted_workspaces.append(workspace)
-        if stdin_text == "Build app":
-            (workspace / "created-by-first-turn.txt").write_text("persisted", encoding="utf-8")
-        else:
-            assert (workspace / "created-by-first-turn.txt").read_text(encoding="utf-8") == "persisted"
+    def start_container(command: list[str]) -> None:
+        nonlocal container_workspace, codex_home
+        container_workspace = mounted_path(command, "/workspace")
+        codex_home = mounted_path(command, "/home/codex/.codex")
 
-    with patch.object(runner, '_run_process', side_effect=record_process) as mock_run_process, \
+    def record_process(command, *args) -> None:
+        assert command[:3] == ["docker", "exec", "-i"]
+        assert "--user" in command
+        assert "-w" in command
+        assert command[command.index("-w") + 1] == "/workspace"
+        assert "teich-codex-test-session" in command
+        assert container_workspace is not None
+        stdin_text = args[6]
+        if stdin_text == "Build app":
+            (container_workspace / "created-by-first-turn.txt").write_text("persisted", encoding="utf-8")
+        else:
+            assert (container_workspace / "created-by-first-turn.txt").read_text(encoding="utf-8") == "persisted"
+
+    with patch.object(runner, '_start_container', side_effect=start_container) as mock_start_container, \
+         patch.object(runner, '_run_process', side_effect=record_process) as mock_run_process, \
+         patch.object(runner, '_remove_container') as mock_remove_container, \
          patch.object(runner, '_extract_session_file') as mock_extract, \
          patch.object(runner, '_copy_workspace_snapshot'):
 
@@ -316,12 +328,9 @@ def test_codex_run_session_runs_follow_up_prompts_by_resuming_session():
     assert "resume" not in first_command
     assert "resume" in second_command
     assert "--last" in second_command
-    assert len(set(mounted_workspaces)) == 1
-    codex_home_mounts = [
-        mounted_path(call.args[0], "/home/codex/.codex")
-        for call in mock_run_process.call_args_list
-    ]
-    assert len(set(codex_home_mounts)) == 1
+    assert mock_start_container.call_count == 1
+    assert codex_home is not None
+    assert mock_remove_container.call_args.args == ("teich-codex-test-session",)
 
 
 def test_pi_run_session_runs_follow_up_prompts_by_continuing_session(tmp_path: Path):
@@ -333,13 +342,18 @@ def test_pi_run_session_runs_follow_up_prompts_by_continuing_session(tmp_path: P
     captured_workspace = None
     prompt_file_values = []
     commands = []
-    mounted_workspaces = []
-    mounted_session_dirs = []
+    container_workspace = None
+    container_session_dir = None
 
     def mounted_path(command: list[str], target: str) -> Path:
         mounts = [command[index + 1] for index, item in enumerate(command) if item == "-v"]
         match = next(mount for mount in mounts if mount.endswith(f":{target}"))
         return Path(match.rsplit(":", maxsplit=1)[0])
+
+    def start_container(command: list[str]) -> None:
+        nonlocal container_workspace, container_session_dir
+        container_workspace = mounted_path(command, "/workspace")
+        container_session_dir = mounted_path(command, "/home/codex/pi-sessions")
 
     def capture_project_settings(workspace: Path) -> None:
         nonlocal captured_workspace
@@ -347,20 +361,25 @@ def test_pi_run_session_runs_follow_up_prompts_by_continuing_session(tmp_path: P
 
     def record_prompt_file(command, *args, **kwargs) -> None:
         assert captured_workspace is not None
+        assert command[:3] == ["docker", "exec", "-i"]
+        assert "--user" in command
+        assert "-w" in command
+        assert command[command.index("-w") + 1] == "/workspace"
+        assert "teich-pi-pi-session" in command
+        assert container_workspace is not None
         commands.append(command)
-        workspace = mounted_path(command, "/workspace")
-        mounted_workspaces.append(workspace)
-        mounted_session_dirs.append(mounted_path(command, "/home/codex/pi-sessions"))
         prompt_file_values.append((captured_workspace / ".teich-prompt.txt").read_text(encoding="utf-8"))
         if prompt_file_values[-1] == "Build app":
-            (workspace / "created-by-first-turn.txt").write_text("persisted", encoding="utf-8")
+            (container_workspace / "created-by-first-turn.txt").write_text("persisted", encoding="utf-8")
         else:
-            assert (workspace / "created-by-first-turn.txt").read_text(encoding="utf-8") == "persisted"
+            assert (container_workspace / "created-by-first-turn.txt").read_text(encoding="utf-8") == "persisted"
 
     prompt_input = PromptInput(prompt="Build app", follow_up_prompts=["Add tests"])
 
-    with patch.object(runner, "_write_pi_project_settings", side_effect=capture_project_settings), \
+    with patch.object(runner, "_start_container", side_effect=start_container) as mock_start_container, \
+         patch.object(runner, "_write_pi_project_settings", side_effect=capture_project_settings), \
          patch.object(runner, "_run_process", side_effect=record_prompt_file), \
+         patch.object(runner, "_remove_container") as mock_remove_container, \
          patch.object(runner, "_extract_session_file", return_value=tmp_path / "output" / "pi.jsonl"), \
          patch.object(runner, "_copy_workspace_snapshot"):
         runner.run_session("Build app", "pi-session", prompt_input=prompt_input)
@@ -368,8 +387,9 @@ def test_pi_run_session_runs_follow_up_prompts_by_continuing_session(tmp_path: P
     assert prompt_file_values == ["Build app", "Add tests"]
     assert "--continue" not in commands[0]
     assert "--continue" in commands[1]
-    assert len(set(mounted_workspaces)) == 1
-    assert len(set(mounted_session_dirs)) == 1
+    assert mock_start_container.call_count == 1
+    assert container_session_dir is not None
+    assert mock_remove_container.call_args.args == ("teich-pi-pi-session",)
 
 
 def test_run_all_reports_progress_and_preserves_prompt_order(tmp_path: Path):

@@ -18,8 +18,8 @@ flowchart TD
     F2 --> G
 
     G --> H{"agent.provider"}
-    H -->|"codex"| I["Run Codex CLI in Docker<br/>resume same session for follow-ups"]
-    H -->|"pi"| J["Run Pi agent in Docker<br/>continue same session for follow-ups"]
+    H -->|"codex"| I["Run Codex CLI in Docker<br/>keep one container and resume same session for follow-ups"]
+    H -->|"pi"| J["Run Pi agent in Docker<br/>keep one container and continue same session for follow-ups"]
     H -->|"chat"| K["Call OpenAI-compatible API directly"]
 
     I --> I1["Write normalized raw JSONL trace"]
@@ -57,7 +57,7 @@ Each row accepts:
 
 - **`prompt`**: required initial user prompt.
 - **`github_repo`**: optional `owner/repo` checkout for `codex` and `pi` runs.
-- **`follow_up_prompts`**: optional list of additional user turns. `agent.provider: chat` generates them as real multi-turn data. `codex` and `pi` run the initial prompt, then resume or continue the same saved agent session for each follow-up.
+- **`follow_up_prompts`**: optional list of additional user turns. `agent.provider: chat` generates them as real multi-turn data. `codex` and `pi` keep one Docker container alive for the prompt sequence, then resume or continue the same saved agent session for each follow-up.
 
 CSV and plain text prompt files still load, but JSONL is the recommended format because prompts often contain commas, code fences, and newlines.
 
