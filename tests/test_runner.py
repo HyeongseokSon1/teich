@@ -1143,6 +1143,62 @@ def test_chat_runner_writes_structured_dataset_row_from_responses_api(tmp_path: 
     assert request.full_url == "https://api.openai.com/v1/responses"
 
 
+def test_chat_runner_supports_follow_up_prompts_as_multiturn_rows(tmp_path: Path):
+    config = Config(
+        agent={"provider": "chat"},
+        model=ModelConfig(model="gpt-4.1-mini"),
+        api=APIConfig(provider="openai", api_key="sk-test", wire_api="responses"),
+        output={"traces_dir": tmp_path / "output"},
+    )
+    runner = ChatRunner(config)
+    payloads = [
+        {
+            "model": "gpt-4.1-mini",
+            "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Initial answer"}]}],
+            "usage": {"input_tokens": 4, "output_tokens": 3, "total_tokens": 7},
+        },
+        {
+            "model": "gpt-4.1-mini",
+            "output": [
+                {"type": "reasoning", "summary": [{"text": "Need to revise."}]},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Follow-up answer"}]},
+            ],
+            "usage": {"input_tokens": 8, "output_tokens": 5, "total_tokens": 13},
+        },
+    ]
+    responses = []
+    for payload in payloads:
+        response = MagicMock()
+        response.read.return_value = json.dumps(payload).encode("utf-8")
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        responses.append(response)
+
+    with patch("teich.runner.urlopen", side_effect=responses) as mock_urlopen:
+        result = runner.run_session(
+            "Build a todo app",
+            "chat-session",
+            prompt_input=PromptInput(prompt="Build a todo app", follow_up_prompts=["Now add tests"]),
+        )
+
+    row = json.loads(result.read_text(encoding="utf-8").strip())
+    assert row["prompt"] == "Build a todo app"
+    assert row["follow_up_prompts"] == ["Now add tests"]
+    assert row["responses"] == ["Initial answer", "Follow-up answer"]
+    assert row["response"] == "Follow-up answer"
+    assert row["thinking"] == "Need to revise."
+    assert row["usage"]["totalTokens"] == 20
+    assert [message["role"] for message in row["messages"]] == ["system", "user", "assistant", "user", "assistant"]
+
+    second_request = mock_urlopen.call_args_list[1].args[0]
+    second_body = json.loads(second_request.data.decode("utf-8"))
+    assert second_body["input"] == [
+        {"role": "user", "content": "Build a todo app"},
+        {"role": "assistant", "content": "Initial answer"},
+        {"role": "user", "content": "Now add tests"},
+    ]
+
+
 @pytest.mark.parametrize(
     ("payload", "match"),
     [
@@ -1449,6 +1505,40 @@ def test_resume_detects_completed_chat_prompts(tmp_path: Path):
     pending = pending_prompt_inputs_for_resume(prompt_inputs, output_dir)
 
     assert [item.prompt for item in pending] == ["Who are you?"]
+
+
+def test_resume_detects_completed_chat_follow_up_prompt_sets(tmp_path: Path):
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "chat.jsonl").write_text(
+        json.dumps(
+            {
+                "prompt": "Build app",
+                "follow_up_prompts": ["Add tests"],
+                "response": "Done",
+                "messages": [
+                    {"role": "user", "content": "Build app"},
+                    {"role": "assistant", "content": "Built"},
+                    {"role": "user", "content": "Add tests"},
+                    {"role": "assistant", "content": "Done"},
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    prompt_inputs = [
+        PromptInput(prompt="Build app"),
+        PromptInput(prompt="Build app", follow_up_prompts=["Add tests"]),
+        PromptInput(prompt="Build app", follow_up_prompts=["Add docs"]),
+    ]
+
+    pending = pending_prompt_inputs_for_resume(prompt_inputs, output_dir)
+
+    assert [(item.prompt, item.follow_up_prompts) for item in pending] == [
+        ("Build app", []),
+        ("Build app", ["Add docs"]),
+    ]
 
 
 def test_resume_deduplicates_new_configured_prompts(tmp_path: Path):

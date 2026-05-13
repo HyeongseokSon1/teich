@@ -23,7 +23,9 @@ from urllib.request import Request, urlopen
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from .config import Config, PromptInput
+    from .config import Config
+
+from .config import PromptInput
 
 from .converter import convert_trace_to_training_example
 
@@ -236,9 +238,15 @@ class SessionProgressUpdate:
 SessionProgressCallback = Callable[[SessionProgressUpdate], None]
 
 
-def _prompt_completion_key(prompt: str) -> str:
+def _prompt_text_completion_key(prompt: str) -> str:
     prompt = _unwrap_teich_prompt_file(prompt)
     return "\n".join(prompt.replace("\r\n", "\n").replace("\r", "\n").strip().splitlines())
+
+
+def _prompt_completion_key(prompt_input: PromptInput | str) -> str:
+    if isinstance(prompt_input, str):
+        return _prompt_text_completion_key(prompt_input)
+    return "\n\n--- follow-up ---\n\n".join(_prompt_text_completion_key(prompt) for prompt in prompt_input.turn_prompts())
 
 
 def _unwrap_teich_prompt_file(prompt: str) -> str:
@@ -328,15 +336,25 @@ def completed_prompt_keys_from_outputs(traces_dir: Path) -> set[str]:
         for example in examples:
             prompt = example.get("prompt")
             if isinstance(prompt, str) and prompt.strip() and _training_example_has_answer(example):
-                completed.add(_prompt_completion_key(prompt))
+                completed.add(_prompt_completion_key(_prompt_input_from_training_example(example, prompt)))
     return completed
+
+
+def _prompt_input_from_training_example(example: dict[str, Any], prompt: str) -> PromptInput | str:
+    follow_up_prompts = example.get("follow_up_prompts")
+    if not isinstance(follow_up_prompts, list):
+        return prompt
+    try:
+        return PromptInput(prompt=prompt, follow_up_prompts=follow_up_prompts)
+    except ValueError:
+        return prompt
 
 
 def unique_prompt_inputs_by_completion_key(prompt_inputs: list[PromptInput]) -> list[PromptInput]:
     unique: list[PromptInput] = []
     seen: set[str] = set()
     for prompt_input in prompt_inputs:
-        key = _prompt_completion_key(prompt_input.prompt)
+        key = _prompt_completion_key(prompt_input)
         if key in seen:
             continue
         seen.add(key)
@@ -352,7 +370,7 @@ def pending_prompt_inputs_for_resume(prompt_inputs: list[PromptInput], traces_di
     return [
         prompt_input
         for prompt_input in prompt_inputs
-        if _prompt_completion_key(prompt_input.prompt) not in completed
+        if _prompt_completion_key(prompt_input) not in completed
     ]
 
 
@@ -771,6 +789,8 @@ class DockerRuntimeRunner:
         session_id = str(uuid.uuid4())
         started_at = datetime.now(timezone.utc)
         prompt_preview = self._prompt_preview(prompt_input.prompt)
+        if prompt_input.follow_up_prompts:
+            raise RuntimeError("follow_up_prompts are currently supported only by agent.provider: chat.")
         progress_base = SessionProgressUpdate(
             prompt_id=prompt_id,
             prompt_index=prompt_index,
@@ -1408,17 +1428,15 @@ class ChatRunner(DockerRuntimeRunner):
             return f"{self._api_base_url()}/chat/completions"
         return f"{self._api_base_url()}/responses"
 
-    def _chat_request_body(self, prompt: str) -> dict[str, Any]:
+    def _chat_request_body(self, prompt: str, history: list[dict[str, str]] | None = None) -> dict[str, Any]:
         system_prompt = self._chat_system_prompt()
         model = self.config.get_effective_model()
         reasoning_effort = self.config.model.reasoning_effort
+        conversation = [*(history or []), {"role": "user", "content": prompt}]
         if self._wire_api() in {"completions", "chat_completions", "chat-completions", "openai-completions"}:
             body: dict[str, Any] = {
                 "model": model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": prompt},
-                ],
+                "messages": [{"role": "system", "content": system_prompt}, *conversation],
             }
             if isinstance(reasoning_effort, str) and reasoning_effort.strip():
                 body["reasoning_effort"] = reasoning_effort.strip()
@@ -1426,7 +1444,7 @@ class ChatRunner(DockerRuntimeRunner):
         body = {
             "model": model,
             "instructions": system_prompt,
-            "input": prompt,
+            "input": conversation if history else prompt,
         }
         if isinstance(reasoning_effort, str) and reasoning_effort.strip():
             body["reasoning"] = {"effort": reasoning_effort.strip()}
@@ -1591,8 +1609,8 @@ class ChatRunner(DockerRuntimeRunner):
 
         return payload
 
-    def _request_chat_completion(self, prompt: str) -> dict[str, Any]:
-        body = self._chat_request_body(prompt)
+    def _request_chat_turn(self, prompt: str, history: list[dict[str, str]] | None = None) -> tuple[str, str | None, dict[str, Any] | None, str]:
+        body = self._chat_request_body(prompt, history)
         request = Request(
             self._chat_endpoint(),
             data=json.dumps(body).encode("utf-8"),
@@ -1613,6 +1631,10 @@ class ChatRunner(DockerRuntimeRunner):
         content, thinking, usage, model = self._parse_chat_response(payload)
         if not content and not thinking:
             raise RuntimeError("Chat request returned neither assistant content nor thinking.")
+        return content, thinking, usage, model
+
+    def _request_chat_completion(self, prompt: str) -> dict[str, Any]:
+        content, thinking, usage, model = self._request_chat_turn(prompt)
         system_prompt = self._chat_system_prompt()
         return {
             "messages": [
@@ -1631,6 +1653,66 @@ class ChatRunner(DockerRuntimeRunner):
                 "trace_type": "chat",
                 "model_provider": self.config.api.provider,
                 "model": model,
+            },
+        }
+
+    @staticmethod
+    def _merge_usage_totals(usages: list[dict[str, Any] | None]) -> dict[str, Any] | None:
+        normalized_usages = [ChatRunner._normalize_usage(usage) for usage in usages if isinstance(usage, dict)]
+        normalized_usages = [usage for usage in normalized_usages if usage is not None]
+        if not normalized_usages:
+            return None
+        totals = {"input": 0, "output": 0, "reasoning": 0, "totalTokens": 0}
+        for usage in normalized_usages:
+            totals["input"] += TraceMetrics._int_value(usage.get("input"))
+            totals["output"] += TraceMetrics._int_value(usage.get("output"))
+            totals["reasoning"] += TraceMetrics._int_value(usage.get("reasoning"))
+            totals["totalTokens"] += TraceMetrics._int_value(usage.get("totalTokens"))
+        if not totals["totalTokens"]:
+            totals["totalTokens"] = totals["input"] + totals["output"] + totals["reasoning"]
+        return totals
+
+    def _request_chat_conversation(self, prompt_input: PromptInput) -> dict[str, Any]:
+        if not prompt_input.follow_up_prompts:
+            return self._request_chat_completion(prompt_input.prompt)
+
+        system_prompt = self._chat_system_prompt()
+        history: list[dict[str, str]] = []
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system_prompt, "thinking": None},
+        ]
+        responses: list[str] = []
+        thinking_parts: list[str | None] = []
+        usages: list[dict[str, Any] | None] = []
+        model = self.config.get_effective_model()
+
+        for prompt in prompt_input.turn_prompts():
+            content, thinking, usage, model = self._request_chat_turn(prompt, history)
+            messages.append({"role": "user", "content": prompt, "thinking": None})
+            messages.append({"role": "assistant", "content": content, "thinking": thinking})
+            history.append({"role": "user", "content": prompt})
+            history.append({"role": "assistant", "content": content})
+            responses.append(content)
+            thinking_parts.append(thinking)
+            usages.append(usage)
+
+        thinking_text = "\n\n".join(part for part in thinking_parts if isinstance(part, str) and part.strip()) or None
+        return {
+            "messages": messages,
+            "system": system_prompt,
+            "prompt": prompt_input.prompt,
+            "follow_up_prompts": prompt_input.follow_up_prompts,
+            "thinking": thinking_text,
+            "response": responses[-1] if responses else "",
+            "responses": responses,
+            "model": model,
+            "provider": self.config.api.provider,
+            "usage": self._merge_usage_totals(usages),
+            "metadata": {
+                "trace_type": "chat",
+                "model_provider": self.config.api.provider,
+                "model": model,
+                "turn_count": len(prompt_input.turn_prompts()),
             },
         }
 
@@ -1663,7 +1745,7 @@ class ChatRunner(DockerRuntimeRunner):
             raise RuntimeError("Chat runner does not support github_repo prompt inputs.")
         destination = self._resolve_output_path(f"{session_id}.jsonl")
         destination.parent.mkdir(parents=True, exist_ok=True)
-        training_row = self._request_chat_completion(prompt)
+        training_row = self._request_chat_conversation(prompt_input or PromptInput(prompt=prompt))
         destination.write_text(json.dumps(training_row, ensure_ascii=False) + "\n", encoding="utf-8")
         return destination
 
@@ -1712,7 +1794,7 @@ class ChatRunner(DockerRuntimeRunner):
                 raise RuntimeError("Chat runner does not support mcp_servers.")
             if prompt_input.github_repo:
                 raise RuntimeError("Chat runner does not support github_repo prompt inputs.")
-            training_row = self._request_chat_completion(prompt_input.prompt)
+            training_row = self._request_chat_conversation(prompt_input)
             if append_lock is not None:
                 with append_lock:
                     self._append_chat_training_row(destination, training_row)

@@ -245,7 +245,7 @@ def build_traces_readme(
         lines.extend(
             [
                 "Each file is newline-delimited JSON where every line is already a training example.",
-                "Chat-only datasets include `messages` plus convenience fields like `system`, `prompt`, `thinking`, and `response`.",
+                "Chat-only datasets include `messages` plus convenience fields like `system`, `prompt`, `follow_up_prompts`, `thinking`, `response`, and `responses`.",
                 "Tool datasets can include the same normalized `messages` structure together with a `tools` field.",
                 "",
             ]
@@ -388,7 +388,8 @@ def build_traces_readme(
             ")",
             "```",
             "",
-            "For weighted mixes, pass a source mapping with `percentage`, `weight`, or per-source `max_examples`:",
+            "For weighted mixes, pass a source mapping with `percentage`, `weight`, or per-source `max_examples`.",
+            "Explicit ratios stay true: if a source cannot fill its share after filtering, Teich scales the total row count down instead of backfilling from another source.",
             "",
             "```python",
             "train_dataset = prepare_data(",

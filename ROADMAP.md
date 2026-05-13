@@ -10,7 +10,9 @@ Teich now has a usable trace-first generation and SFT preparation flow:
 - CLI `init` / `generate` commands with resume support and Rich progress reporting.
 - Raw trace preservation, partial-output recovery, and deterministic Docker container cleanup.
 - Structured conversion to `messages` / `tools` / `metadata` rows.
-- Configured `tools.json` snapshots for dataset uploads and future rendering.
+- Embedded configured tool-schema snapshots in generated dataset READMEs.
+- JSONL/NDJSON prompt files as the recommended generation input format.
+- Multi-turn `follow_up_prompts` for text-only `chat` dataset generation.
 - `prepare_data()` + `mask_data()` as the supported trainer-first SFT path.
 - `load_traces()` for fallback/manual workflows where users own chat-template rendering, filtering, tokenization, and masking.
 - Generated dataset README cards that show the current Teich SFT path.
@@ -43,7 +45,7 @@ Teich now has a usable trace-first generation and SFT preparation flow:
 - [x] Validate trace JSONL structure against example traces
 - [x] Ensure HF trace viewer compatibility
 - [x] Generate README for trace upload directories
-- [x] Generate `tools.json` snapshots for configured tools
+- [x] Embed configured tool-schema snapshots in generated READMEs
 
 ---
 
@@ -122,7 +124,7 @@ tokenized = tokenizer(rendered, truncation=True, max_length=32768)
 - [x] Map user/assistant/tool messages from Pi traces
 - [x] Extract `reasoning_content`
 - [x] Map tool calls and tool results
-- [x] Apply configured tool schemas from `tools.json`
+- [x] Apply configured tool schemas from generated README snapshots
 - [x] Handle multi-turn conversations correctly
 
 ### 2.4 SFT Safety
@@ -143,7 +145,10 @@ tokenized = tokenizer(rendered, truncation=True, max_length=32768)
 - [x] Run multiple prompts concurrently
 - [x] Configurable concurrency
 - [x] Progress tracking for batch jobs
-- [x] Continue processing queued prompts after individual prompt failures
+- [x] Stop claiming new prompts after an individual prompt fails while preserving completed outputs
+- [x] JSONL/NDJSON prompt files with prompt metadata
+- [x] `follow_up_prompts` list support for `agent.provider: chat`
+- [ ] Native interactive follow-up prompt support for Codex and Pi runners
 
 ### 3.2 Session Resumption
 
@@ -158,7 +163,7 @@ tokenized = tokenizer(rendered, truncation=True, max_length=32768)
 - [x] Structured chat JSONL rows
 - [x] Hugging Face dataset upload
 - [x] Generated dataset README
-- [x] Generated `tools.json`
+- [x] Embedded training-ready tool schema snapshot in generated README
 - [ ] Parquet output option
 - [ ] Train/validation split generation
 
@@ -213,6 +218,7 @@ tokenized = tokenizer(rendered, truncation=True, max_length=32768)
 
 - [x] Public README / PyPI README updated for `prepare_data()` + `mask_data()`
 - [x] Generated dataset README updated for `prepare_data()` + `mask_data()`
+- [x] Generation docs updated for JSONL prompt files and chat follow-up prompts
 - [x] Example training script updated for `prepare_data()` + `mask_data()`
 - [ ] Full API reference
 - [ ] Tutorial: Creating your first dataset
@@ -238,9 +244,9 @@ tokenized = tokenizer(rendered, truncation=True, max_length=32768)
 
 ## Immediate Next Steps
 
-1. **Run a small real generation smoke test** for Codex and Pi with 1-2 prompts each.
+1. **Run a small real generation smoke test** for Codex, Pi, and chat with 1-2 prompts each.
 2. **Run a small real `prepare_data()` + `mask_data()` smoke test** against the newly generated output and the intended tokenizer.
-3. **Audit generated examples manually** for tool-call rendering, reasoning supervision, and empty/error sessions.
+3. **Audit generated examples manually** for tool-call rendering, reasoning supervision, follow-up turns, and empty/error sessions.
 4. **Decide quality-filter policy** for failed sessions and low-value traces.
 5. **Add docs/tutorials** around creating, publishing, loading, and training on a first dataset.
 
@@ -252,4 +258,5 @@ tokenized = tokenizer(rendered, truncation=True, max_length=32768)
 2. Should LM Studio and Ollama stay routed through Codex OSS mode, or get their own non-Codex runner?
 3. What quality metrics should Teich filter on before training?
 4. Should Teich eventually offer optional model/template presets, or keep explicit `chat_template_kwargs` only?
-5. How should Parquet and train/validation split generation fit into the trace-first workflow?
+5. How should native interactive follow-up prompting work for non-interactive Codex/Pi runners?
+6. How should Parquet and train/validation split generation fit into the trace-first workflow?

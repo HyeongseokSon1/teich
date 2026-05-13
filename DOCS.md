@@ -1,4 +1,67 @@
-# [prepare_data](cci:1://file:///c:/Users/aranr/Documents/github/agentic-datagen/v2/src/teich/prepare.py:141:0-206:5) Flow
+# Generation Flow
+
+```mermaid
+flowchart TD
+    A["User runs teich generate -c config.yaml"] --> B["Load Config.from_yaml"]
+    B --> C["Read prompt inputs"]
+    C --> C1{"Prompt file type?"}
+    C1 -->|"recommended"| C2["JSONL / NDJSON<br/>prompt, github_repo, follow_up_prompts"]
+    C1 -->|"also supported"| C3["JSON, CSV, or plain text"]
+    C2 --> D["Normalize PromptInput rows"]
+    C3 --> D
+    D --> D1["Reject unsupported image inputs"]
+    D1 --> E["Deduplicate by prompt + follow_up_prompts"]
+    E --> F{"--resume?"}
+    F -->|"yes"| F1["Scan output JSONL for completed prompt keys"]
+    F1 --> F2["Skip completed rows"]
+    F -->|"no"| G["Use all pending prompt inputs"]
+    F2 --> G
+
+    G --> H{"agent.provider"}
+    H -->|"codex"| I["Run Codex CLI in Docker<br/>one non-interactive prompt per trace"]
+    H -->|"pi"| J["Run Pi agent in Docker<br/>one non-interactive prompt per trace"]
+    H -->|"chat"| K["Call OpenAI-compatible API directly"]
+
+    I --> I1["Write normalized raw JSONL trace"]
+    J --> J1["Write normalized raw JSONL trace"]
+    I1 --> I2["Copy workspace snapshot to sandbox"]
+    J1 --> J2["Copy workspace snapshot to sandbox"]
+
+    K --> K1{"follow_up_prompts present?"}
+    K1 -->|"no"| K2["Request one assistant turn"]
+    K1 -->|"yes"| K3["Request each follow-up with prior user/assistant history"]
+    K2 --> K4["Append structured chat row to chat.jsonl"]
+    K3 --> K4
+
+    I2 --> L["Write dataset README"]
+    J2 --> L
+    K4 --> L
+    L --> L1["Embed tool schema snapshot in README when available"]
+    L1 --> M{"publish.repo_id set?"}
+    M -->|"yes"| N["Upload JSONL + README to HF dataset repo"]
+    M -->|"no"| O["Leave local output ready for prepare_data"]
+    N --> O
+```
+
+## Generation Inputs
+
+Prefer JSONL or NDJSON prompt files for new datasets:
+
+```jsonl
+{"prompt":"Build a simple todo list app in React"}
+{"github_repo":"armand0e/perplexica-mcp","prompt":"Improve the search flow and update tests"}
+{"prompt":"Draft a compact project plan","follow_up_prompts":["Revise it for a solo developer","Add a risk checklist"]}
+```
+
+Each row accepts:
+
+- **`prompt`**: required initial user prompt.
+- **`github_repo`**: optional `owner/repo` checkout for `codex` and `pi` runs.
+- **`follow_up_prompts`**: optional list of additional user turns. This is currently generated as real multi-turn data by `agent.provider: chat`. `codex` and `pi` are still one non-interactive coding-agent prompt per trace.
+
+CSV and plain text prompt files still load, but JSONL is the recommended format because prompts often contain commas, code fences, and newlines.
+
+# `prepare_data` Flow
 
 ```mermaid
 flowchart TD
@@ -19,7 +82,7 @@ flowchart TD
     G --> G1{"Local path exists?"}
     G1 -->|"yes"| G2["Use local file / directory"]
     G1 -->|"no"| G3["snapshot_download HF dataset repo"]
-    G3 --> G4["Downloads JSONL + README.md + tools snapshot files"]
+    G3 --> G4["Downloads JSONL + README.md"]
     G2 --> G5["Find split directory if present"]
     G4 --> G5
     G5 --> G6["convert_traces_to_training_data"]
@@ -42,7 +105,11 @@ flowchart TD
     J2 --> J3["Resolve each source independently"]
     J3 --> K["Format each source independently"]
     K --> K1["Allocate row counts from probabilities + available rows + global max_examples"]
-    K1 --> K2["Shuffle each source, select allocated rows"]
+    K1 --> K1A{"Explicit percentage / weight?"}
+    K1A -->|"yes"| K1B["Scale total down to keep true ratios"]
+    K1A -->|"no"| K1C["Redistribute equal-default capacity"]
+    K1B --> K2["Shuffle each source, select allocated rows"]
+    K1C --> K2
     K2 --> K3["Concatenate selected sources"]
     K3 --> K4["Final deterministic shuffle(seed=3407)"]
     K4 --> Z
@@ -94,9 +161,9 @@ flowchart TD
     X2 --> Z
 ```
 
-## What [prepare_data](cci:1://file:///c:/Users/aranr/Documents/github/agentic-datagen/v2/src/teich/prepare.py:141:0-206:5) returns
+## What `prepare_data` returns
 
-[prepare_data](cci:1://file:///c:/Users/aranr/Documents/github/agentic-datagen/v2/src/teich/prepare.py:141:0-206:5) returns a **trainer-friendly text dataset**, not final labels.
+`prepare_data` returns a **trainer-friendly text dataset**, not final labels.
 
 Each row looks conceptually like:
 
@@ -122,7 +189,7 @@ Important details:
 - **Original columns are removed** after formatting.
 - **Oversized examples are measured and dropped** if `drop_oversized_examples=True`; token IDs are kept only when `tokenize=True`.
 
-# [mask_data](cci:1://file:///c:/Users/aranr/Documents/github/agentic-datagen/v2/src/teich/formatter.py:1252:0-1360:18) Flow
+# `mask_data` Flow
 
 ```mermaid
 flowchart TD
@@ -217,9 +284,9 @@ flowchart TD
     AJ --> AK["Return trainer"]
 ```
 
-## What [mask_data](cci:1://file:///c:/Users/aranr/Documents/github/agentic-datagen/v2/src/teich/formatter.py:1252:0-1360:18) changes
+## What `mask_data` changes
 
-Before [mask_data](cci:1://file:///c:/Users/aranr/Documents/github/agentic-datagen/v2/src/teich/formatter.py:1252:0-1360:18), the trainer dataset is typically:
+Before `mask_data`, the trainer dataset is typically:
 
 ```python
 {
@@ -230,7 +297,7 @@ Before [mask_data](cci:1://file:///c:/Users/aranr/Documents/github/agentic-datag
 }
 ```
 
-After [mask_data](cci:1://file:///c:/Users/aranr/Documents/github/agentic-datagen/v2/src/teich/formatter.py:1252:0-1360:18), Teich replaces trainer datasets with:
+After `mask_data`, Teich replaces trainer datasets with:
 
 ```python
 {
@@ -273,7 +340,7 @@ flowchart TD
 
 # Plain-English Explanation
 
-- **[prepare_data](cci:1://file:///c:/Users/aranr/Documents/github/agentic-datagen/v2/src/teich/prepare.py:141:0-206:5) is the formatting stage**
+- **`prepare_data` is the formatting stage**
   - It loads raw traces or datasets.
   - It renders them with the model tokenizer’s chat template.
   - It records typed character ranges that can be trained on.
@@ -282,7 +349,7 @@ flowchart TD
 - **`SFTTrainer` is the tokenization stage**
   - The trainer turns `text` into `input_ids`.
 
-- **[mask_data](cci:1://file:///c:/Users/aranr/Documents/github/agentic-datagen/v2/src/teich/formatter.py:1252:0-1360:18) is the label stage**
+- **`mask_data` is the label stage**
   - It applies the masking policy, then aligns Teich’s saved character spans to token offsets.
   - It creates `labels`.
   - It masks prompt/context tokens with `-100`.

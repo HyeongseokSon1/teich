@@ -218,6 +218,7 @@ def test_config_prompts_file_supports_jsonl_prompts(tmp_path: Path):
         {
             "prompt": "Premise:\nUse a safer long prompt format.\nAvailable choices:\n - yes\n - no",
             "github_repo": "armand0e/perplexica-mcp",
+            "follow_up_prompts": ["Now add tests.", "Now update the README."],
         },
         {"prompt": "Build a todo app"},
     ]
@@ -232,7 +233,37 @@ def test_config_prompts_file_supports_jsonl_prompts(tmp_path: Path):
     assert len(prompt_inputs) == 2
     assert prompt_inputs[0].prompt == rows[0]["prompt"]
     assert prompt_inputs[0].github_repo == "armand0e/perplexica-mcp"
+    assert prompt_inputs[0].follow_up_prompts == ["Now add tests.", "Now update the README."]
     assert prompt_inputs[1].prompt == "Build a todo app"
+
+
+def test_config_inline_prompts_support_structured_follow_up_prompts():
+    config = Config(
+        prompts=[
+            {
+                "prompt": "Build a todo app",
+                "follow_up_prompts": ["Add keyboard shortcuts", "Polish the empty state"],
+            }
+        ]
+    )
+
+    prompt_inputs = config.get_prompt_inputs()
+
+    assert len(prompt_inputs) == 1
+    assert prompt_inputs[0].prompt == "Build a todo app"
+    assert prompt_inputs[0].follow_up_prompts == ["Add keyboard shortcuts", "Polish the empty state"]
+
+
+def test_config_rejects_non_list_follow_up_prompts(tmp_path: Path):
+    prompts_file = tmp_path / "prompts.jsonl"
+    prompts_file.write_text(
+        json.dumps({"prompt": "Build a todo app", "follow_up_prompts": "Add tests"}) + "\n",
+        encoding="utf-8",
+    )
+    config = Config(prompts_file=prompts_file)
+
+    with pytest.raises(ValueError, match="follow_up_prompts must be a list"):
+        config.get_prompt_inputs()
 
 
 def test_config_prompts_file_supports_json_prompt_list(tmp_path: Path):

@@ -3,7 +3,7 @@
 # Quick start:
 # 1. Choose agent.provider: codex, pi, or chat
 # 2. Set model.model to the model you want to run
-# 3. Keep prompts in prompts.csv, or add inline prompts below
+# 3. Keep prompts in prompts.jsonl, or add inline prompts below
 # 4. Prefer TEICH_API_KEY / OPENROUTER_API_KEY / OPENAI_API_KEY in your environment for secrets
 # 5. Run: uvx teich generate -c config.yaml
 
@@ -65,10 +65,16 @@ api:
 
 # Prompts can come from a file, inline below, or both.
 # Relative paths are resolved from the location of this config file.
-# CSV prompt files must include a `prompt` column.
-prompts_file: prompts.csv
+# JSONL is recommended because it safely supports multiline prompts and follow_up_prompts.
+# CSV is still supported, but prompt files with commas/newlines are easier to maintain as JSONL.
+prompts_file: prompts.jsonl
 
-# Optional inline prompts.
+# Optional inline prompts. Use objects when you need metadata or chat follow-up turns.
+# prompts:
+#   - prompt: "Draft a compact project plan"
+#     follow_up_prompts:
+#       - "Revise it for a solo developer"
+#       - "Add a risk checklist"
 prompts: []
 
 output:

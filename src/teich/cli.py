@@ -169,7 +169,14 @@ def generate(
 
     prompt_inputs = unique_prompt_inputs_by_completion_key(cfg.get_prompt_inputs())
     if not prompt_inputs:
-        console.print("[red]No prompts configured. Add prompts in config.yaml or prompts.csv.[/red]")
+        console.print("[red]No prompts configured. Add prompts in config.yaml or prompts.jsonl.[/red]")
+        raise typer.Exit(1)
+    agent_provider = cfg.get_agent_provider()
+    if agent_provider != "chat" and any(prompt_input.follow_up_prompts for prompt_input in prompt_inputs):
+        console.print(
+            "[red]follow_up_prompts are currently supported only when agent.provider is chat. "
+            "Use single-turn prompt rows for codex/pi generation.[/red]"
+        )
         raise typer.Exit(1)
 
     # Ensure output dir exists
@@ -206,7 +213,6 @@ def generate(
 
     # Run generation
     try:
-        agent_provider = cfg.get_agent_provider()
         if agent_provider == "codex":
             runner = CodexRunner(cfg)
         elif agent_provider == "pi":
@@ -407,8 +413,8 @@ def init(
     else:
         console.print(f"[yellow]Already exists: {config_path}[/yellow]")
 
-    # Create prompts.csv
-    prompts_path = path / "prompts.csv"
+    # Create prompts.jsonl
+    prompts_path = path / "prompts.jsonl"
     if not prompts_path.exists():
         prompts_path.write_text(PROMPTS_TEMPLATE, encoding="utf-8")
         console.print(f"[green]Created: {prompts_path}[/green]")
@@ -418,7 +424,7 @@ def init(
     console.print(f"\n[bold green]Initialized in {path.absolute()}[/bold green]")
     console.print("\n[yellow]Next:[/yellow]")
     console.print("1. Set TEICH_API_KEY, OPENROUTER_API_KEY, or OPENAI_API_KEY in env or config.yaml")
-    console.print("2. Add prompt rows to prompts.csv")
+    console.print("2. Add prompt rows to prompts.jsonl")
     console.print("3. Run: [cyan]uvx teich generate -c config.yaml[/cyan]")
 
 
@@ -427,7 +433,7 @@ CONFIG_TEMPLATE = '''# Teich configuration
 # Quick start:
 # 1. Choose agent.provider: codex, pi, or chat
 # 2. Set model.model to the model you want to run
-# 3. Keep prompts in prompts.csv, or add inline prompts below
+# 3. Keep prompts in prompts.jsonl, or add inline prompts below
 # 4. Prefer TEICH_API_KEY / OPENROUTER_API_KEY / OPENAI_API_KEY in your environment for secrets
 # 5. Run: uvx teich generate -c config.yaml
 
@@ -489,10 +495,16 @@ api:
 
 # Prompts can come from a file, inline below, or both.
 # Relative paths are resolved from the location of this config file.
-# CSV prompt files must include a `prompt` column.
-prompts_file: prompts.csv
+# JSONL is recommended because it safely supports multiline prompts and follow_up_prompts.
+# CSV is still supported, but prompt files with commas/newlines are easier to maintain as JSONL.
+prompts_file: prompts.jsonl
 
-# Optional inline prompts.
+# Optional inline prompts. Use objects when you need metadata or chat follow-up turns.
+# prompts:
+#   - prompt: "Draft a compact project plan"
+#     follow_up_prompts:
+#       - "Revise it for a solo developer"
+#       - "Add a risk checklist"
 prompts: []
 
 output:
@@ -528,10 +540,10 @@ openai_api_key: null
 developer_instructions: null
 '''
 
-PROMPTS_TEMPLATE = '''image,github_repo,prompt
-None,None,"Build a simple todo list app in React"
-None,None,"Create a Python script that fetches weather data from an API"
-None,armand0e/perplexica-mcp,"Add a small usability improvement and update the tests"
+PROMPTS_TEMPLATE = '''{"prompt":"Build a simple todo list app in React"}
+{"prompt":"Create a Python script that fetches weather data from an API"}
+{"github_repo":"armand0e/perplexica-mcp","prompt":"Add a small usability improvement and update the tests"}
+{"prompt":"Draft a compact project plan","follow_up_prompts":["Revise it for a solo developer","Add a risk checklist"]}
 '''
 
 

@@ -26,7 +26,7 @@ uvx teich init my-project && cd my-project
 uvx teich generate -c config.yaml
 ```
 
-> Be sure to edit your config.yaml and prompts.csv file as needed
+> Be sure to edit your config.yaml and prompts.jsonl file as needed
 
 ## ⭐ What Teich Does
 
@@ -34,7 +34,7 @@ uvx teich generate -c config.yaml
 - **Multi-agent support**: Works with Codex, Pi, and a text-only `chat` mode
 - **Structured conversion**: Converts traces into chat messages with tool calls, reasoning, tool results, metadata, and configured tool snapshots
 - **SFT-ready preparation**: Applies tokenizer chat templates, masks labels, builds a Teich collator, and audits the dataset before training
-- **Hugging Face integration**: Publishes dataset cards plus `tools.json`, and loads local or Hub datasets through one API
+- **Hugging Face integration**: Publishes dataset cards with embedded tool-schema snapshots, and loads local or Hub datasets through one API
 
 ## 📥 Prerequisites
 
@@ -56,7 +56,7 @@ Training examples use your existing finetuning stack. For the TRL example below,
 teich init my-project
 cd my-project
 
-# Add prompts to prompts.csv, then:
+# Add prompts to prompts.jsonl, then:
 export OPENAI_API_KEY=sk-...
 teich generate -c config.yaml
 ```
@@ -66,7 +66,7 @@ Outputs:
 - `codex` / `pi`: raw traces in `output/`, sandboxes in `sandbox/`, and a `README.md`
 - `chat`: text-only JSONL training rows in `output/` and a dataset `README.md`
 
-If `publish.repo_id` is configured, Teich also creates or updates the matching Hugging Face **dataset** repo and uploads the generated JSONL, README, and `tools.json` automatically.
+If `publish.repo_id` is configured, Teich also creates or updates the matching Hugging Face **dataset** repo and uploads the generated JSONL and README automatically. Tool schemas are embedded in the dataset card when present.
 
 If a long run is interrupted, use:
 
@@ -76,7 +76,17 @@ teich generate -c config.yaml --resume
 
 Teich will scan existing outputs and skip prompts that already converted into completed training examples.
 
-Prompt files can be CSV, text, JSONL/NDJSON, or JSON. JSONL is recommended for very long or multiline prompts.
+Prompt files can be JSONL/NDJSON, JSON, CSV, or plain text. JSONL is recommended because it handles long multiline prompts, repository metadata, and chat follow-up turns without CSV escaping problems.
+
+Recommended `prompts.jsonl`:
+
+```jsonl
+{"prompt":"Build a simple todo list app in React"}
+{"github_repo":"armand0e/perplexica-mcp","prompt":"Add a small usability improvement and update the tests"}
+{"prompt":"Draft a compact project plan","follow_up_prompts":["Revise it for a solo developer","Add a risk checklist"]}
+```
+
+`follow_up_prompts` is supported by `agent.provider: chat` as real additional user turns in one generated training row. `codex` and `pi` currently run one non-interactive coding-agent prompt per trace; keep those prompt rows single-turn until native interactive follow-ups are added.
 
 ### Generate a text-only chat dataset
 
@@ -98,6 +108,8 @@ Each generated JSONL line will look like:
 {"messages":[{"role":"system","content":"You are a helpful assistant","thinking":null},{"role":"user","content":"Hello","thinking":null},{"role":"assistant","content":"Hi!","thinking":"I should greet the user."}],"system":"You are a helpful assistant","prompt":"Hello","thinking":"I should greet the user.","response":"Hi!","model":"gpt-4.1-mini"}
 ```
 
+With follow-ups, the same row contains alternating `user` and `assistant` messages plus convenience fields like `follow_up_prompts`, `responses`, and final `response`.
+
 ### Train with Unsloth and TRL `SFTTrainer`
 
 Use the trainer-first path: `prepare_data` renders trainer-friendly `text` rows with Teich supervision metadata, `SFTTrainer` tokenizes them, then `mask_data` applies multi-turn/tool-aware response-only labels to the trainer dataset.
@@ -106,14 +118,12 @@ Use the trainer-first path: `prepare_data` renders trainer-friendly `text` rows 
 import os
 
 from unsloth import FastLanguageModel
-import torch
 from trl import SFTConfig, SFTTrainer
 
 from teich import mask_data, prepare_data
 
 MAX_SEQ_LEN = 32768
 MODEL_NAME = "unsloth/Qwen3.5-0.8B"
-TRAIN_ON_REASONING = True
 CHAT_TEMPLATE_KWARGS = {"enable_thinking": True}
 PUSH_TO_HUB_REPO_ID = "username/teich-sft-model"
 HF_TOKEN = os.environ.get("HF_TOKEN") or ""
@@ -179,29 +189,13 @@ trainer = SFTTrainer(
 trainer = mask_data(
     trainer,
     tokenizer=tokenizer,
-    train_on_reasoning=TRAIN_ON_REASONING,
+    train_on_reasoning=True,
     train_on_final_answers=True,
     train_on_tools=True,
 )
 
-gpu_stats = torch.cuda.get_device_properties(0)
-start_gpu_memory = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
-max_memory = round(gpu_stats.total_memory / 1024 / 1024 / 1024, 3)
-print(f"GPU = {gpu_stats.name}. Max memory = {max_memory} GB.")
-print(f"{start_gpu_memory} GB of memory reserved.")
-
 trainer_stats = trainer.train(resume_from_checkpoint=False)
-
-used_memory = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
-used_memory_for_lora = round(used_memory - start_gpu_memory, 3)
-used_percentage = round(used_memory / max_memory * 100, 3)
-lora_percentage = round(used_memory_for_lora / max_memory * 100, 3)
 print(f"{trainer_stats.metrics['train_runtime']} seconds used for training.")
-print(f"{round(trainer_stats.metrics['train_runtime'] / 60, 2)} minutes used for training.")
-print(f"Peak reserved memory = {used_memory} GB.")
-print(f"Peak reserved memory for training = {used_memory_for_lora} GB.")
-print(f"Peak reserved memory % of max memory = {used_percentage} %.")
-print(f"Peak reserved memory for training % of max memory = {lora_percentage} %.")
 
 model.push_to_hub_merged(PUSH_TO_HUB_REPO_ID, tokenizer, save_method="merged_16bit", token=HF_TOKEN)
 ```
@@ -222,6 +216,8 @@ train_dataset = prepare_data(
     chat_template_kwargs=CHAT_TEMPLATE_KWARGS,
 )
 ```
+
+For weighted mixes, explicit `percentage`, `proportion`, and `weight` values are treated as true ratios. If one source cannot fill its share after filtering or context-window drops, Teich scales the total row count down instead of silently changing the realized mix.
 
 ### Fallback manual flow with `load_traces`
 
@@ -256,7 +252,15 @@ model:
   approval_policy: never
   sandbox: danger-full-access
 
-prompts_file: prompts.csv
+prompts_file: prompts.jsonl
+
+prompts: []
+# For chat provider follow-up turns:
+# prompts:
+#   - prompt: "Draft a compact project plan"
+#     follow_up_prompts:
+#       - "Revise it for a solo developer"
+#       - "Add a risk checklist"
 
 output:
   traces_dir: ./output
@@ -292,6 +296,7 @@ teich generate -c config.yaml
 Training examples include:
 
 - `prompt`: initial task description
+- `follow_up_prompts`: optional additional chat turns generated after the initial prompt
 - `messages`: chat history (system, user, assistant, tool)
 - `tools`: tool schemas used in the session
 - `metadata`: session info, model, timestamps, and usage when available
@@ -299,8 +304,10 @@ Training examples include:
 Structured chat datasets can also include convenience top-level fields like:
 
 - `system`
+- `follow_up_prompts`
 - `thinking`
 - `response`
+- `responses`
 - `model`
 
 Assistant messages capture:

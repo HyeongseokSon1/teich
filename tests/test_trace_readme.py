@@ -58,6 +58,7 @@ def test_build_traces_readme_includes_model_and_references_tools(tmp_path: Path)
     assert "You can combine this dataset with other Teich chat-only or tool-call datasets" in readme
     assert "['username/repo', 'username/other-teich-dataset']" in readme
     assert "For weighted mixes" in readme
+    assert "Explicit ratios stay true" in readme
     assert "'agent': {'source': 'username/repo', 'percentage': 80}" in readme
     assert "convert_traces_to_training_data" not in readme
 
@@ -116,7 +117,7 @@ def test_write_traces_readme_for_structured_chat_dataset_skips_tools_json(tmp_pa
     assert "TRAIN_ON_REASONING" not in readme
     assert "prepare_data(..., teich_masking=False)" in readme
     assert "tools=example.get('tools') or []" not in readme
-    assert "Chat-only datasets include `messages` plus convenience fields like `system`, `prompt`, `thinking`, and `response`." in readme
+    assert "Chat-only datasets include `messages` plus convenience fields like `system`, `prompt`, `follow_up_prompts`, `thinking`, `response`, and `responses`." in readme
     assert "## Training-ready tools" not in readme
     assert not (tmp_path / "tools.json").exists()
 

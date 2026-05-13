@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import sys
+from typing import Any
 
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -142,6 +143,7 @@ class PromptInput(BaseModel):
     image: str | None = None
     github_repo: str | None = None
     prompt: str
+    follow_up_prompts: list[str] = Field(default_factory=list)
 
     @staticmethod
     def _normalize_optional_text(value: object) -> str | None:
@@ -173,6 +175,22 @@ class PromptInput(BaseModel):
             raise ValueError("Prompt cannot be empty")
         return value
 
+    @field_validator("follow_up_prompts", mode="before")
+    @classmethod
+    def normalize_follow_up_prompts(cls, value: object) -> list[str]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError("follow_up_prompts must be a list of prompt strings")
+        prompts: list[str] = []
+        for index, item in enumerate(value, start=1):
+            text = item if isinstance(item, str) else str(item)
+            normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+            if not normalized:
+                raise ValueError(f"follow_up_prompts entry {index} cannot be empty")
+            prompts.append(normalized)
+        return prompts
+
     @field_validator("github_repo")
     @classmethod
     def validate_github_repo(cls, value: str | None) -> str | None:
@@ -184,6 +202,10 @@ class PromptInput(BaseModel):
             )
         return value
 
+    def turn_prompts(self) -> list[str]:
+        """Return the initial prompt plus any configured follow-up prompts."""
+        return [self.prompt, *self.follow_up_prompts]
+
 
 class Config(BaseModel):
     """Main configuration."""
@@ -191,7 +213,7 @@ class Config(BaseModel):
     model: ModelConfig = Field(default_factory=ModelConfig)
     api: APIConfig = Field(default_factory=APIConfig)
     mcp_servers: list[MCPConfig] = Field(default_factory=list)
-    prompts: list[str] = Field(default_factory=list)
+    prompts: list[str | dict[str, Any]] = Field(default_factory=list)
     prompts_file: Path | None = None
     output: OutputConfig = Field(default_factory=OutputConfig)
     publish: PublishConfig = Field(default_factory=PublishConfig)
@@ -304,7 +326,16 @@ class Config(BaseModel):
 
     def get_prompt_inputs(self) -> list[PromptInput]:
         """Get structured prompt inputs from config and prompts_file."""
-        prompt_inputs = [PromptInput(prompt=prompt) for prompt in self.prompts]
+        prompt_inputs: list[PromptInput] = []
+        for index, prompt in enumerate(self.prompts, start=1):
+            if isinstance(prompt, str):
+                prompt_inputs.append(PromptInput(prompt=prompt))
+                continue
+            if not isinstance(prompt, dict):
+                raise ValueError(f"Inline prompt entry {index} must be a string or object")
+            prompt_input = self._prompt_input_from_mapping(prompt, source=f"inline prompt entry {index}")
+            if prompt_input is not None:
+                prompt_inputs.append(prompt_input)
         if self.prompts_file:
             prompt_inputs.extend(self._load_prompt_inputs_from_file(self.prompts_file))
         for prompt_input in prompt_inputs:
@@ -407,6 +438,7 @@ class Config(BaseModel):
                 image=normalized_row.get("image"),
                 github_repo=normalized_row.get("github_repo"),
                 prompt=prompt,
+                follow_up_prompts=normalized_row.get("follow_up_prompts"),
             )
         except ValueError as exc:
             raise ValueError(f"Invalid {source}: {exc}") from exc
