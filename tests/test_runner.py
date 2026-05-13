@@ -244,6 +244,8 @@ def test_claude_code_runner_uses_openrouter_anthropic_skin_auth(tmp_path: Path):
     assert "--model claude-sonnet-4-6" in command_text
     assert "--model minimax/minimax-m2.5:free" not in command_text
     assert "node /home/codex/.claude/claude_openrouter_proxy.js" in command_text
+    assert "sleep 1" not in command_text
+    assert "/dev/tcp/127.0.0.1/17891" in command_text
     rows = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
     assert rows[0]["payload"]["model_provider"] == "openrouter"
     assert rows[0]["payload"]["model"] == "minimax/minimax-m2.5:free"
@@ -1745,6 +1747,7 @@ def test_chat_runner_prefers_openrouter_generation_stats_usage(tmp_path: Path):
     assert metrics.has_token_usage is True
     assert metrics.has_cost is True
     stats_request = mock_urlopen.call_args_list[1].args[0]
+    assert mock_urlopen.call_args_list[1].kwargs["timeout"] == 3
     assert stats_request.full_url == "https://openrouter.ai/api/v1/generation?id=gen-openrouter-123"
 
 

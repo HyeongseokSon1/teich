@@ -44,6 +44,8 @@ LOCAL_PROVIDER_PROXY_SCRIPT_NAME = "local_provider_proxy.js"
 CLAUDE_OPENROUTER_PROXY_SCRIPT_NAME = "claude_openrouter_proxy.js"
 CLAUDE_OPENROUTER_PROXY_PORT = 17891
 CLAUDE_OPENROUTER_SURROGATE_MODEL = "claude-sonnet-4-6"
+OPENROUTER_GENERATION_STATS_ATTEMPTS = 2
+OPENROUTER_GENERATION_STATS_TIMEOUT_SECONDS = 3
 TEICH_PROMPT_FILE_NAME = ".teich-prompt.txt"
 PI_SYSTEM_PROMPT_CUSTOM_TYPE = "teich-system-prompt"
 PI_EMPTY_TOOL_NOT_FOUND_TEXT = "Tool  not found"
@@ -1015,10 +1017,13 @@ class DockerRuntimeRunner:
             },
             method="GET",
         )
-        attempts = 3
+        attempts = OPENROUTER_GENERATION_STATS_ATTEMPTS
         for attempt in range(attempts):
             try:
-                with urlopen(request, timeout=min(10, self.config.timeout_seconds)) as response:
+                with urlopen(
+                    request,
+                    timeout=min(OPENROUTER_GENERATION_STATS_TIMEOUT_SECONDS, self.config.timeout_seconds),
+                ) as response:
                     payload = json.loads(response.read().decode("utf-8"))
             except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
                 if attempt < attempts - 1:
@@ -2288,7 +2293,15 @@ class ClaudeCodeRunner(ExternalCliRunner):
 
     def _openrouter_proxy_shell_prefix(self) -> str:
         proxy_script = f"{self.home_in_container}/{CLAUDE_OPENROUTER_PROXY_SCRIPT_NAME}"
-        return f"node {shlex.quote(proxy_script)} >/tmp/claude-openrouter-proxy.log 2>&1 & sleep 1 && "
+        readiness_probe = (
+            f"ready=0; for i in {{1..50}}; do "
+            f"(: >/dev/tcp/127.0.0.1/{CLAUDE_OPENROUTER_PROXY_PORT}) >/dev/null 2>&1 "
+            f"&& ready=1 && break; "
+            f"sleep 0.02; "
+            f"done; "
+            f'[ "$ready" = 1 ] || {{ echo "Claude OpenRouter proxy did not become ready" >&2; exit 1; }}; '
+        )
+        return f"node {shlex.quote(proxy_script)} >/tmp/claude-openrouter-proxy.log 2>&1 & {readiness_probe}"
 
     def _build_shell_command(self, *, continue_session: bool = False) -> str:
         claude_command = [
