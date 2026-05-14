@@ -20,7 +20,13 @@ class TinyChatTokenizer:
         self._reverse_vocab: dict[int, str] = {}
 
     def apply_chat_template(self, messages, *, tokenize=False, add_generation_prompt=False, tools=None, **kwargs):
-        rendered = "".join(f"<{message['role']}>{message.get('content', '')}</{message['role']}>" for message in messages)
+        tool_prefix = ""
+        if tools:
+            tool_names = ",".join(tool["function"]["name"] for tool in tools)
+            tool_prefix = f"<tools>{tool_names}</tools>"
+        rendered = tool_prefix + "".join(
+            f"<{message['role']}>{message.get('content', '')}</{message['role']}>" for message in messages
+        )
         if add_generation_prompt:
             rendered += "<assistant>"
         if tokenize:
@@ -88,6 +94,51 @@ def _write_structured_dataset(path: Path) -> None:
     )
 
 
+def _write_readme_tool_snapshot(path: Path, tool_name: str) -> None:
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "description": f"{tool_name} tool",
+                "parameters": {
+                    "type": "object",
+                    "properties": {f"{tool_name}_arg": {"type": "string"}},
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+    path.write_text(
+        "<details>\n"
+        "<summary>Training-ready tool schema snapshot</summary>\n\n"
+        "```json\n"
+        f"{json.dumps(tools, indent=2)}\n"
+        "```\n"
+        "</details>\n",
+        encoding="utf-8",
+    )
+
+
+def _write_source_with_tool_snapshot(root: Path, *, tool_name: str, prompt: str, response: str) -> None:
+    root.mkdir(parents=True)
+    (root / "trace.jsonl").write_text(
+        json.dumps(
+            {
+                "messages": [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": response},
+                ],
+                "prompt": prompt,
+                "response": response,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _write_readme_tool_snapshot(root / "README.md", tool_name)
+
+
 def test_prepare_data_loads_local_source(tmp_path: Path):
     dataset_file = tmp_path / "chat.jsonl"
     _write_structured_dataset(dataset_file)
@@ -145,6 +196,44 @@ def test_prepare_data_accepts_source_mix_with_percentages_and_caps():
     assert prepared.num_rows == 10
     assert sum("agent answer" in text for text in texts) == 7
     assert sum("chat answer" in text for text in texts) == 3
+
+
+def test_prepare_data_source_mix_applies_each_source_tools_snapshot_independently(tmp_path: Path):
+    tokenizer = TinyChatTokenizer()
+    alpha_source = tmp_path / "alpha"
+    beta_source = tmp_path / "beta"
+    _write_source_with_tool_snapshot(
+        alpha_source,
+        tool_name="alpha_tool",
+        prompt="alpha prompt",
+        response="alpha answer",
+    )
+    _write_source_with_tool_snapshot(
+        beta_source,
+        tool_name="beta_tool",
+        prompt="beta prompt",
+        response="beta answer",
+    )
+
+    prepared = prepare_data(
+        {
+            "max_examples": 2,
+            "alpha": {"source": alpha_source},
+            "beta": {"source": beta_source},
+        },
+        tokenizer,
+        split=None,
+        verbose=False,
+    )
+
+    texts = [prepared[index]["text"] for index in range(prepared.num_rows)]
+    assert prepared.num_rows == 2
+    alpha_text = next(text for text in texts if "alpha answer" in text)
+    beta_text = next(text for text in texts if "beta answer" in text)
+    assert "<tools>alpha_tool</tools>" in alpha_text
+    assert "beta_tool" not in alpha_text
+    assert "<tools>beta_tool</tools>" in beta_text
+    assert "alpha_tool" not in beta_text
 
 
 def test_prepare_data_source_mix_percentages_scale_down_to_limiting_source():
