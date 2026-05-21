@@ -206,8 +206,11 @@ Recommended `prompts.jsonl`:
 ```jsonl
 {"prompt":"Build a simple todo list app in React"}
 {"github_repo":"armand0e/perplexica-mcp","prompt":"Add a small usability improvement and update the tests"}
+{"system":"Answer as a concise project manager.","prompt":"Draft a compact project plan"}
 {"prompt":"Draft a compact project plan","follow_up_prompts":["Revise it for a solo developer","Add a risk checklist"]}
 ```
+
+`system` is optional and prompt-specific. If a row does not include `system`, Teich does not inject a default system prompt.
 
 `follow_up_prompts` is supported across providers. `chat` sends each follow-up as a real additional user turn in one generated training row. Agent runners keep one Docker container alive for the full prompt sequence, run the initial prompt, then resume or continue the same saved agent session for each follow-up so workspace edits, tool caches, and in-container installs remain available across turns.
 
@@ -236,7 +239,7 @@ api:
 Each generated JSONL line will look like:
 
 ```json
-{"messages":[{"role":"system","content":"You are a helpful assistant","thinking":null},{"role":"user","content":"Hello","thinking":null},{"role":"assistant","content":"Hi!","thinking":"I should greet the user."}],"system":"You are a helpful assistant","prompt":"Hello","thinking":"I should greet the user.","response":"Hi!","model":"gpt-4.1-mini"}
+{"messages":[{"role":"user","content":"Hello","thinking":null},{"role":"assistant","content":"Hi!","thinking":"I should greet the user."}],"prompt":"Hello","thinking":"I should greet the user.","response":"Hi!","model":"gpt-4.1-mini"}
 ```
 
 With follow-ups, the same row contains:
@@ -473,7 +476,7 @@ Training examples include:
 
 Structured chat datasets can also include convenience top-level fields like:
 
-- `system`
+- `system` when provided by the prompt row
 - `follow_up_prompts`
 - `thinking`
 - `response`

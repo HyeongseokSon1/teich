@@ -566,13 +566,14 @@ api:
 
 # Prompts can come from a file, inline below, or both.
 # Relative paths are resolved from the location of this config file.
-# JSONL is recommended because it safely supports multiline prompts and follow_up_prompts.
+# JSONL is recommended because it safely supports multiline prompts, prompt-level system messages, and follow_up_prompts.
 # CSV is still supported, but prompt files with commas/newlines are easier to maintain as JSONL.
 prompts_file: prompts.jsonl
 
 # Optional inline prompts. Use objects when you need metadata or chat follow-up turns.
 # prompts:
 #   - prompt: "Draft a compact project plan"
+#     system: "Answer as a concise project manager."
 #     follow_up_prompts:
 #       - "Revise it for a solo developer"
 #       - "Add a risk checklist"
@@ -616,6 +617,7 @@ developer_instructions: null
 PROMPTS_TEMPLATE = '''{"prompt":"Build a simple todo list app in React"}
 {"prompt":"Create a Python script that fetches weather data from an API"}
 {"github_repo":"armand0e/perplexica-mcp","prompt":"Add a small usability improvement and update the tests"}
+{"system":"Answer as a concise project manager.","prompt":"Draft a compact project plan"}
 {"prompt":"Draft a compact project plan","follow_up_prompts":["Revise it for a solo developer","Add a risk checklist"]}
 '''
 

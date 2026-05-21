@@ -434,7 +434,19 @@ def _prompt_text_completion_key(prompt: str) -> str:
 def _prompt_completion_key(prompt_input: PromptInput | str) -> str:
     if isinstance(prompt_input, str):
         return _prompt_text_completion_key(prompt_input)
-    return "\n\n--- follow-up ---\n\n".join(_prompt_text_completion_key(prompt) for prompt in prompt_input.turn_prompts())
+    prompt_parts = [
+        _prompt_text_completion_key(prompt)
+        for prompt in prompt_input.turn_prompts()
+    ]
+    system_prompt = prompt_input.system.strip() if isinstance(prompt_input.system, str) and prompt_input.system.strip() else ""
+    if system_prompt:
+        return "\n\n--- system ---\n\n".join(
+            [
+                _prompt_text_completion_key(system_prompt),
+                "\n\n--- follow-up ---\n\n".join(prompt_parts),
+            ]
+        )
+    return "\n\n--- follow-up ---\n\n".join(prompt_parts)
 
 
 def _agent_turn_prompts(prompt: str, prompt_input: PromptInput | None) -> list[str]:
@@ -521,6 +533,22 @@ def _prompt_from_training_messages(messages: Any) -> str:
     )
 
 
+def _system_from_training_example(example: dict[str, Any]) -> str | None:
+    system = example.get("system")
+    if isinstance(system, str) and system.strip():
+        return system.strip()
+    messages = example.get("messages")
+    if not isinstance(messages, list):
+        return None
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "system":
+            continue
+        content = _message_text(message.get("content"))
+        if content:
+            return content
+    return None
+
+
 def completed_prompt_keys_from_outputs(traces_dir: Path) -> set[str]:
     if not traces_dir.exists():
         return set()
@@ -551,11 +579,12 @@ def completed_prompt_keys_from_outputs(traces_dir: Path) -> set[str]:
 
 
 def _prompt_input_from_training_example(example: dict[str, Any], prompt: str) -> PromptInput | str:
+    system = _system_from_training_example(example)
     follow_up_prompts = example.get("follow_up_prompts")
     if not isinstance(follow_up_prompts, list):
         messages = example.get("messages")
         if not isinstance(messages, list):
-            return prompt
+            return PromptInput(prompt=prompt, system=system) if system else prompt
         user_prompts = [
             _message_text(message.get("content"))
             for message in messages
@@ -563,10 +592,10 @@ def _prompt_input_from_training_example(example: dict[str, Any], prompt: str) ->
         ]
         user_prompts = [item for item in user_prompts if item]
         if len(user_prompts) <= 1 or _prompt_text_completion_key(user_prompts[0]) != _prompt_text_completion_key(prompt):
-            return prompt
+            return PromptInput(prompt=prompt, system=system) if system else prompt
         follow_up_prompts = user_prompts[1:]
     try:
-        return PromptInput(prompt=prompt, follow_up_prompts=follow_up_prompts)
+        return PromptInput(prompt=prompt, system=system, follow_up_prompts=follow_up_prompts)
     except ValueError:
         return prompt
 
@@ -2801,34 +2830,44 @@ class ChatRunner(DockerRuntimeRunner):
         base_url = self.config.get_base_url() or self._default_base_url()
         return base_url.rstrip("/")
 
-    def _chat_system_prompt(self) -> str:
-        if isinstance(self.config.developer_instructions, str) and self.config.developer_instructions.strip():
-            return self.config.developer_instructions.strip()
-        return "You are a helpful assistant"
+    @staticmethod
+    def _chat_system_prompt(prompt_input: PromptInput | None = None) -> str | None:
+        if prompt_input is None:
+            return None
+        if isinstance(prompt_input.system, str) and prompt_input.system.strip():
+            return prompt_input.system.strip()
+        return None
 
     def _chat_endpoint(self) -> str:
         if self._wire_api() in {"completions", "chat_completions", "chat-completions", "openai-completions"}:
             return f"{self._api_base_url()}/chat/completions"
         return f"{self._api_base_url()}/responses"
 
-    def _chat_request_body(self, prompt: str, history: list[dict[str, str]] | None = None) -> dict[str, Any]:
-        system_prompt = self._chat_system_prompt()
+    def _chat_request_body(
+        self,
+        prompt: str,
+        history: list[dict[str, str]] | None = None,
+        system_prompt: str | None = None,
+    ) -> dict[str, Any]:
         model = self.config.get_effective_model()
         reasoning_effort = self.config.model.reasoning_effort
         conversation = [*(history or []), {"role": "user", "content": prompt}]
         if self._wire_api() in {"completions", "chat_completions", "chat-completions", "openai-completions"}:
             body: dict[str, Any] = {
                 "model": model,
-                "messages": [{"role": "system", "content": system_prompt}, *conversation],
+                "messages": conversation,
             }
+            if isinstance(system_prompt, str) and system_prompt.strip():
+                body["messages"] = [{"role": "system", "content": system_prompt.strip()}, *conversation]
             if isinstance(reasoning_effort, str) and reasoning_effort.strip():
                 body["reasoning_effort"] = reasoning_effort.strip()
             return body
         body = {
             "model": model,
-            "instructions": system_prompt,
             "input": conversation if history else prompt,
         }
+        if isinstance(system_prompt, str) and system_prompt.strip():
+            body["instructions"] = system_prompt.strip()
         if isinstance(reasoning_effort, str) and reasoning_effort.strip():
             body["reasoning"] = {"effort": reasoning_effort.strip()}
         return body
@@ -3014,8 +3053,13 @@ class ChatRunner(DockerRuntimeRunner):
 
         return payload
 
-    def _request_chat_turn(self, prompt: str, history: list[dict[str, str]] | None = None) -> tuple[str, str | None, dict[str, Any] | None, str]:
-        body = self._chat_request_body(prompt, history)
+    def _request_chat_turn(
+        self,
+        prompt: str,
+        history: list[dict[str, str]] | None = None,
+        system_prompt: str | None = None,
+    ) -> tuple[str, str | None, dict[str, Any] | None, str]:
+        body = self._chat_request_body(prompt, history, system_prompt)
         request = Request(
             self._chat_endpoint(),
             data=json.dumps(body).encode("utf-8"),
@@ -3042,17 +3086,32 @@ class ChatRunner(DockerRuntimeRunner):
             usage = provider_usage
         return content, thinking, usage, model
 
-    def _request_chat_completion(self, prompt: str) -> dict[str, Any]:
-        content, thinking, usage, model = self._request_chat_turn(prompt)
-        system_prompt = self._chat_system_prompt()
-        return {
-            "messages": [
-                {"role": "system", "content": system_prompt, "thinking": None},
-                {"role": "user", "content": prompt, "thinking": None},
-                {"role": "assistant", "content": content, "thinking": thinking},
-            ],
-            "system": system_prompt,
-            "prompt": prompt,
+    def _request_chat_turn_with_optional_system(
+        self,
+        prompt: str,
+        history: list[dict[str, str]] | None,
+        system_prompt: str | None,
+    ) -> tuple[str, str | None, dict[str, Any] | None, str]:
+        if isinstance(system_prompt, str) and system_prompt.strip():
+            return self._request_chat_turn(prompt, history, system_prompt.strip())
+        return self._request_chat_turn(prompt, history)
+
+    def _request_chat_completion(self, prompt_input: PromptInput) -> dict[str, Any]:
+        system_prompt = self._chat_system_prompt(prompt_input)
+        content, thinking, usage, model = self._request_chat_turn_with_optional_system(
+            prompt_input.prompt,
+            None,
+            system_prompt,
+        )
+        messages = [
+            {"role": "user", "content": prompt_input.prompt, "thinking": None},
+            {"role": "assistant", "content": content, "thinking": thinking},
+        ]
+        if system_prompt:
+            messages.insert(0, {"role": "system", "content": system_prompt, "thinking": None})
+        row: dict[str, Any] = {
+            "messages": messages,
+            "prompt": prompt_input.prompt,
             "thinking": thinking,
             "response": content,
             "model": model,
@@ -3064,6 +3123,9 @@ class ChatRunner(DockerRuntimeRunner):
                 "model": model,
             },
         }
+        if system_prompt:
+            row["system"] = system_prompt
+        return row
 
     @staticmethod
     def _merge_usage_totals(usages: list[dict[str, Any] | None]) -> dict[str, Any] | None:
@@ -3249,6 +3311,10 @@ class ChatRunner(DockerRuntimeRunner):
             return False, []
         if _prompt_text_completion_key(base_prompt) != _prompt_text_completion_key(prompt_input.prompt):
             return False, []
+        row_system = _system_from_training_example(row)
+        prompt_system = prompt_input.system.strip() if isinstance(prompt_input.system, str) and prompt_input.system.strip() else None
+        if row_system != prompt_system:
+            return False, []
         if not _training_example_has_answer(row):
             return False, []
 
@@ -3299,8 +3365,9 @@ class ChatRunner(DockerRuntimeRunner):
                 messages.append(dict(message))
 
         if not any(message.get("role") == "system" for message in messages):
-            system_prompt = row.get("system") if isinstance(row.get("system"), str) and row.get("system", "").strip() else self._chat_system_prompt()
-            messages.insert(0, {"role": "system", "content": system_prompt, "thinking": None})
+            system_prompt = _system_from_training_example(row) or self._chat_system_prompt(prompt_input)
+            if system_prompt:
+                messages.insert(0, {"role": "system", "content": system_prompt, "thinking": None})
 
         if not any(message.get("role") == "user" for message in messages):
             messages.append({"role": "user", "content": prompt_input.prompt, "thinking": None})
@@ -3337,20 +3404,20 @@ class ChatRunner(DockerRuntimeRunner):
 
     def _request_chat_conversation(self, prompt_input: PromptInput) -> dict[str, Any]:
         if not prompt_input.follow_up_prompts:
-            return self._request_chat_completion(prompt_input.prompt)
+            return self._request_chat_completion(prompt_input)
 
-        system_prompt = self._chat_system_prompt()
+        system_prompt = self._chat_system_prompt(prompt_input)
         history: list[dict[str, str]] = []
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": system_prompt, "thinking": None},
-        ]
+        messages: list[dict[str, Any]] = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt, "thinking": None})
         responses: list[str] = []
         thinking_parts: list[str | None] = []
         usages: list[dict[str, Any] | None] = []
         model = self.config.get_effective_model()
 
         for prompt in prompt_input.turn_prompts():
-            content, thinking, usage, model = self._request_chat_turn(prompt, history)
+            content, thinking, usage, model = self._request_chat_turn_with_optional_system(prompt, history, system_prompt)
             messages.append({"role": "user", "content": prompt, "thinking": None})
             messages.append({"role": "assistant", "content": content, "thinking": thinking})
             history.append({"role": "user", "content": prompt})
@@ -3360,9 +3427,8 @@ class ChatRunner(DockerRuntimeRunner):
             usages.append(usage)
 
         thinking_text = "\n\n".join(part for part in thinking_parts if isinstance(part, str) and part.strip()) or None
-        return {
+        row: dict[str, Any] = {
             "messages": messages,
-            "system": system_prompt,
             "prompt": prompt_input.prompt,
             "follow_up_prompts": prompt_input.follow_up_prompts,
             "thinking": thinking_text,
@@ -3378,6 +3444,9 @@ class ChatRunner(DockerRuntimeRunner):
                 "turn_count": len(prompt_input.turn_prompts()),
             },
         }
+        if system_prompt:
+            row["system"] = system_prompt
+        return row
 
     def _request_chat_conversation_from_existing(
         self,
@@ -3395,9 +3464,10 @@ class ChatRunner(DockerRuntimeRunner):
             existing_row.get("usage") if isinstance(existing_row.get("usage"), dict) else None
         ]
         model = existing_row.get("model") if isinstance(existing_row.get("model"), str) and existing_row.get("model") else self.config.get_effective_model()
+        system_prompt = _system_from_training_example(existing_row) or self._chat_system_prompt(prompt_input)
 
         for prompt in missing_follow_ups:
-            content, thinking, usage, model = self._request_chat_turn(prompt, history)
+            content, thinking, usage, model = self._request_chat_turn_with_optional_system(prompt, history, system_prompt)
             messages.append({"role": "user", "content": prompt, "thinking": None})
             messages.append({"role": "assistant", "content": content, "thinking": thinking})
             history.append({"role": "user", "content": prompt})
@@ -3416,10 +3486,8 @@ class ChatRunner(DockerRuntimeRunner):
             "model": model,
             "turn_count": len(prompt_input.turn_prompts()),
         }
-        system_prompt = existing_row.get("system") if isinstance(existing_row.get("system"), str) and existing_row.get("system", "").strip() else self._chat_system_prompt()
-        return {
+        row = {
             "messages": messages,
-            "system": system_prompt,
             "prompt": prompt_input.prompt,
             "follow_up_prompts": prompt_input.follow_up_prompts,
             "thinking": thinking_text,
@@ -3430,6 +3498,9 @@ class ChatRunner(DockerRuntimeRunner):
             "usage": self._merge_usage_totals(usages),
             "metadata": metadata,
         }
+        if system_prompt:
+            row["system"] = system_prompt
+        return row
 
     def _request_or_extend_chat_conversation(
         self,

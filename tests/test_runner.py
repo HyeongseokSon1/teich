@@ -1782,10 +1782,48 @@ def test_chat_runner_writes_structured_dataset_row_from_responses_api(tmp_path: 
     assert row["prompt"] == "Hello"
     assert row["response"] == "Hi!"
     assert row["thinking"] == "I should greet the user."
-    assert row["messages"][2]["thinking"] == "I should greet the user."
+    assert [message["role"] for message in row["messages"]] == ["user", "assistant"]
+    assert "system" not in row
+    assert row["messages"][1]["thinking"] == "I should greet the user."
     assert row["usage"]["totalTokens"] == 7
     request = mock_urlopen.call_args.args[0]
     assert request.full_url == "https://api.openai.com/v1/responses"
+    body = json.loads(request.data.decode("utf-8"))
+    assert "instructions" not in body
+
+
+def test_chat_runner_uses_prompt_level_system_prompt(tmp_path: Path):
+    config = Config(
+        agent={"provider": "chat"},
+        model=ModelConfig(model="gpt-4.1-mini"),
+        api=APIConfig(provider="openai", api_key="sk-test", wire_api="responses"),
+        output={"traces_dir": tmp_path / "output"},
+    )
+    runner = ChatRunner(config)
+    payload = {
+        "model": "gpt-4.1-mini",
+        "output": [
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Brief answer"}]},
+        ],
+    }
+    response = MagicMock()
+    response.read.return_value = json.dumps(payload).encode("utf-8")
+    response.__enter__.return_value = response
+    response.__exit__.return_value = False
+
+    with patch("teich.runner.urlopen", return_value=response) as mock_urlopen:
+        result = runner.run_session(
+            "Hello",
+            "chat-session",
+            prompt_input=PromptInput(prompt="Hello", system="Be concise."),
+        )
+
+    row = json.loads(result.read_text(encoding="utf-8").strip())
+    assert row["system"] == "Be concise."
+    assert [message["role"] for message in row["messages"]] == ["system", "user", "assistant"]
+    request = mock_urlopen.call_args.args[0]
+    body = json.loads(request.data.decode("utf-8"))
+    assert body["instructions"] == "Be concise."
 
 
 def test_chat_runner_prefers_openrouter_generation_stats_usage(tmp_path: Path):
@@ -1896,7 +1934,7 @@ def test_chat_runner_supports_follow_up_prompts_as_multiturn_rows(tmp_path: Path
     assert row["response"] == "Follow-up answer"
     assert row["thinking"] == "Need to revise."
     assert row["usage"]["totalTokens"] == 20
-    assert [message["role"] for message in row["messages"]] == ["system", "user", "assistant", "user", "assistant"]
+    assert [message["role"] for message in row["messages"]] == ["user", "assistant", "user", "assistant"]
 
     second_request = mock_urlopen.call_args_list[1].args[0]
     second_body = json.loads(second_request.data.decode("utf-8"))
@@ -2012,14 +2050,13 @@ def test_chat_runner_run_all_writes_one_dataset_file_with_all_rows(tmp_path: Pat
     runner = ChatRunner(config)
     updates = []
 
-    def fake_completion(prompt: str) -> dict[str, object]:
+    def fake_completion(prompt_input: PromptInput) -> dict[str, object]:
+        prompt = prompt_input.prompt
         return {
             "messages": [
-                {"role": "system", "content": "You are a helpful assistant", "thinking": None},
                 {"role": "user", "content": prompt, "thinking": None},
                 {"role": "assistant", "content": f"Response to {prompt}", "thinking": None},
             ],
-            "system": "You are a helpful assistant",
             "prompt": prompt,
             "thinking": None,
             "response": f"Response to {prompt}",
@@ -2052,12 +2089,12 @@ def test_chat_runner_run_all_creates_and_appends_dataset_while_batch_is_running(
     runner = ChatRunner(config)
     release_blocked = threading.Event()
 
-    def fake_completion(prompt: str) -> dict[str, object]:
+    def fake_completion(prompt_input: PromptInput) -> dict[str, object]:
+        prompt = prompt_input.prompt
         if prompt == "blocked":
             assert release_blocked.wait(timeout=2)
         return {
             "messages": [
-                {"role": "system", "content": "You are a helpful assistant", "thinking": None},
                 {"role": "user", "content": prompt, "thinking": None},
                 {"role": "assistant", "content": f"Response to {prompt}", "thinking": None},
             ],
@@ -2226,7 +2263,6 @@ def test_resume_detects_completed_structured_rows_without_top_level_prompt(tmp_p
         json.dumps(
             {
                 "messages": [
-                    {"role": "system", "content": "You are helpful"},
                     {"role": "user", "content": "Hello"},
                     {"role": "assistant", "content": "Hi"},
                 ],
@@ -2243,6 +2279,39 @@ def test_resume_detects_completed_structured_rows_without_top_level_prompt(tmp_p
     pending = pending_prompt_inputs_for_resume(prompt_inputs, output_dir)
 
     assert [item.prompt for item in pending] == ["Who are you?"]
+
+
+def test_resume_treats_prompt_level_system_as_part_of_chat_completion_key(tmp_path: Path):
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "chat.jsonl").write_text(
+        json.dumps(
+            {
+                "system": "Be concise.",
+                "prompt": "Hello",
+                "response": "Hi",
+                "messages": [
+                    {"role": "system", "content": "Be concise."},
+                    {"role": "user", "content": "Hello"},
+                    {"role": "assistant", "content": "Hi"},
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    prompt_inputs = [
+        PromptInput(prompt="Hello"),
+        PromptInput(prompt="Hello", system="Be concise."),
+        PromptInput(prompt="Hello", system="Be thorough."),
+    ]
+
+    pending = pending_prompt_inputs_for_resume(prompt_inputs, output_dir)
+
+    assert [(item.prompt, item.system) for item in pending] == [
+        ("Hello", None),
+        ("Hello", "Be thorough."),
+    ]
 
 
 def test_resume_detects_completed_chat_follow_up_prompt_sets(tmp_path: Path):
@@ -2435,7 +2504,6 @@ def test_chat_runner_resume_extends_existing_chat_row_with_follow_ups(tmp_path: 
                 "prompt": "Build app",
                 "response": "Built",
                 "messages": [
-                    {"role": "system", "content": "You are a helpful assistant", "thinking": None},
                     {"role": "user", "content": "Build app", "thinking": None},
                     {"role": "assistant", "content": "Built", "thinking": "planned"},
                 ],
@@ -2469,7 +2537,6 @@ def test_chat_runner_resume_extends_existing_chat_row_with_follow_ups(tmp_path: 
     assert row["thinking"] == "planned\n\nchecked"
     assert row["usage"] == {"input": 6, "output": 9, "reasoning": 0, "totalTokens": 15}
     assert [message["role"] for message in row["messages"]] == [
-        "system",
         "user",
         "assistant",
         "user",
@@ -2506,7 +2573,6 @@ def test_chat_runner_resume_extends_existing_partial_follow_up_row(tmp_path: Pat
                 "response": "Tests added",
                 "responses": ["Built", "Tests added"],
                 "messages": [
-                    {"role": "system", "content": "You are a helpful assistant", "thinking": None},
                     {"role": "user", "content": "Build app", "thinking": None},
                     {"role": "assistant", "content": "Built", "thinking": None},
                     {"role": "user", "content": "Add tests", "thinking": None},

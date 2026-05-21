@@ -216,6 +216,7 @@ def test_config_prompts_file_supports_jsonl_prompts(tmp_path: Path):
     prompts_file = tmp_path / "prompts.jsonl"
     rows = [
         {
+            "system": "Answer as a senior frontend reviewer.",
             "prompt": "Premise:\nUse a safer long prompt format.\nAvailable choices:\n - yes\n - no",
             "github_repo": "armand0e/perplexica-mcp",
             "follow_up_prompts": ["Now add tests.", "Now update the README."],
@@ -232,6 +233,7 @@ def test_config_prompts_file_supports_jsonl_prompts(tmp_path: Path):
 
     assert len(prompt_inputs) == 2
     assert prompt_inputs[0].prompt == rows[0]["prompt"]
+    assert prompt_inputs[0].system == "Answer as a senior frontend reviewer."
     assert prompt_inputs[0].github_repo == "armand0e/perplexica-mcp"
     assert prompt_inputs[0].follow_up_prompts == ["Now add tests.", "Now update the README."]
     assert prompt_inputs[1].prompt == "Build a todo app"
@@ -241,6 +243,7 @@ def test_config_inline_prompts_support_structured_follow_up_prompts():
     config = Config(
         prompts=[
             {
+                "system": "Keep edits minimal.",
                 "prompt": "Build a todo app",
                 "follow_up_prompts": ["Add keyboard shortcuts", "Polish the empty state"],
             }
@@ -251,6 +254,7 @@ def test_config_inline_prompts_support_structured_follow_up_prompts():
 
     assert len(prompt_inputs) == 1
     assert prompt_inputs[0].prompt == "Build a todo app"
+    assert prompt_inputs[0].system == "Keep edits minimal."
     assert prompt_inputs[0].follow_up_prompts == ["Add keyboard shortcuts", "Polish the empty state"]
 
 

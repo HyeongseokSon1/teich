@@ -140,7 +140,7 @@ def test_write_traces_readme_for_structured_chat_dataset_skips_tools_json(tmp_pa
     assert "TRAIN_ON_REASONING" not in readme
     assert "prepare_data(..., teich_masking=False)" in readme
     assert "tools=example.get('tools') or []" not in readme
-    assert "Chat-only datasets include `messages` plus convenience fields like `system`, `prompt`, `follow_up_prompts`, `thinking`, `response`, and `responses`." in readme
+    assert "Chat-only datasets include `messages` plus convenience fields like optional `system`, `prompt`, `follow_up_prompts`, `thinking`, `response`, and `responses`." in readme
     assert "## Training-ready tools" not in readme
     assert not (tmp_path / "tools.json").exists()
 

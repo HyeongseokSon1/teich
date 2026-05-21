@@ -189,7 +189,6 @@ def build_traces_readme(
     sample_block = "\n".join(sample_lines) if sample_lines else json.dumps(
         {
             "messages": [
-                {"role": "system", "content": "You are a helpful assistant", "thinking": None},
                 {"role": "user", "content": "Hello", "thinking": None},
                 {"role": "assistant", "content": "Hi!", "thinking": None},
             ],
@@ -245,7 +244,7 @@ def build_traces_readme(
         lines.extend(
             [
                 "Each file is newline-delimited JSON where every line is already a training example.",
-                "Chat-only datasets include `messages` plus convenience fields like `system`, `prompt`, `follow_up_prompts`, `thinking`, `response`, and `responses`.",
+                "Chat-only datasets include `messages` plus convenience fields like optional `system`, `prompt`, `follow_up_prompts`, `thinking`, `response`, and `responses`.",
                 "Tool datasets can include the same normalized `messages` structure together with a `tools` field.",
                 "",
             ]

@@ -142,6 +142,7 @@ class PromptInput(BaseModel):
     """Structured prompt input row."""
     image: str | None = None
     github_repo: str | None = None
+    system: str | None = None
     prompt: str
     follow_up_prompts: list[str] = Field(default_factory=list)
 
@@ -155,7 +156,7 @@ class PromptInput(BaseModel):
             return None
         return normalized
 
-    @field_validator("image", "github_repo", mode="before")
+    @field_validator("image", "github_repo", "system", mode="before")
     @classmethod
     def normalize_optional_fields(cls, value: object) -> str | None:
         return cls._normalize_optional_text(value)
@@ -406,6 +407,7 @@ class Config(BaseModel):
                             PromptInput(
                                 image=normalized_row.get("image"),
                                 github_repo=normalized_row.get("github_repo"),
+                                system=normalized_row.get("system"),
                                 prompt=prompt,
                             )
                         )
@@ -437,6 +439,7 @@ class Config(BaseModel):
             return PromptInput(
                 image=normalized_row.get("image"),
                 github_repo=normalized_row.get("github_repo"),
+                system=normalized_row.get("system"),
                 prompt=prompt,
                 follow_up_prompts=normalized_row.get("follow_up_prompts"),
             )
