@@ -1008,7 +1008,8 @@ def test_pi_run_session_runs_follow_up_prompts_by_continuing_session(tmp_path: P
 
     def record_prompt_file(command, *args, **kwargs) -> None:
         assert captured_workspace is not None
-        assert command[:3] == ["docker", "exec", "-i"]
+        assert command[:2] == ["docker", "exec"]
+        assert "-i" not in command
         assert "--user" in command
         assert "-w" in command
         assert command[command.index("-w") + 1] == "/workspace"
@@ -1037,6 +1038,110 @@ def test_pi_run_session_runs_follow_up_prompts_by_continuing_session(tmp_path: P
     assert mock_start_container.call_count == 1
     assert container_session_dir is not None
     assert mock_remove_container.call_args.args == ("teich-pi-pi-session",)
+
+
+def test_pi_stdout_progress_reports_model_start_and_usage(tmp_path: Path):
+    config = Config(agent={"provider": "pi"}, output={"traces_dir": tmp_path / "output"})
+    with patch.object(PiRunner, '_ensure_image'):
+        runner = PiRunner(config)
+
+    metrics, details = runner._stdout_progress_update(
+        [
+            {"type": "session", "id": "pi-session"},
+            {"type": "message_end", "message": {"role": "user", "content": []}},
+            {
+                "type": "message_start",
+                "message": {
+                    "role": "assistant",
+                    "provider": "openrouter",
+                    "model": "qwen/qwen3.7-max",
+                    "usage": {"input": 12, "output": 0, "totalTokens": 12, "cost": {"total": 0.001}},
+                },
+            },
+        ]
+    )
+
+    assert details == "pi model request started"
+    assert metrics is not None
+    assert metrics.provider == "openrouter"
+    assert metrics.model == "qwen/qwen3.7-max"
+    assert metrics.total_tokens == 12
+    assert metrics.total_cost == 0.001
+
+
+def test_pi_monitor_reports_stdout_progress_before_session_file(tmp_path: Path):
+    config = Config(agent={"provider": "pi"}, output={"traces_dir": tmp_path / "output"}, timeout_seconds=5)
+    with patch.object(PiRunner, '_ensure_image'):
+        runner = PiRunner(config)
+
+    class FakeProcess:
+        args = ["pi"]
+
+        def __init__(self) -> None:
+            self.poll_count = 0
+
+        def poll(self) -> int | None:
+            self.poll_count += 1
+            return None if self.poll_count == 1 else 0
+
+        def kill(self) -> None:
+            raise AssertionError("process should not be killed")
+
+        def wait(self) -> int:
+            return 0
+
+    stdout_path = tmp_path / "stdout.jsonl"
+    stderr_path = tmp_path / "stderr.txt"
+    stdout_path.write_text(
+        "\n".join(
+            json.dumps(row)
+            for row in [
+                {"type": "session", "id": "pi-session"},
+                {"type": "message_end", "message": {"role": "user", "content": []}},
+                {
+                    "type": "message_start",
+                    "message": {
+                        "role": "assistant",
+                        "provider": "openai",
+                        "model": "Opus-Agent",
+                        "usage": {"input": 42, "output": 0, "totalTokens": 42},
+                    },
+                },
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    stderr_path.write_text("", encoding="utf-8")
+    updates: list[runner_module.SessionProgressUpdate] = []
+    progress_base = runner_module.SessionProgressUpdate(
+        prompt_id="prompt-1",
+        prompt_index=1,
+        total_prompts=1,
+        prompt="Build app",
+        prompt_preview="Build app",
+        status="running",
+        session_id="pi-session",
+        started_at=datetime.now(timezone.utc),
+    )
+
+    with stdout_path.open("r+", encoding="utf-8") as stdout_handle, stderr_path.open("r+", encoding="utf-8") as stderr_handle:
+        runner._monitor_process(
+            FakeProcess(),  # type: ignore[arg-type]
+            "pi-session",
+            datetime.now(timezone.utc),
+            None,
+            updates.append,
+            progress_base,
+            stdout_handle,
+            stderr_handle,
+        )
+
+    assert updates
+    assert updates[-1].details == "pi model request started"
+    assert updates[-1].metrics is not None
+    assert updates[-1].metrics.model == "Opus-Agent"
+    assert updates[-1].metrics.total_tokens == 42
 
 
 def test_run_all_reports_progress_and_preserves_prompt_order(tmp_path: Path):

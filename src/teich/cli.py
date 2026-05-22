@@ -456,7 +456,9 @@ class BatchProgressReporter:
                 metrics = update.metrics
                 model = metrics.model if metrics and metrics.model else "--"
                 details = "--"
-                if update.trace_path is not None:
+                if update.details:
+                    details = update.details
+                elif update.trace_path is not None:
                     details = str(update.trace_path.name)
                 elif update.error:
                     details = update.error

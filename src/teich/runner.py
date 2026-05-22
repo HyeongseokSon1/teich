@@ -638,6 +638,7 @@ class SessionProgressUpdate:
     trace_path: Path | None = None
     sandbox_path: Path | None = None
     error: str | None = None
+    details: str | None = None
     metrics: TraceMetrics | None = None
 
 
@@ -906,6 +907,8 @@ class DockerRuntimeRunner:
         self.image_name = RUNTIME_IMAGE_NAME
         self._active_processes: dict[subprocess.Popen[str], str | None] = {}
         self._active_processes_lock = threading.Lock()
+        self._active_containers: set[str] = set()
+        self._active_containers_lock = threading.Lock()
         self._ensure_image()
 
     @staticmethod
@@ -1000,6 +1003,18 @@ class DockerRuntimeRunner:
         with self._active_processes_lock:
             self._active_processes.pop(process, None)
 
+    def _register_active_container(self, container_name: str | None) -> None:
+        if not container_name:
+            return
+        with self._active_containers_lock:
+            self._active_containers.add(container_name)
+
+    def _unregister_active_container(self, container_name: str | None) -> None:
+        if not container_name:
+            return
+        with self._active_containers_lock:
+            self._active_containers.discard(container_name)
+
     @staticmethod
     def _remove_container(container_name: str | None) -> None:
         if not container_name:
@@ -1028,6 +1043,11 @@ class DockerRuntimeRunner:
             active = list(self._active_processes.items())
         for process, container_name in active:
             self._terminate_process(process, container_name)
+        with self._active_containers_lock:
+            active_containers = list(self._active_containers)
+        for container_name in active_containers:
+            self._remove_container(container_name)
+            self._unregister_active_container(container_name)
 
     @staticmethod
     def _start_container(command: list[str]) -> None:
@@ -1193,6 +1213,65 @@ class DockerRuntimeRunner:
     def _runtime_trace_guard_error(self, trace_path: Path) -> str | None:
         return None
 
+    @staticmethod
+    def _read_new_stdout_json_events(
+        stdout_handle,
+        offset: int,
+        buffer: str,
+    ) -> tuple[list[dict[str, Any]], int, str]:
+        stdout_handle.flush()
+        stdout_handle.seek(offset)
+        chunk = stdout_handle.read()
+        offset = stdout_handle.tell()
+        if not chunk:
+            return [], offset, buffer
+
+        buffer += chunk
+        if buffer.endswith(("\n", "\r")):
+            raw_lines = buffer.splitlines()
+            buffer = ""
+        else:
+            raw_lines = buffer.splitlines()
+            buffer = raw_lines.pop() if raw_lines else buffer
+
+        events: list[dict[str, Any]] = []
+        for raw_line in raw_lines:
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict):
+                events.append(event)
+        return events, offset, buffer
+
+    def _stdout_progress_update(
+        self,
+        events: list[dict[str, Any]],
+    ) -> tuple[TraceMetrics | None, str | None]:
+        return None, None
+
+    @staticmethod
+    def _progress_metrics_signature(metrics: TraceMetrics | None) -> tuple[object, ...] | None:
+        if metrics is None:
+            return None
+        return (
+            metrics.provider,
+            metrics.model,
+            metrics.input_tokens,
+            metrics.output_tokens,
+            metrics.reasoning_tokens,
+            metrics.cache_read_tokens,
+            metrics.cache_write_tokens,
+            metrics.total_tokens,
+            metrics.est_total_tokens,
+            metrics.has_token_usage,
+            metrics.total_cost,
+            metrics.has_cost,
+        )
+
     def _monitor_process(
         self,
         process: subprocess.Popen[str],
@@ -1206,10 +1285,40 @@ class DockerRuntimeRunner:
     ) -> None:
         deadline = time.monotonic() + self.config.timeout_seconds
         last_signature: tuple[str | None, int, float] | None = None
+        stdout_offset = 0
+        stdout_buffer = ""
+        last_stdout_signature: tuple[str | None, tuple[object, ...] | None] | None = None
         while True:
             return_code = process.poll()
             trace_path: Path | None = None
             metrics: TraceMetrics | None = None
+            stdout_events, stdout_offset, stdout_buffer = self._read_new_stdout_json_events(
+                stdout_handle,
+                stdout_offset,
+                stdout_buffer,
+            )
+            if stdout_events and progress_callback and progress_base:
+                stdout_metrics, stdout_details = self._stdout_progress_update(stdout_events)
+                stdout_signature = (
+                    stdout_details,
+                    self._progress_metrics_signature(stdout_metrics),
+                )
+                if (stdout_details or stdout_metrics is not None) and stdout_signature != last_stdout_signature:
+                    last_stdout_signature = stdout_signature
+                    progress_callback(
+                        SessionProgressUpdate(
+                            prompt_id=progress_base.prompt_id,
+                            prompt_index=progress_base.prompt_index,
+                            total_prompts=progress_base.total_prompts,
+                            prompt=progress_base.prompt,
+                            prompt_preview=progress_base.prompt_preview,
+                            status="running",
+                            session_id=session_id,
+                            started_at=progress_base.started_at,
+                            details=stdout_details,
+                            metrics=stdout_metrics,
+                        )
+                    )
             if session_dir is not None:
                 trace_path = self._latest_session_file(session_dir, started_at)
                 if trace_path and trace_path.exists():
@@ -4287,6 +4396,60 @@ class PiRunner(DockerRuntimeRunner):
         return None
 
     @staticmethod
+    def _pi_stdout_message(event: dict[str, Any]) -> dict[str, Any] | None:
+        message = event.get("message")
+        if isinstance(message, dict):
+            return message
+        assistant_message_event = event.get("assistantMessageEvent")
+        if isinstance(assistant_message_event, dict):
+            partial = assistant_message_event.get("partial")
+            if isinstance(partial, dict):
+                return partial
+        return None
+
+    @classmethod
+    def _pi_stdout_metrics(cls, message: dict[str, Any] | None) -> TraceMetrics | None:
+        if not isinstance(message, dict):
+            return None
+        metrics = TraceMetrics()
+        provider = message.get("provider")
+        model = message.get("model")
+        if isinstance(provider, str) and provider.strip():
+            metrics.provider = provider.strip()
+        if isinstance(model, str) and model.strip():
+            metrics.model = model.strip()
+        usage = message.get("usage")
+        if isinstance(usage, dict):
+            metrics.add_structured_usage(usage)
+            metrics.finalize()
+        if not metrics.provider and not metrics.model and not metrics.has_token_usage and not metrics.has_cost:
+            return None
+        return metrics
+
+    def _stdout_progress_update(self, events: list[dict[str, Any]]) -> tuple[TraceMetrics | None, str | None]:
+        details: str | None = None
+        metrics: TraceMetrics | None = None
+        for event in events:
+            event_type = event.get("type")
+            message = self._pi_stdout_message(event)
+            event_metrics = self._pi_stdout_metrics(message)
+            if event_metrics is not None:
+                metrics = event_metrics
+            if event_type == "session":
+                details = "pi session started"
+            elif event_type == "message_end" and isinstance(message, dict) and message.get("role") == "user":
+                details = "pi prompt sent"
+            elif event_type == "message_start" and isinstance(message, dict) and message.get("role") == "assistant":
+                details = "pi model request started"
+            elif event_type == "message_update":
+                details = "pi streaming response"
+            elif event_type == "message_end" and isinstance(message, dict) and message.get("role") == "assistant":
+                details = "pi assistant response complete"
+            elif event_type == "turn_end":
+                details = "pi turn complete"
+        return metrics, details
+
+    @staticmethod
     def _normalize_provider(provider: str) -> str:
         return provider.strip().lower()
 
@@ -4520,7 +4683,6 @@ class PiRunner(DockerRuntimeRunner):
         return [
             "docker",
             "exec",
-            "-i",
             "--user",
             "codex",
             "-w",
@@ -4755,6 +4917,7 @@ class PiRunner(DockerRuntimeRunner):
                         container_name,
                     )
                 )
+                self._register_active_container(container_name)
             for turn_index, turn_prompt in enumerate(turn_prompts):
                 (workspace / TEICH_PROMPT_FILE_NAME).write_text(turn_prompt, encoding="utf-8")
                 if len(turn_prompts) > 1:
@@ -4796,6 +4959,7 @@ class PiRunner(DockerRuntimeRunner):
         finally:
             if len(turn_prompts) > 1:
                 self._remove_container(container_name)
+                self._unregister_active_container(container_name)
             shutil.rmtree(workspace_root, ignore_errors=True)
             shutil.rmtree(agent_dir, ignore_errors=True)
             shutil.rmtree(session_dir, ignore_errors=True)
