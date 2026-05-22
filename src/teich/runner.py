@@ -4438,7 +4438,11 @@ class PiRunner(DockerRuntimeRunner):
 
     def _runtime_trace_guard_error(self, trace_path: Path) -> str | None:
         try:
-            self._normalized_pi_trace_events(trace_path, reject_terminal_runtime_error=False)
+            self._normalized_pi_trace_events(
+                trace_path,
+                reject_terminal_runtime_error=False,
+                reject_incomplete_user_turns=False,
+            )
         except RuntimeError as exc:
             return str(exc).replace("This trace was not exported because ", "")
         return None
@@ -4817,9 +4821,12 @@ class PiRunner(DockerRuntimeRunner):
         events: list[dict[str, object]],
         *,
         reject_terminal_runtime_error: bool = True,
+        reject_incomplete_user_turns: bool = True,
     ) -> None:
         empty_tool_calls = 0
         empty_tool_results = 0
+        incomplete_user_turns = 0
+        pending_user_turn = False
         terminal_runtime_error: str | None = None
         for event in events:
             if event.get("type") != "message":
@@ -4834,10 +4841,18 @@ class PiRunner(DockerRuntimeRunner):
                     terminal_runtime_error = error_message.strip()
                 else:
                     terminal_runtime_error = "model/provider returned stopReason=error"
+            elif stop_reason == "length":
+                terminal_runtime_error = "model/provider stopped because it reached the output token limit"
             elif payload.get("role") == "assistant" and cls._pi_assistant_has_content(payload):
                 terminal_runtime_error = None
             role = payload.get("role")
-            if role == "assistant":
+            if role == "user":
+                if pending_user_turn:
+                    incomplete_user_turns += 1
+                pending_user_turn = True
+            elif role == "assistant":
+                if cls._pi_assistant_has_content(payload):
+                    pending_user_turn = False
                 content = payload.get("content")
                 if isinstance(content, list):
                     for block in content:
@@ -4856,11 +4871,19 @@ class PiRunner(DockerRuntimeRunner):
                 text = cls._pi_message_text(payload).strip()
                 if not tool_name.strip() or not tool_call_id.strip() or text == PI_EMPTY_TOOL_NOT_FOUND_TEXT:
                     empty_tool_results += 1
+        if pending_user_turn:
+            incomplete_user_turns += 1
         if reject_terminal_runtime_error and terminal_runtime_error:
             raise RuntimeError(
                 "Pi session ended with model/provider error: "
                 f"{terminal_runtime_error}. "
                 "This trace was not exported because the model/provider did not produce a successful assistant response."
+            )
+        if reject_incomplete_user_turns and incomplete_user_turns:
+            raise RuntimeError(
+                "Pi session ended before producing an assistant response for "
+                f"{incomplete_user_turns} user turn(s). "
+                "This trace was not exported because it is incomplete."
             )
         if not empty_tool_calls and not empty_tool_results:
             return
@@ -4893,6 +4916,7 @@ class PiRunner(DockerRuntimeRunner):
         source_path: Path,
         *,
         reject_terminal_runtime_error: bool = True,
+        reject_incomplete_user_turns: bool = True,
     ) -> list[dict[str, object]]:
         normalized_events: list[dict[str, object]] = []
         system_prompt: str | None = None
@@ -4919,6 +4943,7 @@ class PiRunner(DockerRuntimeRunner):
         self._validate_pi_trace_events(
             normalized_events,
             reject_terminal_runtime_error=reject_terminal_runtime_error,
+            reject_incomplete_user_turns=reject_incomplete_user_turns,
         )
         return normalized_events
 
@@ -5026,6 +5051,14 @@ class PiRunner(DockerRuntimeRunner):
                     stderr = exc.stderr if isinstance(exc.stderr, str) else (exc.stderr or "")
                     stdout = exc.stdout if isinstance(exc.stdout, str) else (exc.stdout or "")
                     details = stderr.strip() or stdout.strip()
+                    if turn_index == len(turn_prompts) - 1:
+                        try:
+                            trace_path = self._extract_session_file(session_id, session_dir, started_at)
+                        except RuntimeError:
+                            pass
+                        else:
+                            self._copy_workspace_snapshot(workspace, self._sandbox_destination(trace_path))
+                            return trace_path
                     raise RuntimeError(f"Session {session_id[:8]} failed: {details}")
             trace_path = self._extract_session_file(session_id, session_dir, started_at)
             self._copy_workspace_snapshot(workspace, self._sandbox_destination(trace_path))

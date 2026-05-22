@@ -1112,6 +1112,69 @@ def test_pi_run_session_cleans_persistent_container_after_followup_failure(tmp_p
     assert "teich-pi-pi-failure" not in runner._active_containers
 
 
+def test_pi_run_session_salvages_valid_trace_after_last_turn_nonzero_exit(tmp_path: Path):
+    config = Config(agent={"provider": "pi"}, output={"traces_dir": tmp_path / "output", "sandbox_dir": tmp_path / "sandbox"})
+
+    with patch.object(PiRunner, '_ensure_image'):
+        runner = PiRunner(config)
+
+    trace_path = tmp_path / "output" / "pi.jsonl"
+    exit_error = subprocess.CalledProcessError(
+        1,
+        ["pi"],
+        output="",
+        stderr="provider reported a transient error after writing trace",
+    )
+
+    with patch.object(runner, "_run_process", side_effect=exit_error), \
+         patch.object(runner, "_extract_session_file", return_value=trace_path) as mock_extract, \
+         patch.object(runner, "_copy_workspace_snapshot") as mock_copy_snapshot, \
+         patch.object(runner, "_write_pi_project_settings"):
+        result = runner.run_session("Build app", "pi-salvage")
+
+    assert result == trace_path
+    mock_extract.assert_called_once()
+    mock_copy_snapshot.assert_called_once()
+
+
+def test_pi_run_session_does_not_salvage_nonzero_exit_before_followup_turn(tmp_path: Path):
+    config = Config(agent={"provider": "pi"}, output={"traces_dir": tmp_path / "output", "sandbox_dir": tmp_path / "sandbox"})
+
+    with patch.object(PiRunner, '_ensure_image'):
+        runner = PiRunner(config)
+
+    prompt_input = PromptInput(prompt="Build app", follow_up_prompts=["Add tests"])
+    exit_error = subprocess.CalledProcessError(1, ["pi"], output="", stderr="first turn failed")
+
+    with patch.object(runner, "_start_container"), \
+         patch.object(runner, "_run_process", side_effect=exit_error), \
+         patch.object(runner, "_extract_session_file") as mock_extract, \
+         patch.object(runner, "_remove_container"), \
+         patch.object(runner, "_write_pi_project_settings"):
+        with pytest.raises(RuntimeError, match="first turn failed"):
+            runner.run_session("Build app", "pi-followup-nonzero", prompt_input=prompt_input)
+
+    mock_extract.assert_not_called()
+
+
+def test_pi_run_session_keeps_nonzero_failure_when_final_trace_is_invalid(tmp_path: Path):
+    config = Config(agent={"provider": "pi"}, output={"traces_dir": tmp_path / "output", "sandbox_dir": tmp_path / "sandbox"})
+
+    with patch.object(PiRunner, '_ensure_image'):
+        runner = PiRunner(config)
+
+    exit_error = subprocess.CalledProcessError(1, ["pi"], output="", stderr="provider failed")
+
+    with patch.object(runner, "_run_process", side_effect=exit_error), \
+         patch.object(runner, "_extract_session_file", side_effect=RuntimeError("terminal provider error")), \
+         patch.object(runner, "_copy_workspace_snapshot") as mock_copy_snapshot, \
+         patch.object(runner, "_write_pi_project_settings"):
+        with pytest.raises(RuntimeError, match="provider failed"):
+            runner.run_session("Build app", "pi-invalid-trace")
+
+    mock_copy_snapshot.assert_not_called()
+
+
 def test_pi_runner_preserves_tool_validation_failures_as_trace_events(tmp_path: Path):
     config = Config(agent={"provider": "pi"}, output={"traces_dir": tmp_path / "output"})
 
@@ -1974,6 +2037,55 @@ def test_monitor_process_does_not_kill_live_pi_provider_error(tmp_path: Path):
     process.wait.assert_not_called()
 
 
+def test_monitor_process_does_not_kill_live_pi_user_only_trace(tmp_path: Path):
+    config = Config(agent={"provider": "pi"}, output={"traces_dir": tmp_path / "output"})
+    with patch.object(PiRunner, '_ensure_image'):
+        runner = PiRunner(config)
+
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir(parents=True)
+    trace_file = session_dir / "session.jsonl"
+    trace_file.write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "session", "id": "pi-session"}),
+                json.dumps(
+                    {
+                        "type": "message",
+                        "id": "user-1",
+                        "message": {
+                            "role": "user",
+                            "content": [{"type": "text", "text": "Build app"}],
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    process = MagicMock()
+    process.poll.side_effect = [None, 0]
+    process.args = ["docker", "run"]
+    stdout_handle = io.StringIO()
+    stderr_handle = io.StringIO()
+
+    runner._monitor_process(
+        process,
+        "session-id",
+        datetime.fromtimestamp(0, tz=timezone.utc),
+        session_dir,
+        None,
+        None,
+        stdout_handle,
+        stderr_handle,
+    )
+
+    process.kill.assert_not_called()
+    process.wait.assert_not_called()
+
+
 def test_pi_trace_with_model_error_is_rejected_before_export(tmp_path: Path):
     config = Config(agent={"provider": "pi"}, output={"traces_dir": tmp_path / "output"})
     with patch.object(PiRunner, '_ensure_image'):
@@ -2008,6 +2120,95 @@ def test_pi_trace_with_model_error_is_rejected_before_export(tmp_path: Path):
     destination = tmp_path / "output" / "bad-session.jsonl"
 
     with pytest.raises(RuntimeError, match="model/provider error: 401 User not found"):
+        runner._copy_normalized_session_file(source, destination)
+
+    assert not destination.exists()
+
+
+def test_pi_trace_with_user_only_turns_is_rejected_before_export(tmp_path: Path):
+    config = Config(agent={"provider": "pi"}, output={"traces_dir": tmp_path / "output"})
+    with patch.object(PiRunner, '_ensure_image'):
+        runner = PiRunner(config)
+
+    source = tmp_path / "user-only-session.jsonl"
+    source.write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "session", "id": "pi-session"}),
+                json.dumps(
+                    {
+                        "type": "message",
+                        "id": "user-1",
+                        "message": {
+                            "role": "user",
+                            "content": [{"type": "text", "text": "Build app"}],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "message",
+                        "id": "user-2",
+                        "message": {
+                            "role": "user",
+                            "content": [{"type": "text", "text": "Add a follow up"}],
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    destination = tmp_path / "output" / "user-only-session.jsonl"
+    destination.parent.mkdir(parents=True)
+
+    with pytest.raises(RuntimeError, match="assistant response for 2 user turn"):
+        runner._copy_normalized_session_file(source, destination)
+
+    assert not destination.exists()
+
+
+def test_pi_trace_with_terminal_length_stop_is_rejected_before_export(tmp_path: Path):
+    config = Config(agent={"provider": "pi"}, output={"traces_dir": tmp_path / "output"})
+    with patch.object(PiRunner, '_ensure_image'):
+        runner = PiRunner(config)
+
+    source = tmp_path / "length-session.jsonl"
+    source.write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "session", "id": "pi-session"}),
+                json.dumps(
+                    {
+                        "type": "message",
+                        "id": "user-1",
+                        "message": {
+                            "role": "user",
+                            "content": [{"type": "text", "text": "Build app"}],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "message",
+                        "id": "assistant-1",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "Partial answer"}],
+                            "stopReason": "length",
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    destination = tmp_path / "output" / "length-session.jsonl"
+    destination.parent.mkdir(parents=True)
+
+    with pytest.raises(RuntimeError, match="output token limit"):
         runner._copy_normalized_session_file(source, destination)
 
     assert not destination.exists()
@@ -3834,6 +4035,18 @@ def test_pi_runner_unwraps_prompt_file_user_message_in_exported_trace(tmp_path: 
                         },
                     }
                 ),
+                json.dumps(
+                    {
+                        "type": "message",
+                        "id": "assistant-1",
+                        "parentId": "44931461",
+                        "timestamp": "2026-05-22T00:28:40.346Z",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "Done."}],
+                        },
+                    }
+                ),
             ]
         )
         + "\n",
@@ -3891,6 +4104,18 @@ def test_pi_runner_injects_captured_system_prompt_into_exported_trace(tmp_path: 
                         "message": {
                             "role": "user",
                             "content": [{"type": "text", "text": "who are you?"}],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "message",
+                        "id": "assistant-1",
+                        "parentId": "user-1",
+                        "timestamp": "2026-04-30T07:14:44.483Z",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "I am Pi."}],
                         },
                     }
                 ),
