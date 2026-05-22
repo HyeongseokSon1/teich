@@ -14,7 +14,15 @@ import pytest
 
 import teich.runner as runner_module
 from teich.config import APIConfig, Config, MCPConfig, ModelConfig, PromptInput
-from teich.runner import ChatRunner, ClaudeCodeRunner, CodexRunner, HermesRunner, PiRunner, pending_prompt_inputs_for_resume
+from teich.runner import (
+    ChatRunner,
+    ClaudeCodeRunner,
+    CodexRunner,
+    DockerRuntimeRunner,
+    HermesRunner,
+    PiRunner,
+    pending_prompt_inputs_for_resume,
+)
 
 
 def _claude_home_from_command(command: list[str]) -> Path:
@@ -115,6 +123,47 @@ def test_runtime_dockerfile_path_prefers_packaged_file(tmp_path: Path):
         dockerfile_path = CodexRunner._runtime_dockerfile_path()
 
     assert dockerfile_path == packaged_dockerfile
+
+
+def test_tracked_container_cleans_up_when_start_fails():
+    with patch.object(DockerRuntimeRunner, "_ensure_image"):
+        runner = DockerRuntimeRunner(Config())
+
+    with patch.object(runner, "_start_container", side_effect=RuntimeError("boom")), \
+         patch.object(runner, "_remove_container") as mock_remove:
+        with pytest.raises(RuntimeError, match="boom"):
+            runner._start_tracked_container(["docker", "run"], "teich-broken-start")
+
+    mock_remove.assert_called_once_with("teich-broken-start")
+    assert "teich-broken-start" not in runner._active_containers
+
+
+def test_tracked_container_cleanup_unregisters_after_success():
+    with patch.object(DockerRuntimeRunner, "_ensure_image"):
+        runner = DockerRuntimeRunner(Config())
+
+    with patch.object(runner, "_start_container") as mock_start, \
+         patch.object(runner, "_remove_container") as mock_remove:
+        runner._start_tracked_container(["docker", "run"], "teich-live")
+        assert "teich-live" in runner._active_containers
+        runner._cleanup_tracked_container("teich-live")
+
+    mock_start.assert_called_once_with(["docker", "run"])
+    mock_remove.assert_called_once_with("teich-live")
+    assert "teich-live" not in runner._active_containers
+
+
+def test_terminate_active_processes_removes_registered_persistent_containers():
+    with patch.object(DockerRuntimeRunner, "_ensure_image"):
+        runner = DockerRuntimeRunner(Config())
+
+    runner._register_active_container("teich-stuck")
+
+    with patch.object(runner, "_remove_container") as mock_remove:
+        runner._terminate_active_processes()
+
+    mock_remove.assert_called_once_with("teich-stuck")
+    assert "teich-stuck" not in runner._active_containers
 
 
 def test_codex_config_setup(tmp_path: Path):
@@ -369,6 +418,7 @@ def test_claude_code_runner_uses_continue_for_followups(tmp_path: Path):
     assert "--continue" not in first_command
     assert "--continue" in second_command
     mock_remove.assert_called_once_with("teich-claude-claude-followups")
+    assert "teich-claude-claude-followups" not in runner._active_containers
 
 
 def test_hermes_runner_uses_chat_query_and_prompt_file(tmp_path: Path):
@@ -961,6 +1011,25 @@ def test_codex_run_session_runs_follow_up_prompts_by_resuming_session():
     assert mock_start_container.call_count == 1
     assert codex_home is not None
     assert mock_remove_container.call_args.args == ("teich-codex-test-session",)
+    assert "teich-codex-test-session" not in runner._active_containers
+
+
+def test_codex_run_session_cleans_persistent_container_after_followup_failure(tmp_path: Path):
+    config = Config(output={"traces_dir": tmp_path / "output", "sandbox_dir": tmp_path / "sandbox"})
+
+    with patch.object(CodexRunner, '_ensure_image'):
+        runner = CodexRunner(config)
+
+    prompt_input = PromptInput(prompt="Build app", follow_up_prompts=["Add tests"])
+
+    with patch.object(runner, "_start_container"), \
+         patch.object(runner, "_run_process", side_effect=RuntimeError("turn failed")), \
+         patch.object(runner, "_remove_container") as mock_remove_container:
+        with pytest.raises(RuntimeError, match="turn failed"):
+            runner.run_session("Build app", "failure-session", prompt_input=prompt_input)
+
+    mock_remove_container.assert_called_once_with("teich-codex-failure-session")
+    assert "teich-codex-failure-session" not in runner._active_containers
 
 
 def test_pi_run_session_runs_follow_up_prompts_by_continuing_session(tmp_path: Path):
@@ -1021,6 +1090,26 @@ def test_pi_run_session_runs_follow_up_prompts_by_continuing_session(tmp_path: P
     assert mock_start_container.call_count == 1
     assert container_session_dir is not None
     assert mock_remove_container.call_args.args == ("teich-pi-pi-session",)
+    assert "teich-pi-pi-session" not in runner._active_containers
+
+
+def test_pi_run_session_cleans_persistent_container_after_followup_failure(tmp_path: Path):
+    config = Config(agent={"provider": "pi"}, output={"traces_dir": tmp_path / "output", "sandbox_dir": tmp_path / "sandbox"})
+
+    with patch.object(PiRunner, '_ensure_image'):
+        runner = PiRunner(config)
+
+    prompt_input = PromptInput(prompt="Build app", follow_up_prompts=["Add tests"])
+
+    with patch.object(runner, "_start_container"), \
+         patch.object(runner, "_run_process", side_effect=RuntimeError("turn failed")), \
+         patch.object(runner, "_remove_container") as mock_remove_container, \
+         patch.object(runner, "_write_pi_project_settings"):
+        with pytest.raises(RuntimeError, match="turn failed"):
+            runner.run_session("Build app", "pi-failure", prompt_input=prompt_input)
+
+    mock_remove_container.assert_called_once_with("teich-pi-pi-failure")
+    assert "teich-pi-pi-failure" not in runner._active_containers
 
 
 def test_pi_stdout_progress_reports_model_start_and_usage(tmp_path: Path):
@@ -1276,6 +1365,57 @@ def test_run_all_prequeues_all_prompts_before_workers_free_up(tmp_path: Path):
         if update.status == "queued"
     ]
     assert all(thread_name == thread.name for thread_name in queued_update_thread_names)
+
+
+def test_run_all_starts_next_queued_prompt_when_one_worker_finishes(tmp_path: Path):
+    config = Config(prompts=["Prompt 1", "Prompt 2", "Prompt 3"], max_concurrency=2)
+
+    with patch.object(CodexRunner, '_ensure_image'):
+        runner = CodexRunner(config)
+
+    started: list[str] = []
+    started_lock = threading.Lock()
+    first_two_started = threading.Event()
+    third_started = threading.Event()
+    release_prompt_1 = threading.Event()
+    release_prompt_2 = threading.Event()
+    release_prompt_3 = threading.Event()
+
+    def fake_task(prompt_id, prompt_index, total_prompts, prompt_input, progress_callback):
+        with started_lock:
+            started.append(prompt_id)
+            if len(started) == 2:
+                first_two_started.set()
+            if prompt_id == "prompt-3":
+                third_started.set()
+        if prompt_id == "prompt-1":
+            assert release_prompt_1.wait(timeout=2)
+        elif prompt_id == "prompt-2":
+            assert release_prompt_2.wait(timeout=2)
+        else:
+            assert release_prompt_3.wait(timeout=2)
+        return tmp_path / f"{prompt_id}.jsonl"
+
+    with patch.object(runner, '_run_prompt_task', side_effect=fake_task):
+        result_holder = {}
+
+        def run():
+            result_holder["results"] = runner.run_all(max_concurrency=2)
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        assert first_two_started.wait(timeout=2)
+        assert started == ["prompt-1", "prompt-2"]
+        release_prompt_1.set()
+        assert third_started.wait(timeout=2)
+        assert started == ["prompt-1", "prompt-2", "prompt-3"]
+        assert thread.is_alive()
+        release_prompt_2.set()
+        release_prompt_3.set()
+        thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert [path.name for path in result_holder["results"]] == ["prompt-1.jsonl", "prompt-2.jsonl", "prompt-3.jsonl"]
 
 
 def test_run_all_stops_claiming_agent_prompts_after_failure(tmp_path: Path):

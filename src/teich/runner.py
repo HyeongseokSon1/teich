@@ -1100,6 +1100,7 @@ class DockerRuntimeRunner:
             active = list(self._active_processes.items())
         for process, container_name in active:
             self._terminate_process(process, container_name)
+            self._unregister_active_process(process)
         with self._active_containers_lock:
             active_containers = list(self._active_containers)
         for container_name in active_containers:
@@ -1121,6 +1122,19 @@ class DockerRuntimeRunner:
             stdout = exc.stdout if isinstance(exc.stdout, str) else (exc.stdout or "")
             details = stderr.strip() or stdout.strip() or str(exc)
             raise RuntimeError(f"Failed to start Docker runtime container: {details}") from exc
+
+    def _start_tracked_container(self, command: list[str], container_name: str | None) -> None:
+        self._register_active_container(container_name)
+        try:
+            self._start_container(command)
+        except BaseException:
+            self._remove_container(container_name)
+            self._unregister_active_container(container_name)
+            raise
+
+    def _cleanup_tracked_container(self, container_name: str | None) -> None:
+        self._remove_container(container_name)
+        self._unregister_active_container(container_name)
 
     @staticmethod
     def _discard_output_file(trace_path: Path) -> None:
@@ -2353,12 +2367,13 @@ class CodexRunner(DockerRuntimeRunner):
                 self._write_local_provider_proxy(codex_home)
             existing_sessions = {path.resolve() for path in self._list_session_files(codex_home)}
             if len(turn_prompts) > 1:
-                self._start_container(
+                self._start_tracked_container(
                     self._build_codex_persistent_container_command(
                         workspace,
                         codex_home,
                         container_name,
-                    )
+                    ),
+                    container_name,
                 )
             for turn_index, turn_prompt in enumerate(turn_prompts):
                 if len(turn_prompts) > 1:
@@ -2406,7 +2421,7 @@ class CodexRunner(DockerRuntimeRunner):
             raise
         finally:
             if len(turn_prompts) > 1:
-                self._remove_container(container_name)
+                self._cleanup_tracked_container(container_name)
             shutil.rmtree(workspace_root, ignore_errors=True)
             shutil.rmtree(codex_home, ignore_errors=True)
 
@@ -2683,7 +2698,10 @@ class ExternalCliRunner(DockerRuntimeRunner):
             workspace.mkdir(parents=True, exist_ok=True)
             self._write_events(destination, [self._session_meta_event(session_id, started_at, workspace)])
             if len(turn_prompts) > 1:
-                self._start_container(self._build_external_persistent_container_command(workspace, home_dir, container_name))
+                self._start_tracked_container(
+                    self._build_external_persistent_container_command(workspace, home_dir, container_name),
+                    container_name,
+                )
             for turn_index, turn_prompt in enumerate(turn_prompts):
                 (workspace / TEICH_PROMPT_FILE_NAME).write_text(turn_prompt, encoding="utf-8")
                 (workspace / TEICH_PROMPT_FILE_NAME).chmod(0o666)
@@ -2729,7 +2747,7 @@ class ExternalCliRunner(DockerRuntimeRunner):
             raise
         finally:
             if len(turn_prompts) > 1:
-                self._remove_container(container_name)
+                self._cleanup_tracked_container(container_name)
             shutil.rmtree(workspace_root, ignore_errors=True)
             shutil.rmtree(home_dir, ignore_errors=True)
 
@@ -2921,7 +2939,10 @@ class ClaudeCodeRunner(ExternalCliRunner):
             workspace.mkdir(parents=True, exist_ok=True)
             existing_sessions = {path.resolve() for path in self._list_native_session_files(home_dir)}
             if len(turn_prompts) > 1:
-                self._start_container(self._build_external_persistent_container_command(workspace, home_dir, container_name))
+                self._start_tracked_container(
+                    self._build_external_persistent_container_command(workspace, home_dir, container_name),
+                    container_name,
+                )
             for turn_index, turn_prompt in enumerate(turn_prompts):
                 (workspace / TEICH_PROMPT_FILE_NAME).write_text(turn_prompt, encoding="utf-8")
                 (workspace / TEICH_PROMPT_FILE_NAME).chmod(0o666)
@@ -2948,7 +2969,7 @@ class ClaudeCodeRunner(ExternalCliRunner):
             raise
         finally:
             if len(turn_prompts) > 1:
-                self._remove_container(container_name)
+                self._cleanup_tracked_container(container_name)
             shutil.rmtree(workspace_root, ignore_errors=True)
             shutil.rmtree(home_dir, ignore_errors=True)
 
@@ -3348,7 +3369,10 @@ class HermesRunner(ExternalCliRunner):
             workspace.mkdir(parents=True, exist_ok=True)
             self._write_hermes_runtime_config(home_dir)
             if len(turn_prompts) > 1:
-                self._start_container(self._build_external_persistent_container_command(workspace, home_dir, container_name))
+                self._start_tracked_container(
+                    self._build_external_persistent_container_command(workspace, home_dir, container_name),
+                    container_name,
+                )
             for turn_index, turn_prompt in enumerate(turn_prompts):
                 (workspace / TEICH_PROMPT_FILE_NAME).write_text(turn_prompt, encoding="utf-8")
                 (workspace / TEICH_PROMPT_FILE_NAME).chmod(0o666)
@@ -3419,7 +3443,7 @@ class HermesRunner(ExternalCliRunner):
             raise
         finally:
             if len(turn_prompts) > 1:
-                self._remove_container(container_name)
+                self._cleanup_tracked_container(container_name)
             shutil.rmtree(workspace_root, ignore_errors=True)
             shutil.rmtree(home_dir, ignore_errors=True)
 
@@ -4926,15 +4950,15 @@ class PiRunner(DockerRuntimeRunner):
             workspace.mkdir(parents=True, exist_ok=True)
             self._write_pi_project_settings(workspace)
             if len(turn_prompts) > 1:
-                self._start_container(
+                self._start_tracked_container(
                     self._build_pi_persistent_container_command(
                         workspace,
                         agent_dir,
                         session_dir,
                         container_name,
-                    )
+                    ),
+                    container_name,
                 )
-                self._register_active_container(container_name)
             for turn_index, turn_prompt in enumerate(turn_prompts):
                 (workspace / TEICH_PROMPT_FILE_NAME).write_text(turn_prompt, encoding="utf-8")
                 if len(turn_prompts) > 1:
@@ -4974,8 +4998,7 @@ class PiRunner(DockerRuntimeRunner):
             raise
         finally:
             if len(turn_prompts) > 1:
-                self._remove_container(container_name)
-                self._unregister_active_container(container_name)
+                self._cleanup_tracked_container(container_name)
             shutil.rmtree(workspace_root, ignore_errors=True)
             shutil.rmtree(agent_dir, ignore_errors=True)
             shutil.rmtree(session_dir, ignore_errors=True)
