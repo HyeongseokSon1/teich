@@ -703,6 +703,17 @@ def _prompt_completion_key(prompt_input: PromptInput | str) -> str:
     return "\n\n--- follow-up ---\n\n".join(prompt_parts)
 
 
+def _prompt_resume_key(prompt_input: PromptInput | str) -> str:
+    if isinstance(prompt_input, str):
+        prompt_parts = [_prompt_text_completion_key(prompt_input)]
+    else:
+        prompt_parts = [
+            _prompt_text_completion_key(prompt)
+            for prompt in prompt_input.turn_prompts()
+        ]
+    return "\n\n--- follow-up ---\n\n".join(prompt_parts)
+
+
 def _agent_turn_prompts(prompt: str, prompt_input: PromptInput | None) -> list[str]:
     if prompt_input is None or not prompt_input.follow_up_prompts:
         return [prompt]
@@ -884,7 +895,7 @@ def completed_prompt_keys_from_outputs(traces_dir: Path) -> set[str]:
             if not prompt.strip():
                 prompt = _prompt_from_training_messages(example.get("messages"))
             if isinstance(prompt, str) and prompt.strip() and _training_example_has_answer(example):
-                completed.add(_prompt_completion_key(_prompt_input_from_training_example(example, prompt)))
+                completed.add(_prompt_resume_key(_prompt_input_from_training_example(example, prompt)))
     return completed
 
 
@@ -930,7 +941,7 @@ def pending_prompt_inputs_for_resume(prompt_inputs: list[PromptInput], traces_di
     return [
         prompt_input
         for prompt_input in prompt_inputs
-        if _prompt_completion_key(prompt_input) not in completed
+        if _prompt_resume_key(prompt_input) not in completed
     ]
 
 
@@ -1765,7 +1776,7 @@ class DockerRuntimeRunner:
                 progress_base=progress_base,
                 prompt_input=prompt_input,
             )
-            metrics = self._summarize_trace_file_with_provider_stats(result)
+            metrics = self._summarize_trace_file(result)
             sandbox_path = self._sandbox_destination(result)
             if progress_callback:
                 progress_callback(

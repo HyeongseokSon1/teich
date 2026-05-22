@@ -1189,6 +1189,40 @@ def test_run_all_reports_progress_and_preserves_prompt_order(tmp_path: Path):
     assert completed[0].metrics.total_cost == 0.25
 
 
+def test_run_all_does_not_block_queue_on_provider_stats_lookup(tmp_path: Path):
+    config = Config(prompts=["Prompt 1", "Prompt 2"], max_concurrency=1, output={"traces_dir": tmp_path / "output"})
+
+    with patch.object(CodexRunner, '_ensure_image'):
+        runner = CodexRunner(config)
+
+    claimed: list[str] = []
+
+    def fake_run_session(
+        prompt: str,
+        session_id: str | None = None,
+        progress_callback=None,
+        progress_base=None,
+        prompt_input=None,
+    ) -> Path:
+        claimed.append(prompt)
+        trace_file = tmp_path / f"{prompt.replace(' ', '_').lower()}.jsonl"
+        trace_file.write_text(
+            '{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"'
+            + prompt
+            + '"}]}}\n'
+            '{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done"}]}}\n',
+            encoding="utf-8",
+        )
+        return trace_file
+
+    with patch.object(runner, "run_session", side_effect=fake_run_session), \
+         patch.object(runner, "_summarize_trace_file_with_provider_stats", side_effect=AssertionError("provider stats should not block queue")):
+        results = runner.run_all(max_concurrency=1)
+
+    assert claimed == ["Prompt 1", "Prompt 2"]
+    assert [path.name for path in results] == ["prompt_1.jsonl", "prompt_2.jsonl"]
+
+
 def test_run_all_prequeues_all_prompts_before_workers_free_up(tmp_path: Path):
     config = Config(prompts=["Prompt 1", "Prompt 2", "Prompt 3"], max_concurrency=2)
 
@@ -2705,10 +2739,28 @@ def test_resume_treats_prompt_level_system_as_part_of_chat_completion_key(tmp_pa
 
     pending = pending_prompt_inputs_for_resume(prompt_inputs, output_dir)
 
-    assert [(item.prompt, item.system) for item in pending] == [
-        ("Hello", None),
-        ("Hello", "Be thorough."),
+    assert pending == []
+
+
+def test_resume_matches_completed_agent_trace_when_configured_prompt_has_system(tmp_path: Path):
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "pi.jsonl").write_text(
+        '{"type":"session","id":"pi-1"}\n'
+        '{"type":"message","message":{"role":"user","content":[{"type":"text","text":"Build app"}]}}\n'
+        '{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"Built"}]}}\n',
+        encoding="utf-8",
+    )
+    prompt_inputs = [
+        PromptInput(
+            prompt="Build app",
+            system="Use a specific system prompt that does not appear in native agent traces.",
+        )
     ]
+
+    pending = pending_prompt_inputs_for_resume(prompt_inputs, output_dir)
+
+    assert pending == []
 
 
 def test_resume_detects_completed_chat_follow_up_prompt_sets(tmp_path: Path):
