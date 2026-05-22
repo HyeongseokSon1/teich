@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
 from rich.console import Console
 from typer.testing import CliRunner
 
@@ -594,6 +595,87 @@ def test_batch_progress_reporter_marks_unknown_usage_as_na():
 
     assert "tokens=N/A cost=N/A" in output
     assert "minimax/minimax-m2.5:free" in output
+
+
+def test_batch_progress_reporter_accumulates_running_metric_deltas():
+    reporter = BatchProgressReporter(Console(record=True, width=160))
+
+    reporter.update(
+        SessionProgressUpdate(
+            prompt_id="running-1",
+            prompt_index=1,
+            total_prompts=1,
+            prompt="Build app",
+            prompt_preview="Build app",
+            status="running",
+            metrics=TraceMetrics(
+                input_tokens=10,
+                output_tokens=20,
+                total_tokens=30,
+                total_cost=0.10,
+                model="Opus-Agent",
+            ),
+            metrics_delta=True,
+        )
+    )
+    reporter.update(
+        SessionProgressUpdate(
+            prompt_id="running-1",
+            prompt_index=1,
+            total_prompts=1,
+            prompt="Build app",
+            prompt_preview="Build app",
+            status="running",
+            metrics=TraceMetrics(
+                input_tokens=5,
+                output_tokens=7,
+                total_tokens=12,
+                total_cost=0.05,
+                model="Opus-Agent",
+            ),
+            metrics_delta=True,
+        )
+    )
+
+    totals = reporter.snapshot_totals()
+
+    assert totals["input_tokens"] == 15
+    assert totals["output_tokens"] == 27
+    assert totals["total_tokens"] == 42
+    assert totals["total_cost"] == pytest.approx(0.15)
+
+
+def test_batch_progress_reporter_replaces_deltas_with_completed_metrics():
+    reporter = BatchProgressReporter(Console(record=True, width=160))
+
+    reporter.update(
+        SessionProgressUpdate(
+            prompt_id="running-1",
+            prompt_index=1,
+            total_prompts=1,
+            prompt="Build app",
+            prompt_preview="Build app",
+            status="running",
+            metrics=TraceMetrics(total_tokens=30, total_cost=0.10, model="Opus-Agent"),
+            metrics_delta=True,
+        )
+    )
+    reporter.update(
+        SessionProgressUpdate(
+            prompt_id="running-1",
+            prompt_index=1,
+            total_prompts=1,
+            prompt="Build app",
+            prompt_preview="Build app",
+            status="completed",
+            metrics=TraceMetrics(total_tokens=35, total_cost=0.12, model="Opus-Agent"),
+        )
+    )
+
+    totals = reporter.snapshot_totals()
+
+    assert totals["total_tokens"] == 35
+    assert totals["total_cost"] == pytest.approx(0.12)
 
 
 def test_batch_progress_reporter_refreshes_elapsed_without_status_update():

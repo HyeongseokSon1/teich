@@ -387,6 +387,14 @@ class BatchProgressReporter:
             previous = self._updates.get(update.prompt_id)
             if previous and update.started_at is None:
                 update.started_at = previous.started_at
+            if previous and update.metrics_delta and update.metrics is not None:
+                if previous.metrics is not None:
+                    metrics = previous.metrics.copy()
+                    metrics.add_metrics(update.metrics)
+                    update.metrics = metrics
+                update.metrics_delta = False
+            elif previous and update.metrics is None and update.status == "running":
+                update.metrics = previous.metrics
             self._updates[update.prompt_id] = update
             if self._live is not None:
                 self._live.update(self._render(), refresh=True)

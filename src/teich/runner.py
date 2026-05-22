@@ -623,6 +623,40 @@ class TraceMetrics:
         if self.has_token_usage and not self.est_total_tokens:
             self.est_total_tokens = self.total_tokens
 
+    def copy(self) -> TraceMetrics:
+        return TraceMetrics(
+            model=self.model,
+            provider=self.provider,
+            input_tokens=self.input_tokens,
+            output_tokens=self.output_tokens,
+            reasoning_tokens=self.reasoning_tokens,
+            cache_read_tokens=self.cache_read_tokens,
+            cache_write_tokens=self.cache_write_tokens,
+            total_tokens=self.total_tokens,
+            est_total_tokens=self.est_total_tokens,
+            total_cost=self.total_cost,
+            has_token_usage=self.has_token_usage,
+            has_cost=self.has_cost,
+        )
+
+    def add_metrics(self, metrics: TraceMetrics) -> None:
+        if metrics.model:
+            self.model = metrics.model
+        if metrics.provider:
+            self.provider = metrics.provider
+        if metrics.has_token_usage:
+            self.has_token_usage = True
+        self.input_tokens += metrics.input_tokens
+        self.output_tokens += metrics.output_tokens
+        self.reasoning_tokens += metrics.reasoning_tokens
+        self.cache_read_tokens += metrics.cache_read_tokens
+        self.cache_write_tokens += metrics.cache_write_tokens
+        self.total_tokens += metrics.total_tokens
+        self.est_total_tokens += metrics.est_total_tokens
+        if metrics.has_cost:
+            self.has_cost = True
+        self.total_cost += metrics.total_cost
+
 
 @dataclass(slots=True)
 class SessionProgressUpdate:
@@ -640,6 +674,7 @@ class SessionProgressUpdate:
     error: str | None = None
     details: str | None = None
     metrics: TraceMetrics | None = None
+    metrics_delta: bool = False
 
 
 SessionProgressCallback = Callable[[SessionProgressUpdate], None]
@@ -1270,6 +1305,7 @@ class DockerRuntimeRunner:
         stdout_offset = 0
         stdout_buffer = ""
         last_stdout_signature: tuple[str | None, tuple[object, ...] | None] | None = None
+        last_stdout_metrics_signature: tuple[object, ...] | None = None
         while True:
             return_code = process.poll()
             trace_path: Path | None = None
@@ -1281,9 +1317,15 @@ class DockerRuntimeRunner:
             )
             if stdout_events and progress_callback and progress_base:
                 stdout_metrics, stdout_details = self._stdout_progress_update(stdout_events)
+                stdout_metrics_signature = self._progress_metrics_signature(stdout_metrics)
+                if stdout_metrics_signature is not None:
+                    if stdout_metrics_signature == last_stdout_metrics_signature:
+                        stdout_metrics = None
+                    else:
+                        last_stdout_metrics_signature = stdout_metrics_signature
                 stdout_signature = (
                     stdout_details,
-                    self._progress_metrics_signature(stdout_metrics),
+                    stdout_metrics_signature,
                 )
                 if (stdout_details or stdout_metrics is not None) and stdout_signature != last_stdout_signature:
                     last_stdout_signature = stdout_signature
@@ -1299,6 +1341,7 @@ class DockerRuntimeRunner:
                             started_at=progress_base.started_at,
                             details=stdout_details,
                             metrics=stdout_metrics,
+                            metrics_delta=stdout_metrics is not None,
                         )
                     )
             if session_dir is not None:
