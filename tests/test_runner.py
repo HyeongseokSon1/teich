@@ -1112,49 +1112,76 @@ def test_pi_run_session_cleans_persistent_container_after_followup_failure(tmp_p
     assert "teich-pi-pi-failure" not in runner._active_containers
 
 
-def test_pi_run_session_retries_malformed_tool_call_failures(tmp_path: Path):
-    config = Config(agent={"provider": "pi"}, output={"traces_dir": tmp_path / "output", "sandbox_dir": tmp_path / "sandbox"})
+def test_pi_runner_preserves_tool_validation_failures_as_trace_events(tmp_path: Path):
+    config = Config(agent={"provider": "pi"}, output={"traces_dir": tmp_path / "output"})
 
     with patch.object(PiRunner, '_ensure_image'):
         runner = PiRunner(config)
 
-    trace_path = tmp_path / "output" / "pi.jsonl"
-    malformed_error = RuntimeError(
-        "Session pi-retry failed: Pi session produced malformed tool calls/results "
-        "(empty_tool_calls=0, empty_tool_results=0, empty_argument_validation_errors=1)."
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir(parents=True)
+    session_file = session_dir / "session.jsonl"
+    session_file.write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "session", "id": "pi-session"}),
+                json.dumps(
+                    {
+                        "type": "message",
+                        "id": "assistant-1",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "toolCall", "id": "call-1", "name": "bash", "arguments": {}},
+                            ],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "message",
+                        "id": "tool-1",
+                        "message": {
+                            "role": "toolResult",
+                            "toolCallId": "call-1",
+                            "toolName": "bash",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "Validation failed for tool \"bash\":\n  - command: must have required properties command\n\nReceived arguments:\n{}",
+                                }
+                            ],
+                            "isError": True,
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "message",
+                        "id": "assistant-2",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "I will correct the command."}],
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
     )
 
-    with patch.object(runner, "_run_process") as mock_run_process, \
-         patch.object(runner, "_write_pi_project_settings"), \
-         patch.object(
-             runner,
-             "_extract_session_file",
-             side_effect=[malformed_error, malformed_error, malformed_error, trace_path],
-         ) as mock_extract, \
-         patch.object(runner, "_copy_workspace_snapshot"):
-        result = runner.run_session("Build app", "pi-retry")
+    result = runner._extract_session_file(
+        "session-id",
+        session_dir,
+        datetime.fromtimestamp(0, tz=timezone.utc),
+    )
 
-    assert result == trace_path
-    assert mock_run_process.call_count == 4
-    assert mock_extract.call_count == 4
-
-
-def test_pi_run_session_stops_after_three_malformed_tool_call_retries(tmp_path: Path):
-    config = Config(agent={"provider": "pi"}, output={"traces_dir": tmp_path / "output", "sandbox_dir": tmp_path / "sandbox"})
-
-    with patch.object(PiRunner, '_ensure_image'):
-        runner = PiRunner(config)
-
-    malformed_error = RuntimeError("Pi session produced malformed tool calls/results")
-
-    with patch.object(runner, "_run_process") as mock_run_process, \
-         patch.object(runner, "_write_pi_project_settings"), \
-         patch.object(runner, "_extract_session_file", side_effect=malformed_error) as mock_extract:
-        with pytest.raises(RuntimeError, match="malformed tool calls/results"):
-            runner.run_session("Build app", "pi-retry-cap")
-
-    assert mock_run_process.call_count == 4
-    assert mock_extract.call_count == 4
+    exported = [json.loads(line) for line in result.read_text(encoding="utf-8").splitlines()]
+    assert exported[2]["message"]["role"] == "toolResult"
+    assert exported[2]["message"]["isError"] is True
+    assert "Validation failed for tool" in exported[2]["message"]["content"][0]["text"]
+    assert exported[3]["message"]["content"][0]["text"] == "I will correct the command."
 
 
 def test_pi_stdout_progress_reports_model_start_and_usage(tmp_path: Path):

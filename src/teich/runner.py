@@ -41,7 +41,6 @@ WORKSPACE_IN_CONTAINER = "/workspace"
 HERMES_DEFAULT_TOOLSETS = "safe,terminal,file,skills,memory,session_search,delegation"
 HERMES_AGGREGATE_TRACE_FILE_NAME = "hermes-agent.jsonl"
 HERMES_AGGREGATE_WRITE_LOCK = threading.Lock()
-PI_TOOL_CALL_MAX_RETRIES = 3
 PI_MALFORMED_TOOL_CALL_ERROR_PREFIX = "Pi session produced malformed tool calls/results"
 
 
@@ -4437,10 +4436,6 @@ class ChatRunner(DockerRuntimeRunner):
 class PiRunner(DockerRuntimeRunner):
     """Manages Docker-based Pi sessions."""
 
-    @staticmethod
-    def _is_malformed_tool_call_failure(exc: BaseException) -> bool:
-        return isinstance(exc, MalformedPiToolCallError) or PI_MALFORMED_TOOL_CALL_ERROR_PREFIX in str(exc)
-
     def _runtime_trace_guard_error(self, trace_path: Path) -> str | None:
         try:
             self._normalized_pi_trace_events(trace_path)
@@ -4820,7 +4815,6 @@ class PiRunner(DockerRuntimeRunner):
     def _validate_pi_trace_events(cls, events: list[dict[str, object]]) -> None:
         empty_tool_calls = 0
         empty_tool_results = 0
-        empty_argument_validation_errors = 0
         runtime_errors: list[str] = []
         for event in events:
             if event.get("type") != "message":
@@ -4855,20 +4849,17 @@ class PiRunner(DockerRuntimeRunner):
                 text = cls._pi_message_text(payload).strip()
                 if not tool_name.strip() or not tool_call_id.strip() or text == PI_EMPTY_TOOL_NOT_FOUND_TEXT:
                     empty_tool_results += 1
-                if text.startswith("Validation failed for tool ") and "Received arguments:\n{}" in text:
-                    empty_argument_validation_errors += 1
         if runtime_errors:
             raise RuntimeError(
                 "Pi session ended with model/provider error: "
                 f"{runtime_errors[0]}. "
                 "This trace was not exported because the model/provider did not produce a successful assistant response."
             )
-        if not empty_tool_calls and not empty_tool_results and not empty_argument_validation_errors:
+        if not empty_tool_calls and not empty_tool_results:
             return
         raise MalformedPiToolCallError(
             f"{PI_MALFORMED_TOOL_CALL_ERROR_PREFIX} "
-            f"(empty_tool_calls={empty_tool_calls}, empty_tool_results={empty_tool_results}, "
-            f"empty_argument_validation_errors={empty_argument_validation_errors}). "
+            f"(empty_tool_calls={empty_tool_calls}, empty_tool_results={empty_tool_results}). "
             "This trace was not exported because the model/provider emitted corrupted tool invocations."
         )
 
@@ -4947,34 +4938,6 @@ class PiRunner(DockerRuntimeRunner):
             session_id = str(uuid.uuid4())
         if self.config.mcp_servers:
             raise RuntimeError("Pi runner does not support mcp_servers in v2 yet")
-
-        last_malformed_error: RuntimeError | None = None
-        for attempt in range(PI_TOOL_CALL_MAX_RETRIES + 1):
-            try:
-                return self._run_session_once(
-                    prompt,
-                    session_id,
-                    progress_callback=progress_callback,
-                    progress_base=progress_base,
-                    prompt_input=prompt_input,
-                )
-            except RuntimeError as exc:
-                if self._is_malformed_tool_call_failure(exc) and attempt < PI_TOOL_CALL_MAX_RETRIES:
-                    last_malformed_error = exc
-                    continue
-                raise
-        if last_malformed_error is not None:
-            raise last_malformed_error
-        raise RuntimeError(f"Session {session_id[:8]} failed")
-
-    def _run_session_once(
-        self,
-        prompt: str,
-        session_id: str,
-        progress_callback: SessionProgressCallback | None = None,
-        progress_base: SessionProgressUpdate | None = None,
-        prompt_input: PromptInput | None = None,
-    ) -> Path:
 
         workspace_root, workspace = self._prepare_workspace(session_id, prompt_input, "pi")
         agent_dir = Path(tempfile.mkdtemp(prefix=f"pi-agent-{session_id}-"))
