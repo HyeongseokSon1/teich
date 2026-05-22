@@ -4318,6 +4318,8 @@ class PiRunner(DockerRuntimeRunner):
         return sorted(path for path in session_dir.rglob("*.jsonl") if path.is_file())
 
     def _pi_provider_api(self) -> str:
+        if self._normalize_provider(self.config.api.provider) == "openrouter":
+            return "openai-completions"
         wire_api = self.config.api.wire_api.strip().lower()
         if wire_api in {"completions", "chat_completions", "chat-completions", "openai-completions"}:
             return "openai-completions"

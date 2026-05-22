@@ -572,6 +572,8 @@ api:
   provider: openrouter
   base_url: https://openrouter.ai/api/v1
   api_key: null
+  # Pi uses OpenRouter through chat/completions even if this is set to responses;
+  # the Responses adapter can stall before the first native session event.
   wire_api: responses
 
 # Optional MCP servers exposed inside the agent runtime.

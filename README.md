@@ -217,7 +217,7 @@ Recommended `prompts.jsonl`:
 ### Provider notes
 
 - `codex` copies the native Codex session JSONL out of the mounted `CODEX_HOME/sessions` directory, then normalizes known Codex event-shape edge cases.
-- `pi` copies the native Pi session JSONL out of the mounted `/home/codex/pi-sessions` directory, then normalizes and validates tool-call structure before writing output.
+- `pi` copies the native Pi session JSONL out of the mounted `/home/codex/pi-sessions` directory, then normalizes and validates tool-call structure before writing output. For OpenRouter, Teich forces Pi onto the chat/completions wire path because Pi's OpenRouter Responses adapter can stall before the first session event.
 - `claude-code` copies Claude Code's native transcript JSONL from `.claude/projects/...` so the output keeps Claude's own `user`, `assistant`, `system`, and `result` event format. With OpenRouter non-Claude models, Teich runs a local in-container proxy: Claude Code sees a Claude surrogate model name, while the proxy rewrites outbound requests back to the configured model. The native assistant/result events keep the provider-returned model and usage fields when Claude Code records them.
 - `hermes` runs with built-in toolsets `safe,terminal,file,skills,memory,session_search,delegation`, then exports Hermes Agent `state.db` sessions using the native `export_all(source="cli")` session shape: one session object per JSONL file with a nested `messages` list. Delegated subagents remain separate trace files rather than being merged into the orchestrator session; child traces include `parent_session_id`.
 - `chat` calls an OpenAI-compatible API directly and writes structured training rows instead of raw agent traces.

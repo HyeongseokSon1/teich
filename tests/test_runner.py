@@ -3234,7 +3234,7 @@ def test_pi_runner_applies_optional_model_overrides_for_builtin_openrouter():
     }
 
 
-def test_pi_runner_applies_default_max_tokens_override_for_builtin_openrouter():
+def test_pi_runner_uses_completions_for_builtin_openrouter_even_when_config_says_responses():
     with patch.object(PiRunner, '_ensure_image'):
         runner = PiRunner(
             Config(
@@ -3251,7 +3251,7 @@ def test_pi_runner_applies_default_max_tokens_override_for_builtin_openrouter():
 
     assert runner._pi_provider_settings() == {
         "baseUrl": "https://openrouter.ai/api/v1",
-        "api": "openai-responses",
+        "api": "openai-completions",
         "authHeader": True,
         "modelOverrides": {
             "google/gemma-4-26b-it": {
