@@ -41,6 +41,12 @@ WORKSPACE_IN_CONTAINER = "/workspace"
 HERMES_DEFAULT_TOOLSETS = "safe,terminal,file,skills,memory,session_search,delegation"
 HERMES_AGGREGATE_TRACE_FILE_NAME = "hermes-agent.jsonl"
 HERMES_AGGREGATE_WRITE_LOCK = threading.Lock()
+PI_TOOL_CALL_MAX_RETRIES = 3
+PI_MALFORMED_TOOL_CALL_ERROR_PREFIX = "Pi session produced malformed tool calls/results"
+
+
+class MalformedPiToolCallError(RuntimeError):
+    """Raised when Pi emits invalid tool-call trace events."""
 
 
 def _make_tree_world_writable(path: Path) -> None:
@@ -1869,7 +1875,9 @@ class DockerRuntimeRunner:
             emit_queued(prompt_index, prompt_input)
 
         def worker() -> None:
-            while not stop_event.is_set():
+            while True:
+                if stop_event.is_set():
+                    return
                 try:
                     prompt_index, prompt_input = prompt_queue.get_nowait()
                 except queue.Empty:
@@ -1885,7 +1893,6 @@ class DockerRuntimeRunner:
                 except Exception as exc:
                     with result_lock:
                         errors.append(exc)
-                    stop_event.set()
                 else:
                     with result_lock:
                         results_by_index[prompt_index] = result
@@ -4342,7 +4349,9 @@ class ChatRunner(DockerRuntimeRunner):
             emit_queued(prompt_index, prompt_input)
 
         def worker() -> None:
-            while not stop_event.is_set():
+            while True:
+                if stop_event.is_set():
+                    return
                 try:
                     prompt_index, prompt_input = prompt_queue.get_nowait()
                 except queue.Empty:
@@ -4369,7 +4378,6 @@ class ChatRunner(DockerRuntimeRunner):
                 except Exception as exc:
                     with error_lock:
                         errors.append(exc)
-                    stop_event.set()
                 finally:
                     with running_lock:
                         running.pop(prompt_index, None)
@@ -4428,6 +4436,10 @@ class ChatRunner(DockerRuntimeRunner):
 
 class PiRunner(DockerRuntimeRunner):
     """Manages Docker-based Pi sessions."""
+
+    @staticmethod
+    def _is_malformed_tool_call_failure(exc: BaseException) -> bool:
+        return isinstance(exc, MalformedPiToolCallError) or PI_MALFORMED_TOOL_CALL_ERROR_PREFIX in str(exc)
 
     def _runtime_trace_guard_error(self, trace_path: Path) -> str | None:
         try:
@@ -4853,8 +4865,8 @@ class PiRunner(DockerRuntimeRunner):
             )
         if not empty_tool_calls and not empty_tool_results and not empty_argument_validation_errors:
             return
-        raise RuntimeError(
-            "Pi session produced malformed tool calls/results "
+        raise MalformedPiToolCallError(
+            f"{PI_MALFORMED_TOOL_CALL_ERROR_PREFIX} "
             f"(empty_tool_calls={empty_tool_calls}, empty_tool_results={empty_tool_results}, "
             f"empty_argument_validation_errors={empty_argument_validation_errors}). "
             "This trace was not exported because the model/provider emitted corrupted tool invocations."
@@ -4935,6 +4947,34 @@ class PiRunner(DockerRuntimeRunner):
             session_id = str(uuid.uuid4())
         if self.config.mcp_servers:
             raise RuntimeError("Pi runner does not support mcp_servers in v2 yet")
+
+        last_malformed_error: RuntimeError | None = None
+        for attempt in range(PI_TOOL_CALL_MAX_RETRIES + 1):
+            try:
+                return self._run_session_once(
+                    prompt,
+                    session_id,
+                    progress_callback=progress_callback,
+                    progress_base=progress_base,
+                    prompt_input=prompt_input,
+                )
+            except RuntimeError as exc:
+                if self._is_malformed_tool_call_failure(exc) and attempt < PI_TOOL_CALL_MAX_RETRIES:
+                    last_malformed_error = exc
+                    continue
+                raise
+        if last_malformed_error is not None:
+            raise last_malformed_error
+        raise RuntimeError(f"Session {session_id[:8]} failed")
+
+    def _run_session_once(
+        self,
+        prompt: str,
+        session_id: str,
+        progress_callback: SessionProgressCallback | None = None,
+        progress_base: SessionProgressUpdate | None = None,
+        prompt_input: PromptInput | None = None,
+    ) -> Path:
 
         workspace_root, workspace = self._prepare_workspace(session_id, prompt_input, "pi")
         agent_dir = Path(tempfile.mkdtemp(prefix=f"pi-agent-{session_id}-"))

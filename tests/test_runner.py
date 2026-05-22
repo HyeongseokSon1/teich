@@ -1112,6 +1112,51 @@ def test_pi_run_session_cleans_persistent_container_after_followup_failure(tmp_p
     assert "teich-pi-pi-failure" not in runner._active_containers
 
 
+def test_pi_run_session_retries_malformed_tool_call_failures(tmp_path: Path):
+    config = Config(agent={"provider": "pi"}, output={"traces_dir": tmp_path / "output", "sandbox_dir": tmp_path / "sandbox"})
+
+    with patch.object(PiRunner, '_ensure_image'):
+        runner = PiRunner(config)
+
+    trace_path = tmp_path / "output" / "pi.jsonl"
+    malformed_error = RuntimeError(
+        "Session pi-retry failed: Pi session produced malformed tool calls/results "
+        "(empty_tool_calls=0, empty_tool_results=0, empty_argument_validation_errors=1)."
+    )
+
+    with patch.object(runner, "_run_process") as mock_run_process, \
+         patch.object(runner, "_write_pi_project_settings"), \
+         patch.object(
+             runner,
+             "_extract_session_file",
+             side_effect=[malformed_error, malformed_error, malformed_error, trace_path],
+         ) as mock_extract, \
+         patch.object(runner, "_copy_workspace_snapshot"):
+        result = runner.run_session("Build app", "pi-retry")
+
+    assert result == trace_path
+    assert mock_run_process.call_count == 4
+    assert mock_extract.call_count == 4
+
+
+def test_pi_run_session_stops_after_three_malformed_tool_call_retries(tmp_path: Path):
+    config = Config(agent={"provider": "pi"}, output={"traces_dir": tmp_path / "output", "sandbox_dir": tmp_path / "sandbox"})
+
+    with patch.object(PiRunner, '_ensure_image'):
+        runner = PiRunner(config)
+
+    malformed_error = RuntimeError("Pi session produced malformed tool calls/results")
+
+    with patch.object(runner, "_run_process") as mock_run_process, \
+         patch.object(runner, "_write_pi_project_settings"), \
+         patch.object(runner, "_extract_session_file", side_effect=malformed_error) as mock_extract:
+        with pytest.raises(RuntimeError, match="malformed tool calls/results"):
+            runner.run_session("Build app", "pi-retry-cap")
+
+    assert mock_run_process.call_count == 4
+    assert mock_extract.call_count == 4
+
+
 def test_pi_stdout_progress_reports_model_start_and_usage(tmp_path: Path):
     config = Config(agent={"provider": "pi"}, output={"traces_dir": tmp_path / "output"})
     with patch.object(PiRunner, '_ensure_image'):
@@ -1418,13 +1463,13 @@ def test_run_all_starts_next_queued_prompt_when_one_worker_finishes(tmp_path: Pa
     assert [path.name for path in result_holder["results"]] == ["prompt-1.jsonl", "prompt-2.jsonl", "prompt-3.jsonl"]
 
 
-def test_run_all_stops_claiming_agent_prompts_after_failure(tmp_path: Path):
+def test_run_all_continues_claiming_agent_prompts_after_failure(tmp_path: Path):
     config = Config(prompts=["Prompt 1", "Prompt 2", "Prompt 3"], max_concurrency=1)
 
     with patch.object(CodexRunner, '_ensure_image'):
         runner = CodexRunner(config)
 
-    trace_paths = {"Prompt 1": tmp_path / "first.jsonl"}
+    trace_paths = {"Prompt 1": tmp_path / "first.jsonl", "Prompt 3": tmp_path / "third.jsonl"}
 
     def fake_run_session(
         prompt: str,
@@ -1444,8 +1489,9 @@ def test_run_all_stops_claiming_agent_prompts_after_failure(tmp_path: Path):
             runner.run_all(max_concurrency=1)
 
     assert trace_paths["Prompt 1"].exists()
+    assert trace_paths["Prompt 3"].exists()
     assert json.loads(trace_paths["Prompt 1"].read_text(encoding="utf-8")) == {"prompt": "Prompt 1"}
-    assert not (tmp_path / "third.jsonl").exists()
+    assert json.loads(trace_paths["Prompt 3"].read_text(encoding="utf-8")) == {"prompt": "Prompt 3"}
 
 
 def test_run_all_propagates_keyboard_interrupt_without_waiting_for_agent_workers(tmp_path: Path):
@@ -2772,7 +2818,7 @@ def test_chat_runner_run_all_preserves_completed_rows_when_later_prompt_fails(tm
         agent={"provider": "chat"},
         model=ModelConfig(model="gpt-4.1-mini"),
         api=APIConfig(provider="openai", api_key="sk-test", wire_api="responses"),
-        prompts=["Hello", "Who are you?"],
+        prompts=["Hello", "Who are you?", "Continue anyway"],
         output={"traces_dir": tmp_path / "output"},
     )
     runner = ChatRunner(config)
@@ -2800,7 +2846,7 @@ def test_chat_runner_run_all_preserves_completed_rows_when_later_prompt_fails(tm
     destination = tmp_path / "output" / "chat.jsonl"
     assert destination.exists()
     rows = [json.loads(line) for line in destination.read_text(encoding="utf-8").splitlines()]
-    assert [row["prompt"] for row in rows] == ["Hello"]
+    assert [row["prompt"] for row in rows] == ["Hello", "Continue anyway"]
 
 
 def test_resume_detects_completed_chat_prompts(tmp_path: Path):
@@ -3243,7 +3289,7 @@ def test_chat_runner_resume_continues_queue_after_first_concurrency_window(tmp_p
     assert claimed == [item.prompt for item in prompt_inputs]
 
 
-def test_chat_runner_stops_claiming_new_prompts_after_failure(tmp_path: Path):
+def test_chat_runner_continues_claiming_new_prompts_after_failure(tmp_path: Path):
     config = Config(
         agent={"provider": "chat"},
         model=ModelConfig(model="gpt-4.1-mini"),
@@ -3271,7 +3317,7 @@ def test_chat_runner_stops_claiming_new_prompts_after_failure(tmp_path: Path):
         with pytest.raises(RuntimeError, match="boom"):
             runner.run_all(max_concurrency=2)
 
-    assert set(claimed) == {"prompt-1", "prompt-2"}
+    assert set(claimed) == {"prompt-1", "prompt-2", "prompt-3", "prompt-4"}
 
 
 def test_chat_run_all_times_out_hung_worker_without_waiting_forever(tmp_path: Path):
