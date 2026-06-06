@@ -346,7 +346,6 @@ const server = http.createServer(async (req, res) => {
   const headers = { ...req.headers };
   delete headers.host;
   delete headers['content-length'];
-  headers['accept-encoding'] = 'identity';
 
   try {
     const body = req.method === 'GET' || req.method === 'HEAD' ? undefined : await readRequestBody(req);
@@ -444,7 +443,6 @@ const server = http.createServer(async (req, res) => {
   const headers = { ...req.headers };
   delete headers.host;
   delete headers['content-length'];
-  headers['accept-encoding'] = 'identity';
   const apiKey = headers['x-api-key'] || headers.authorization?.replace(/^Bearer\\s+/i, '');
   if (apiKey && !headers.authorization) {
     headers.authorization = `Bearer ${apiKey}`;
@@ -3028,14 +3026,12 @@ class ClaudeCodeRunner(ExternalCliRunner):
             return []
         return sorted(path for path in projects_dir.rglob("*.jsonl") if path.is_file())
 
-    def _extract_native_session_file(
+    def _latest_native_session_file(
         self,
-        session_id: str,
         home_dir: Path,
         existing_sessions: set[Path],
         started_at: datetime,
-    ) -> Path:
-        _make_tree_world_writable(home_dir)
+    ) -> Path | None:
         session_files = self._list_native_session_files(home_dir)
         fresh_files = [path for path in session_files if path.resolve() not in existing_sessions]
         if not fresh_files:
@@ -3045,8 +3041,20 @@ class ClaudeCodeRunner(ExternalCliRunner):
                 if datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc) >= started_at
             ]
         if not fresh_files:
+            return None
+        return max(fresh_files, key=lambda path: path.stat().st_mtime)
+
+    def _extract_native_session_file(
+        self,
+        session_id: str,
+        home_dir: Path,
+        existing_sessions: set[Path],
+        started_at: datetime,
+    ) -> Path:
+        _make_tree_world_writable(home_dir)
+        source_path = self._latest_native_session_file(home_dir, existing_sessions, started_at)
+        if source_path is None:
             raise RuntimeError(f"No Claude Code native session file found for {session_id}")
-        source_path = max(fresh_files, key=lambda path: path.stat().st_mtime)
         destination = self._resolve_output_path(source_path.name)
         destination.parent.mkdir(parents=True, exist_ok=True)
         self._copy_normalized_native_session_file(source_path, destination)
@@ -3196,6 +3204,119 @@ class ClaudeCodeRunner(ExternalCliRunner):
         command.extend(["bash", "-lc", f"{self._openrouter_proxy_shell_prefix()}exec sleep infinity"])
         return command
 
+    def _run_native_process_with_progress(
+        self,
+        command: list[str],
+        container_name: str | None,
+        *,
+        session_id: str,
+        home_dir: Path,
+        existing_sessions: set[Path],
+        started_at: datetime,
+        progress_callback: SessionProgressCallback | None,
+        progress_base: SessionProgressUpdate | None,
+    ) -> tuple[str, str]:
+        process: subprocess.Popen[str] | None = None
+        stdout_handle = tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace")
+        stderr_handle = tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace")
+        try:
+            try:
+                process = subprocess.Popen(
+                    command,
+                    stdout=stdout_handle,
+                    stderr=stderr_handle,
+                    **TEXT_SUBPROCESS_KWARGS,
+                )
+            except FileNotFoundError as exc:
+                if shutil.which(command[0]) is None:
+                    raise RuntimeError(
+                        "Docker runtime not available. Ensure Docker is installed and the runtime image can be built."
+                    ) from exc
+                raise RuntimeError(f"Failed to start Docker runtime process: {exc}") from exc
+
+            self._register_active_process(process, container_name)
+            deadline = time.monotonic() + self.config.timeout_seconds
+            last_signature: tuple[str, int, float] | None = None
+            last_heartbeat = 0.0
+            while True:
+                return_code = process.poll()
+                trace_path = self._latest_native_session_file(home_dir, existing_sessions, started_at)
+                if trace_path is not None:
+                    try:
+                        stat = trace_path.stat()
+                    except OSError:
+                        stat = None
+                    if stat is not None:
+                        signature = (str(trace_path), stat.st_size, stat.st_mtime)
+                        if signature != last_signature:
+                            last_signature = signature
+                            metrics: TraceMetrics | None
+                            try:
+                                metrics = self._summarize_trace_file(trace_path)
+                            except (OSError, json.JSONDecodeError, ValueError):
+                                metrics = None
+                            if progress_callback and progress_base:
+                                progress_callback(
+                                    SessionProgressUpdate(
+                                        prompt_id=progress_base.prompt_id,
+                                        prompt_index=progress_base.prompt_index,
+                                        total_prompts=progress_base.total_prompts,
+                                        prompt=progress_base.prompt,
+                                        prompt_preview=progress_base.prompt_preview,
+                                        status="running",
+                                        session_id=session_id,
+                                        started_at=progress_base.started_at,
+                                        trace_path=trace_path,
+                                        details=f"Claude trace: {trace_path.name}",
+                                        metrics=metrics,
+                                    )
+                                )
+                elif progress_callback and progress_base and time.monotonic() - last_heartbeat >= 5.0:
+                    last_heartbeat = time.monotonic()
+                    progress_callback(
+                        SessionProgressUpdate(
+                            prompt_id=progress_base.prompt_id,
+                            prompt_index=progress_base.prompt_index,
+                            total_prompts=progress_base.total_prompts,
+                            prompt=progress_base.prompt,
+                            prompt_preview=progress_base.prompt_preview,
+                            status="running",
+                            session_id=session_id,
+                            started_at=progress_base.started_at,
+                            details="waiting for Claude Code trace",
+                        )
+                    )
+
+                if return_code is not None:
+                    stdout_handle.flush()
+                    stderr_handle.flush()
+                    stdout_handle.seek(0)
+                    stderr_handle.seek(0)
+                    stdout = stdout_handle.read()
+                    stderr = stderr_handle.read()
+                    if return_code:
+                        raise subprocess.CalledProcessError(
+                            return_code,
+                            process.args,
+                            output=stdout,
+                            stderr=stderr,
+                        )
+                    return stdout, stderr
+                if time.monotonic() >= deadline:
+                    process.kill()
+                    stdout, stderr = process.communicate()
+                    raise RuntimeError(f"Session timed out after {self.config.timeout_seconds}s")
+                time.sleep(0.5)
+        except BaseException:
+            if process is not None:
+                self._terminate_process(process, container_name)
+            raise
+        finally:
+            if process is not None:
+                self._unregister_active_process(process)
+            stdout_handle.close()
+            stderr_handle.close()
+
     def run_session(
         self,
         prompt: str,
@@ -3236,7 +3357,16 @@ class ClaudeCodeRunner(ExternalCliRunner):
                         continue_session=turn_index > 0,
                     )
                 try:
-                    self._run_external_process(command, container_name)
+                    self._run_native_process_with_progress(
+                        command,
+                        container_name,
+                        session_id=session_id,
+                        home_dir=home_dir,
+                        existing_sessions=existing_sessions,
+                        started_at=started_at,
+                        progress_callback=progress_callback,
+                        progress_base=progress_base,
+                    )
                 except subprocess.CalledProcessError as exc:
                     stderr = exc.stderr if isinstance(exc.stderr, str) else (exc.stderr or "")
                     stdout = exc.output if isinstance(exc.output, str) else (exc.output or "")

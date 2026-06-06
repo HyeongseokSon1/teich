@@ -1,5 +1,6 @@
 """Tests for runner module."""
 
+import concurrent.futures
 from datetime import datetime, timedelta, timezone
 import gzip
 import io
@@ -11,6 +12,7 @@ import shutil
 import socket
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 from urllib.request import Request, urlopen
@@ -29,6 +31,7 @@ from teich.runner import (
     HermesRunner,
     PiRunner,
     RUNTIME_CONTAINER_USER,
+    SessionProgressUpdate,
     pending_prompt_inputs_for_resume,
 )
 
@@ -535,11 +538,11 @@ def test_claude_code_runner_uses_stream_json_and_prompt_file(tmp_path: Path):
     with patch.object(ClaudeCodeRunner, "_ensure_image"):
         runner = ClaudeCodeRunner(config)
 
-    def fake_run(command: list[str], _container_name: str | None) -> tuple[str, str]:
+    def fake_run(command: list[str], _container_name: str | None, **_kwargs: object) -> tuple[str, str]:
         _write_fake_claude_native_session(command, prompt=long_prompt)
         return '{"type":"result","result":"done"}\n', ""
 
-    with patch.object(runner, "_run_external_process", side_effect=fake_run) as mock_run, \
+    with patch.object(runner, "_run_native_process_with_progress", side_effect=fake_run) as mock_run, \
          patch.object(runner, "_copy_workspace_snapshot"):
         trace_path = runner.run_session(long_prompt, "claude-session")
 
@@ -574,11 +577,11 @@ def test_claude_code_runner_uses_openrouter_anthropic_skin_auth(tmp_path: Path):
     with patch.object(ClaudeCodeRunner, "_ensure_image"):
         runner = ClaudeCodeRunner(config)
 
-    def fake_run(command: list[str], _container_name: str | None) -> tuple[str, str]:
+    def fake_run(command: list[str], _container_name: str | None, **_kwargs: object) -> tuple[str, str]:
         _write_fake_claude_native_session(command, prompt="smoke", model="minimax/minimax-m2.5:free")
         return '{"type":"result","result":"done"}\n', ""
 
-    with patch.object(runner, "_run_external_process", side_effect=fake_run) as mock_run, \
+    with patch.object(runner, "_run_native_process_with_progress", side_effect=fake_run) as mock_run, \
          patch.object(runner, "_copy_workspace_snapshot"):
         trace_path = runner.run_session("smoke", "claude-openrouter-session")
 
@@ -665,7 +668,7 @@ def test_claude_openrouter_proxy_strips_decoded_compression_headers(tmp_path: Pa
         assert body == response_payload
         assert "content-encoding" not in headers
         assert "content-length" not in headers
-        assert seen["accept_encoding"] == "identity"
+        assert seen["accept_encoding"] == "gzip, deflate, br"
         assert seen["authorization"] == "Bearer sk-test"
         assert seen["path"] == "/v1/messages?beta=true"
         assert seen["body"] == {"model": "minimax/minimax-m3"}
@@ -678,6 +681,170 @@ def test_claude_openrouter_proxy_strips_decoded_compression_headers(tmp_path: Pa
             process.wait(timeout=2)
         server.shutdown()
         server.server_close()
+
+
+def test_claude_openrouter_proxy_handles_requests_concurrently(tmp_path: Path):
+    if shutil.which("node") is None:
+        pytest.skip("node is required for the proxy smoke test")
+
+    upstream_port = _free_tcp_port()
+    proxy_port = _free_tcp_port()
+    request_count = 5
+    response_delay = 0.35
+    stats = {"inflight": 0, "max_inflight": 0, "requests": 0}
+    stats_lock = threading.Lock()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            length = int(self.headers.get("content-length", "0"))
+            if length:
+                self.rfile.read(length)
+            with stats_lock:
+                stats["inflight"] += 1
+                stats["requests"] += 1
+                stats["max_inflight"] = max(stats["max_inflight"], stats["inflight"])
+            try:
+                time.sleep(response_delay)
+                payload = json.dumps({"ok": True, "path": self.path}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            finally:
+                with stats_lock:
+                    stats["inflight"] -= 1
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", upstream_port), Handler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    proxy_script = tmp_path / "claude_openrouter_proxy.js"
+    proxy_script.write_text(CLAUDE_OPENROUTER_PROXY_SCRIPT + "\n", encoding="utf-8")
+    process = subprocess.Popen(
+        ["node", str(proxy_script)],
+        env={
+            **os.environ,
+            "TEICH_CLAUDE_PROXY_TARGET": f"http://127.0.0.1:{upstream_port}/v1",
+            "TEICH_CLAUDE_PROXY_TARGET_MODEL": "minimax/minimax-m3",
+            "TEICH_CLAUDE_PROXY_PORT": str(proxy_port),
+        },
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    def send_request(index: int) -> bytes:
+        request = Request(
+            f"http://127.0.0.1:{proxy_port}/v1/messages?request={index}",
+            data=json.dumps({"model": "claude-sonnet-4-6"}).encode("utf-8"),
+            headers={"content-type": "application/json", "x-api-key": "sk-test"},
+            method="POST",
+        )
+        with urlopen(request, timeout=5) as response:
+            return response.read()
+
+    try:
+        _wait_for_tcp_port(proxy_port)
+        started = time.perf_counter()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=request_count) as executor:
+            bodies = list(executor.map(send_request, range(request_count)))
+        elapsed = time.perf_counter() - started
+
+        assert len(bodies) == request_count
+        assert stats["requests"] == request_count
+        assert stats["max_inflight"] >= 2
+        assert elapsed < response_delay * request_count
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2)
+        server.shutdown()
+        server.server_close()
+
+
+def test_claude_code_native_process_emits_live_trace_progress(tmp_path: Path):
+    config = Config(
+        agent={"provider": "claude-code"},
+        api=APIConfig(provider="anthropic", api_key="none"),
+        model=ModelConfig(model="claude-opus-4-6"),
+        output={"traces_dir": tmp_path / "output", "sandbox_dir": tmp_path / "sandbox"},
+        timeout_seconds=5,
+    )
+    with patch.object(ClaudeCodeRunner, "_ensure_image"):
+        runner = ClaudeCodeRunner(config)
+
+    home_dir = tmp_path / "claude-home"
+    native_trace = home_dir / "projects" / "-workspace" / "live.jsonl"
+    trace_text = (
+        json.dumps(
+            {
+                "type": "user",
+                "sessionId": "claude-live",
+                "message": {"role": "user", "content": "Build app"},
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "type": "assistant",
+                "sessionId": "claude-live",
+                "message": {
+                    "role": "assistant",
+                    "model": "claude-opus-4-6",
+                    "content": [{"type": "text", "text": "Working on it."}],
+                    "usage": {"input_tokens": 11, "output_tokens": 4},
+                },
+            }
+        )
+        + "\n"
+    )
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import pathlib, sys, time;"
+            "p=pathlib.Path(sys.argv[1]);"
+            "p.parent.mkdir(parents=True, exist_ok=True);"
+            "time.sleep(0.1);"
+            "p.write_text(sys.argv[2], encoding='utf-8');"
+            "time.sleep(0.6)"
+        ),
+        str(native_trace),
+        trace_text,
+    ]
+    started_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    updates: list[SessionProgressUpdate] = []
+    progress_base = SessionProgressUpdate(
+        prompt_id="prompt-1",
+        prompt_index=1,
+        total_prompts=1,
+        prompt="Build app",
+        prompt_preview="Build app",
+        status="running",
+        session_id="claude-live",
+        started_at=started_at,
+    )
+
+    runner._run_native_process_with_progress(
+        command,
+        None,
+        session_id="claude-live",
+        home_dir=home_dir,
+        existing_sessions=set(),
+        started_at=started_at,
+        progress_callback=updates.append,
+        progress_base=progress_base,
+    )
+
+    trace_updates = [update for update in updates if update.trace_path == native_trace]
+    assert trace_updates
+    assert any(update.details == "Claude trace: live.jsonl" for update in trace_updates)
 
 
 def test_claude_code_runner_uses_proxy_for_custom_non_claude_model(tmp_path: Path):
@@ -694,7 +861,7 @@ def test_claude_code_runner_uses_proxy_for_custom_non_claude_model(tmp_path: Pat
     with patch.object(ClaudeCodeRunner, "_ensure_image"):
         runner = ClaudeCodeRunner(config)
 
-    with patch.object(runner, "_run_external_process") as mock_run, \
+    with patch.object(runner, "_run_native_process_with_progress") as mock_run, \
          patch.object(runner, "_extract_native_session_file", return_value=tmp_path / "output" / "trace.jsonl"), \
          patch.object(runner, "_copy_workspace_snapshot"):
         runner.run_session("smoke", "claude-custom-session")
@@ -744,7 +911,7 @@ def test_claude_code_run_session_salvages_complete_trace_after_nonzero_exit(tmp_
     )
     exit_error = subprocess.CalledProcessError(1, ["claude"], output="", stderr="exited after writing trace")
 
-    with patch.object(runner, "_run_external_process", side_effect=exit_error), \
+    with patch.object(runner, "_run_native_process_with_progress", side_effect=exit_error), \
          patch.object(runner, "_extract_native_session_file", return_value=trace_path) as mock_extract, \
          patch.object(runner, "_copy_workspace_snapshot") as mock_copy_snapshot:
         result = runner.run_session("Build app", "claude-salvage")
@@ -891,7 +1058,7 @@ def test_claude_code_runner_uses_continue_for_followups(tmp_path: Path):
         nonlocal native_home
         native_home = _claude_home_from_command(command)
 
-    def fake_run(command: list[str], _container_name: str | None) -> tuple[str, str]:
+    def fake_run(command: list[str], _container_name: str | None, **_kwargs: object) -> tuple[str, str]:
         if native_home is None:
             _write_fake_claude_native_session(command, prompt="Build app")
         else:
@@ -914,7 +1081,7 @@ def test_claude_code_runner_uses_continue_for_followups(tmp_path: Path):
         return '{"type":"result","result":"done"}\n', ""
 
     with patch.object(runner, "_start_container", side_effect=fake_start) as mock_start, \
-         patch.object(runner, "_run_external_process", side_effect=fake_run) as mock_run, \
+         patch.object(runner, "_run_native_process_with_progress", side_effect=fake_run) as mock_run, \
          patch.object(runner, "_copy_workspace_snapshot"), \
          patch.object(runner, "_remove_container") as mock_remove:
         runner.run_session(prompt_input.prompt, "claude-followups", prompt_input=prompt_input)
