@@ -1,7 +1,12 @@
 import json
 from pathlib import Path
 
-from teich.converter import convert_trace_to_training_example, convert_traces_to_training_data
+from teich.converter import (
+    convert_trace_to_training_example,
+    convert_traces_to_training_data,
+    normalize_claude_code_trace_events,
+    normalize_codex_trace_events,
+)
 
 
 def test_convert_pi_trace_ignores_malformed_tool_calls(tmp_path: Path):
@@ -400,7 +405,7 @@ def test_convert_native_claude_code_transcript_with_camel_session_id(tmp_path: P
     assert {"Bash", "Read", "Edit", "TodoWrite"}.issubset(tool_names)
 
 
-def test_convert_native_claude_code_merges_fragmented_assistant_turns(tmp_path: Path):
+def test_convert_native_claude_code_orders_fragmented_assistant_turn_semantically(tmp_path: Path):
     trace_file = tmp_path / "native-fragmented-claude.jsonl"
     events = [
         {
@@ -460,8 +465,8 @@ def test_convert_native_claude_code_merges_fragmented_assistant_turns(tmp_path: 
     assert len(example.messages) == 2
     assert example.messages[0] == {"role": "user", "content": "Update the server"}
     assert example.messages[1]["role"] == "assistant"
-    assert example.messages[1]["reasoning_content"] == "The timeout should be configurable and covered by tests."
     assert example.messages[1]["content"] == "I'll update the timeout handling."
+    assert example.messages[1]["reasoning_content"] == "The timeout should be configurable and covered by tests."
     assert example.messages[1]["tool_calls"] == [
         {
             "id": "toolu_1",
@@ -788,6 +793,353 @@ def test_convert_trace_accumulates_multiple_reasoning_events(tmp_path: Path):
 
     assert example.messages[-1]["role"] == "assistant"
     assert example.messages[-1]["reasoning_content"] == "First thought.\n\nSecond thought."
+
+
+def test_convert_codex_trace_attaches_late_reasoning_to_tool_call(tmp_path: Path):
+    trace_file = tmp_path / "codex-late-reasoning.jsonl"
+    events = [
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Create a file"}],
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "exec_command",
+                "call_id": "call_1",
+                "arguments": '{"cmd":"touch app.py"}',
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "reasoning",
+                "summary": [{"text": "I already issued the file creation command."}],
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "created",
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "exec_command",
+                "call_id": "call_2",
+                "arguments": '{"cmd":"ls app.py"}',
+            },
+        },
+    ]
+    trace_file.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+
+    example = convert_trace_to_training_example(trace_file)
+
+    assert example.messages[1]["role"] == "assistant"
+    assert example.messages[1]["tool_calls"][0]["id"] == "call_1"
+    assert example.messages[1]["reasoning_content"] == "I already issued the file creation command."
+    assert example.messages[2]["role"] == "tool"
+    assert example.messages[3]["role"] == "assistant"
+    assert example.messages[3]["tool_calls"][0]["id"] == "call_2"
+    assert "reasoning_content" not in example.messages[3]
+
+
+def test_convert_codex_trace_orders_reasoning_text_and_tool_call(tmp_path: Path):
+    trace_file = tmp_path / "codex-text-reasoning-tool.jsonl"
+    events = [
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Create a file"}],
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "I'll create the file."}],
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "reasoning",
+                "summary": [{"text": "Need to write the file before running it."}],
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "exec_command",
+                "call_id": "call_1",
+                "arguments": '{"cmd":"touch app.py"}',
+            },
+        },
+    ]
+    trace_file.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+
+    example = convert_trace_to_training_example(trace_file)
+
+    assert example.messages == [
+        {"role": "user", "content": "Create a file"},
+        {
+            "role": "assistant",
+            "content": "I'll create the file.",
+            "reasoning_content": "Need to write the file before running it.",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "exec_command", "arguments": {"cmd": "touch app.py"}},
+                }
+            ],
+        },
+    ]
+
+
+def test_normalize_codex_trace_orders_reasoning_text_before_prior_tool_call(tmp_path: Path):
+    trace_file = tmp_path / "codex-runtime-order.jsonl"
+    events = [
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Inspect files"}],
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "exec_command",
+                "call_id": "call_1",
+                "arguments": '{"cmd":"ls"}',
+            },
+        },
+        {"type": "event_msg", "payload": {"type": "agent_reasoning"}},
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "I need to inspect the files."}],
+            },
+        },
+        {"type": "event_msg", "payload": {"type": "agent_message"}},
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "I’ll inspect the files."}],
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "README.md",
+            },
+        },
+    ]
+    trace_file.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+
+    normalized = normalize_codex_trace_events(events)
+
+    assert [event.get("payload", {}).get("type") for event in normalized if event.get("type") == "response_item"] == [
+        "message",
+        "reasoning",
+        "message",
+        "function_call",
+        "function_call_output",
+    ]
+
+    example = convert_trace_to_training_example(trace_file)
+
+    assert example.messages == [
+        {"role": "user", "content": "Inspect files"},
+        {
+            "role": "assistant",
+            "content": "I’ll inspect the files.",
+            "reasoning_content": "I need to inspect the files.",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "exec_command", "arguments": {"cmd": "ls"}},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "name": "exec_command",
+            "content": "README.md",
+        },
+    ]
+
+
+def test_normalize_codex_trace_orders_text_before_prior_tool_call(tmp_path: Path):
+    trace_file = tmp_path / "codex-text-tool.jsonl"
+    events = [
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Create a file"}],
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "exec_command",
+                "call_id": "call_1",
+                "arguments": '{"cmd":"touch app.py"}',
+            },
+        },
+        {"type": "event_msg", "payload": {"type": "agent_message"}},
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "I’ll create the file."}],
+            },
+        },
+    ]
+    trace_file.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+
+    normalized = normalize_codex_trace_events(events)
+
+    assert [event.get("payload", {}).get("type") for event in normalized if event.get("type") == "response_item"] == [
+        "message",
+        "message",
+        "function_call",
+    ]
+
+    example = convert_trace_to_training_example(trace_file)
+
+    assert example.messages == [
+        {"role": "user", "content": "Create a file"},
+        {
+            "role": "assistant",
+            "content": "I’ll create the file.",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "exec_command", "arguments": {"cmd": "touch app.py"}},
+                }
+            ],
+        },
+    ]
+
+
+def test_normalize_codex_trace_orders_empty_assistant_before_prior_tool_call(tmp_path: Path):
+    events = [
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "Need to write the stylesheet."}],
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "exec_command",
+                "call_id": "call_1",
+                "arguments": '{"cmd":"cat > styles.css"}',
+            },
+        },
+        {"type": "event_msg", "payload": {"type": "agent_message"}},
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": " "}],
+            },
+        },
+    ]
+
+    normalized = normalize_codex_trace_events(events)
+
+    assert [event.get("payload", {}).get("type") for event in normalized if event.get("type") == "response_item"] == [
+        "reasoning",
+        "message",
+        "function_call",
+    ]
+
+
+def test_normalize_claude_code_trace_moves_empty_assistant_after_reasoning():
+    events = [
+        {
+            "type": "assistant",
+            "sessionId": "session-1",
+            "timestamp": "2026-05-13T00:00:02.000Z",
+            "message": {"role": "assistant", "content": []},
+        },
+        {
+            "type": "assistant",
+            "sessionId": "session-1",
+            "timestamp": "2026-05-13T00:00:03.000Z",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "thinking", "thinking": "Need to inspect first."}],
+            },
+        },
+    ]
+
+    normalized = normalize_claude_code_trace_events(events)
+
+    assert normalized[0]["message"]["content"][0]["type"] == "thinking"
+    assert normalized[1]["message"]["content"] == []
+
+
+def test_normalize_claude_code_trace_orders_text_before_prior_tool_use():
+    events = [
+        {
+            "type": "assistant",
+            "sessionId": "session-1",
+            "timestamp": "2026-05-13T00:00:02.000Z",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {}}],
+            },
+        },
+        {
+            "type": "assistant",
+            "sessionId": "session-1",
+            "timestamp": "2026-05-13T00:00:03.000Z",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "I’ll inspect the file."}],
+            },
+        },
+    ]
+
+    normalized = normalize_claude_code_trace_events(events)
+
+    assert normalized[0]["message"]["content"][0]["type"] == "text"
+    assert normalized[1]["message"]["content"][0]["type"] == "tool_use"
 
 
 def test_convert_trace_normalizes_nested_json_encoded_tool_arguments(tmp_path: Path):

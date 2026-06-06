@@ -28,7 +28,13 @@ if TYPE_CHECKING:
 
 from .config import PromptInput
 
-from .converter import convert_trace_to_training_example, convert_traces_to_training_data, normalize_codex_trace_event
+from .converter import (
+    convert_trace_to_training_example,
+    convert_traces_to_training_data,
+    normalize_claude_code_trace_events,
+    normalize_codex_trace_event,
+    normalize_codex_trace_events,
+)
 
 RUNTIME_IMAGE_NAME = "teich-runtime:v3"
 RUNTIME_DOCKERFILE_NAME = "codex-runtime.Dockerfile"
@@ -59,6 +65,30 @@ def _make_tree_world_writable(path: Path) -> None:
             child.chmod(0o777 if child.is_dir() else 0o666)
         except OSError:
             continue
+
+
+def _read_jsonl_dict_events(path: Path) -> list[dict[str, Any]] | None:
+    events: list[dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                event = json.loads(line)
+                if not isinstance(event, dict):
+                    return None
+                events.append(event)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return events
+
+
+def _write_jsonl_dict_events(path: Path, events: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for event in events:
+            handle.write(json.dumps(event, ensure_ascii=False) + "\n")
 
 
 def _is_non_data_trace_path(path: Path, traces_dir: Path, excluded_dirs: list[Path] | None = None) -> bool:
@@ -2249,7 +2279,15 @@ class CodexRunner(DockerRuntimeRunner):
     @classmethod
     def _copy_normalized_session_file(cls, source_path: Path, destination: Path) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source_path, destination)
+        events = _read_jsonl_dict_events(source_path)
+        if events is None:
+            shutil.copyfile(source_path, destination)
+            return
+        normalized_events = normalize_codex_trace_events(events, normalize_custom_tools=False)
+        if normalized_events == events:
+            shutil.copyfile(source_path, destination)
+            return
+        _write_jsonl_dict_events(destination, normalized_events)
 
     def _codex_base_url_and_proxy_target(self) -> tuple[str | None, str | None]:
         configured_base_url = self.config.get_base_url()
@@ -2948,8 +2986,21 @@ class ClaudeCodeRunner(ExternalCliRunner):
         source_path = max(fresh_files, key=lambda path: path.stat().st_mtime)
         destination = self._resolve_output_path(source_path.name)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source_path, destination)
+        self._copy_normalized_native_session_file(source_path, destination)
         return destination
+
+    @staticmethod
+    def _copy_normalized_native_session_file(source_path: Path, destination: Path) -> None:
+        events = _read_jsonl_dict_events(source_path)
+        if events is None:
+            shutil.copy2(source_path, destination)
+            return
+        normalized_events = normalize_claude_code_trace_events(events)
+        if normalized_events == events:
+            shutil.copy2(source_path, destination)
+            return
+        _write_jsonl_dict_events(destination, normalized_events)
+        shutil.copystat(source_path, destination)
 
     def _needs_openrouter_model_proxy(self) -> bool:
         if not self.config.get_base_url():
@@ -3876,6 +3927,7 @@ class ChatRunner(DockerRuntimeRunner):
             or usage.get("reasoning_tokens")
             or usage.get("reasoning_output_tokens")
             or (usage.get("output_tokens_details") or {}).get("reasoning_tokens")
+            or (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
         )
         cache_read_tokens = TraceMetrics._int_value(usage.get("cacheRead") or usage.get("cached_input_tokens"))
         cache_write_tokens = TraceMetrics._int_value(usage.get("cacheWrite"))

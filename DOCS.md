@@ -20,13 +20,13 @@ flowchart TD
     G --> H{"agent.provider"}
     H -->|"codex"| I["Run Codex CLI in Docker<br/>keep one container and resume same session for follow-ups"]
     H -->|"pi"| J["Run Pi agent in Docker<br/>keep one container and continue same session for follow-ups"]
-    H -->|"claude-code"| Cc["Run Claude Code in Docker<br/>capture stream-json output"]
+    H -->|"claude-code"| Cc["Run Claude Code in Docker<br/>copy native transcript JSONL"]
     H -->|"hermes"| He["Run Hermes Agent in Docker<br/>enable built-in toolsets + delegation"]
     H -->|"chat"| K["Call OpenAI-compatible API directly"]
 
     I --> I1["Copy and normalize native Codex session JSONL"]
     J --> J1["Copy and normalize native Pi session JSONL"]
-    Cc --> Cc1["Write Teich external trace JSONL"]
+    Cc --> Cc1["Copy native Claude transcript JSONL"]
     He --> He1["Export each Hermes state.db session<br/>as separate Teich external trace JSONL"]
     I1 --> I2["Copy workspace snapshot to sandbox"]
     J1 --> J2["Copy workspace snapshot to sandbox"]
@@ -69,11 +69,13 @@ Each row accepts:
 
 Provider output behavior:
 
-- `codex`: copies the native Codex session JSONL from mounted `CODEX_HOME/sessions` and normalizes Codex event-shape edge cases.
+- `codex`: copies the native Codex session JSONL from mounted `CODEX_HOME/sessions` and normalizes Codex event-shape edge cases so reasoning summaries are visible and split assistant turns render as thinking before text/tool use.
 - `pi`: copies the native Pi session JSONL from mounted `/home/codex/pi-sessions`, then normalizes and validates event structure.
-- `claude-code`: captures Claude Code `stream-json` into Teich `external_*` events. For OpenRouter non-Claude models, a local proxy gives Claude Code a Claude surrogate model while forwarding the configured model to OpenRouter.
+- `claude-code`: copies Claude Code's native transcript JSONL from `.claude/projects/...`, then normalizes split assistant fragments so thinking appears before the text or tool use it explains. For OpenRouter non-Claude models, a local proxy gives Claude Code a Claude surrogate model while forwarding the configured model to OpenRouter.
 - `hermes`: enables Hermes built-in toolsets `safe,terminal,file,skills,memory,session_search,delegation`, reads Hermes `state.db`, and writes each native Hermes session as its own Teich `external_*` trace. Delegated subagent sessions are separate files linked to the orchestrator by `parent_session_id`.
 - `chat`: writes structured training rows directly, without Docker or raw session capture.
+
+During conversion, Teich normalizes split assistant fragments into model-turn order: `reasoning_content` first, optional assistant `content` second, and `tool_calls` last. Reasoning that arrives after assistant text or a tool call is moved back in front of the output it explains.
 
 CSV and plain text prompt files still load, but JSONL is the recommended format because prompts often contain commas, code fences, and newlines.
 

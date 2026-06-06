@@ -244,11 +244,13 @@ Recommended `prompts.jsonl`:
 
 ### Provider notes
 
-- `codex` copies the native Codex session JSONL out of the mounted `CODEX_HOME/sessions` directory, then normalizes known Codex event-shape edge cases.
+- `codex` copies the native Codex session JSONL out of the mounted `CODEX_HOME/sessions` directory, then normalizes known Codex event-shape edge cases so reasoning summaries are visible and split assistant turns render as thinking before text/tool use.
 - `pi` copies the native Pi session JSONL out of the mounted `/home/codex/pi-sessions` directory, then normalizes and validates tool-call structure before writing output. For OpenRouter, Teich forces Pi onto the chat/completions wire path because Pi's OpenRouter Responses adapter can stall before the first session event.
-- `claude-code` copies Claude Code's native transcript JSONL from `.claude/projects/...` so the output keeps Claude's own `user`, `assistant`, `system`, and `result` event format. With OpenRouter non-Claude models, Teich runs a local in-container proxy: Claude Code sees a Claude surrogate model name, while the proxy rewrites outbound requests back to the configured model. The native assistant/result events keep the provider-returned model and usage fields when Claude Code records them.
+- `claude-code` copies Claude Code's native transcript JSONL from `.claude/projects/...` so the output keeps Claude's own `user`, `assistant`, `system`, and `result` event format. Split assistant fragments are normalized so thinking appears before the text or tool use it explains. With OpenRouter non-Claude models, Teich runs a local in-container proxy: Claude Code sees a Claude surrogate model name, while the proxy rewrites outbound requests back to the configured model. The native assistant/result events keep the provider-returned model and usage fields when Claude Code records them.
 - `hermes` runs with built-in toolsets `safe,terminal,file,skills,memory,session_search,delegation`, then exports Hermes Agent `state.db` sessions using the native `export_all(source="cli")` session shape: one session object per JSONL file with a nested `messages` list. Delegated subagents remain separate trace files rather than being merged into the orchestrator session; child traces include `parent_session_id`.
 - `chat` calls an OpenAI-compatible API directly and writes structured training rows instead of raw agent traces.
+
+When converting preserved traces to training rows, Teich normalizes split assistant fragments into model-turn order: `reasoning_content` first, optional assistant `content` second, and `tool_calls` last. If a backend emits thinking after a text or tool-call fragment, Teich moves that thinking back in front of the output it explains.
 
 ### Generate a text-only chat dataset
 
@@ -523,6 +525,8 @@ Assistant messages capture:
 - `content`: text response
 - `reasoning_content`: chain-of-thought traces
 - `tool_calls`: function calls with arguments
+
+Some providers split a single model turn across multiple native events. Teich normalizes those fragments during raw trace copy and conversion so the semantic order is `reasoning_content`, optional assistant `content`, then `tool_calls`.
 
 ## 🔧 Python API
 

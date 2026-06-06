@@ -493,6 +493,182 @@ def normalize_codex_trace_event(event: dict[str, Any]) -> dict[str, Any]:
     return event
 
 
+def _codex_payload_type(event: dict[str, Any]) -> str | None:
+    if event.get("type") != "response_item":
+        return None
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    payload_type = payload.get("type")
+    return payload_type if isinstance(payload_type, str) else None
+
+
+def _codex_reasoning_text(event: dict[str, Any]) -> str | None:
+    if _codex_payload_type(event) != "reasoning":
+        return None
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    return _reasoning_summary(payload)
+
+
+def _codex_assistant_message_has_text(event: dict[str, Any]) -> bool:
+    if _codex_payload_type(event) != "message":
+        return False
+    payload = event.get("payload")
+    if not isinstance(payload, dict) or payload.get("role") != "assistant":
+        return False
+    return bool(_first_text_block(payload.get("content")).strip())
+
+
+def _codex_assistant_message_event(event: dict[str, Any]) -> bool:
+    if _codex_payload_type(event) != "message":
+        return False
+    payload = event.get("payload")
+    return isinstance(payload, dict) and payload.get("role") == "assistant"
+
+
+def _events_with_rotated_timestamps(
+    first_event: dict[str, Any],
+    following_events: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return _events_with_reassigned_timestamps(
+        [first_event, *following_events],
+        [*following_events, first_event],
+    )
+
+
+def _events_with_reassigned_timestamps(
+    events: list[dict[str, Any]],
+    timestamp_sources: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    ordered_events = [dict(event) for event in events]
+    for event_copy, timestamp_source in zip(ordered_events, timestamp_sources, strict=True):
+        for key in ("timestamp", "created_at", "createdAt"):
+            timestamp = timestamp_source.get(key)
+            if timestamp is not None:
+                event_copy[key] = timestamp
+            elif key in event_copy:
+                event_copy.pop(key, None)
+    return ordered_events
+
+
+def _codex_output_fragment(event: dict[str, Any]) -> bool:
+    return _codex_payload_type(event) in {"function_call", "custom_tool_call"} or _codex_assistant_message_has_text(event)
+
+
+def _codex_tool_call_fragment(event: dict[str, Any]) -> bool:
+    return _codex_payload_type(event) in {"function_call", "custom_tool_call"}
+
+
+def _codex_event_msg_payload_type(event: dict[str, Any]) -> str | None:
+    if event.get("type") != "event_msg":
+        return None
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    payload_type = payload.get("type")
+    return payload_type if isinstance(payload_type, str) else None
+
+
+def _codex_assistant_prefix_marker(event: dict[str, Any]) -> bool:
+    return _codex_event_msg_payload_type(event) in {"agent_reasoning", "agent_message"}
+
+
+def _codex_reorderable_output_suffix_event(event: dict[str, Any], *, prefix_has_reasoning: bool) -> bool:
+    if _codex_tool_call_fragment(event):
+        return True
+    if not prefix_has_reasoning:
+        return False
+    return _codex_assistant_message_event(event) or _codex_event_msg_payload_type(event) == "agent_message"
+
+
+def _codex_assistant_prefix_block(
+    events: list[dict[str, Any]],
+    start: int,
+) -> tuple[list[dict[str, Any]], int]:
+    block: list[dict[str, Any]] = []
+    saw_assistant_payload = False
+    saw_message = False
+    index = start
+    while index < len(events):
+        event = events[index]
+        if _codex_assistant_prefix_marker(event):
+            block.append(event)
+            index += 1
+            continue
+
+        payload_type = _codex_payload_type(event)
+        if payload_type == "reasoning":
+            if saw_message:
+                break
+            block.append(event)
+            saw_assistant_payload = True
+            index += 1
+            continue
+        if _codex_assistant_message_event(event):
+            block.append(event)
+            saw_assistant_payload = True
+            saw_message = True
+            index += 1
+            continue
+        break
+
+    if not saw_assistant_payload:
+        return [], start
+    return block, index
+
+
+def normalize_codex_trace_events(
+    events: list[dict[str, Any]],
+    *,
+    normalize_custom_tools: bool = True,
+) -> list[dict[str, Any]]:
+    if normalize_custom_tools:
+        normalized_events = [normalize_codex_trace_event(event) for event in events]
+    else:
+        normalized_events = [
+            normalize_codex_trace_event(event) if _codex_payload_type(event) == "reasoning" else event
+            for event in events
+        ]
+    ordered_events: list[dict[str, Any]] = []
+    index = 0
+    while index < len(normalized_events):
+        prefix_block, next_index = _codex_assistant_prefix_block(normalized_events, index)
+        if prefix_block:
+            prefix_has_reasoning = any(_codex_payload_type(event) == "reasoning" for event in prefix_block)
+            output_suffix: list[dict[str, Any]] = []
+            while ordered_events and _codex_reorderable_output_suffix_event(
+                ordered_events[-1],
+                prefix_has_reasoning=prefix_has_reasoning,
+            ):
+                output_suffix.insert(0, ordered_events.pop())
+            if output_suffix:
+                ordered_events.extend(
+                    _events_with_reassigned_timestamps(
+                        [*prefix_block, *output_suffix],
+                        [*output_suffix, *prefix_block],
+                    )
+                )
+            else:
+                ordered_events.extend(prefix_block)
+            index = next_index
+            continue
+
+        event = normalized_events[index]
+        if _codex_reasoning_text(event):
+            output_suffix = []
+            while ordered_events and _codex_output_fragment(ordered_events[-1]):
+                output_suffix.insert(0, ordered_events.pop())
+            if output_suffix:
+                ordered_events.extend(_events_with_rotated_timestamps(event, output_suffix))
+                index += 1
+                continue
+        ordered_events.append(event)
+        index += 1
+    return ordered_events
+
+
 def _normalize_json_like_value(value: Any) -> Any:
     if isinstance(value, dict):
         return {key: _normalize_json_like_value(item) for key, item in value.items()}
@@ -773,6 +949,114 @@ def _claude_reasoning_from_content(content: Any) -> str | None:
     return result or None
 
 
+def _claude_assistant_content_blocks(event: dict[str, Any]) -> list[dict[str, Any]]:
+    if event.get("type") != "assistant":
+        return []
+    payload = event.get("message")
+    if not isinstance(payload, dict):
+        return []
+    content = payload.get("content")
+    if not isinstance(content, list):
+        return []
+    return [block for block in content if isinstance(block, dict)]
+
+
+def _claude_assistant_event_has_reasoning(event: dict[str, Any]) -> bool:
+    blocks = _claude_assistant_content_blocks(event)
+    if _claude_reasoning_from_content(blocks):
+        return True
+    return any(block.get("type") == "redacted_thinking" for block in blocks)
+
+
+def _claude_assistant_event_has_tool_use(event: dict[str, Any]) -> bool:
+    for block in _claude_assistant_content_blocks(event):
+        if block.get("type") == "tool_use":
+            return True
+    return False
+
+
+def _claude_assistant_event_has_text_output(event: dict[str, Any]) -> bool:
+    for block in _claude_assistant_content_blocks(event):
+        block_type = block.get("type")
+        if block_type in {"text", "input_text", "output_text"}:
+            text = block.get("text")
+            if isinstance(text, str) and text.strip():
+                return True
+    return False
+
+
+def _claude_assistant_event_has_output(event: dict[str, Any]) -> bool:
+    return _claude_assistant_event_has_tool_use(event) or _claude_assistant_event_has_text_output(event)
+
+
+def _claude_empty_assistant_event(event: dict[str, Any]) -> bool:
+    return (
+        event.get("type") == "assistant"
+        and not _claude_assistant_event_has_output(event)
+        and not _claude_assistant_event_has_reasoning(event)
+    )
+
+
+def _same_claude_session(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    left_session = left.get("session_id") or left.get("sessionId")
+    right_session = right.get("session_id") or right.get("sessionId")
+    if isinstance(left_session, str) and isinstance(right_session, str):
+        return left_session == right_session
+    return True
+
+
+def _claude_output_fragment(event: dict[str, Any]) -> bool:
+    return (
+        _claude_empty_assistant_event(event)
+        or _claude_assistant_event_has_output(event)
+        and not _claude_assistant_event_has_reasoning(event)
+    )
+
+
+def _claude_tool_call_fragment(event: dict[str, Any]) -> bool:
+    return _claude_assistant_event_has_tool_use(event) and not _claude_assistant_event_has_reasoning(event)
+
+
+def _claude_text_output_fragment(event: dict[str, Any]) -> bool:
+    return (
+        _claude_assistant_event_has_text_output(event)
+        and not _claude_assistant_event_has_tool_use(event)
+        and not _claude_assistant_event_has_reasoning(event)
+    )
+
+
+def normalize_claude_code_trace_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    ordered_events: list[dict[str, Any]] = []
+    for event in events:
+        if not isinstance(event, dict):
+            ordered_events.append(event)
+            continue
+        if _claude_assistant_event_has_reasoning(event) and not _claude_assistant_event_has_output(event):
+            output_suffix: list[dict[str, Any]] = []
+            while (
+                ordered_events
+                and _claude_output_fragment(ordered_events[-1])
+                and _same_claude_session(ordered_events[-1], event)
+            ):
+                output_suffix.insert(0, ordered_events.pop())
+            if output_suffix:
+                ordered_events.extend(_events_with_rotated_timestamps(event, output_suffix))
+                continue
+        if _claude_text_output_fragment(event):
+            output_suffix = []
+            while (
+                ordered_events
+                and _claude_tool_call_fragment(ordered_events[-1])
+                and _same_claude_session(ordered_events[-1], event)
+            ):
+                output_suffix.insert(0, ordered_events.pop())
+            if output_suffix:
+                ordered_events.extend(_events_with_rotated_timestamps(event, output_suffix))
+                continue
+        ordered_events.append(event)
+    return ordered_events
+
+
 def _append_or_merge_assistant_message(messages: list[dict[str, Any]], message: dict[str, Any]) -> None:
     if not messages or messages[-1].get("role") != "assistant":
         messages.append(message)
@@ -815,6 +1099,7 @@ def _convert_claude_code_trace_to_training_example(
     trace_file: Path,
     events: list[dict[str, Any]],
 ) -> TrainingExample:
+    events = normalize_claude_code_trace_events(events)
     messages: list[dict[str, Any]] = []
     tool_names: set[str] = set(_CLAUDE_CODE_BUILTIN_TOOL_SCHEMAS)
     tool_schemas: dict[str, dict[str, Any]] = deepcopy(_CLAUDE_CODE_BUILTIN_TOOL_SCHEMAS)
@@ -1388,6 +1673,7 @@ def _convert_codex_trace_to_training_example(
     trace_file: Path,
     events: list[dict[str, Any]],
 ) -> TrainingExample:
+    events = normalize_codex_trace_events(events)
     messages: list[dict[str, Any]] = []
     pending_reasoning_parts: list[str] = []
     tool_names: set[str] = set()
@@ -1424,7 +1710,26 @@ def _convert_codex_trace_to_training_example(
         if payload_type == "reasoning":
             reasoning = _reasoning_summary(payload)
             if reasoning:
-                pending_reasoning_parts.append(reasoning)
+                previous_message = messages[-1] if messages else None
+                previous_has_output = (
+                    isinstance(previous_message, dict)
+                    and previous_message.get("role") == "assistant"
+                    and (
+                        bool(str(previous_message.get("content") or "").strip())
+                        or bool(previous_message.get("tool_calls"))
+                    )
+                )
+                if previous_has_output:
+                    _append_or_merge_assistant_message(
+                        messages,
+                        {
+                            "role": "assistant",
+                            "content": "",
+                            "reasoning_content": reasoning,
+                        },
+                    )
+                else:
+                    pending_reasoning_parts.append(reasoning)
             continue
 
         if payload_type == "message":
@@ -1462,8 +1767,23 @@ def _convert_codex_trace_to_training_example(
                     "arguments": arguments,
                 },
             }
-            if messages and messages[-1].get("role") == "assistant" and "tool_calls" in messages[-1]:
-                messages[-1]["tool_calls"].append(tool_call)
+            if messages and messages[-1].get("role") == "assistant":
+                assistant_message = messages[-1]
+                if pending_reasoning_parts:
+                    existing_reasoning = assistant_message.get("reasoning_content")
+                    pending_reasoning = "\n\n".join(pending_reasoning_parts)
+                    if isinstance(existing_reasoning, str) and existing_reasoning.strip():
+                        assistant_message["reasoning_content"] = (
+                            f"{existing_reasoning.strip()}\n\n{pending_reasoning}"
+                        )
+                    else:
+                        assistant_message["reasoning_content"] = pending_reasoning
+                    pending_reasoning_parts = []
+                existing_tool_calls = assistant_message.setdefault("tool_calls", [])
+                if isinstance(existing_tool_calls, list):
+                    existing_tool_calls.append(tool_call)
+                else:
+                    assistant_message["tool_calls"] = [tool_call]
             else:
                 assistant_message: dict[str, Any] = {
                     "role": "assistant",

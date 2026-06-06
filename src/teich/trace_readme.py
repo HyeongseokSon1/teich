@@ -291,6 +291,7 @@ def build_traces_readme(
             [
                 "Each file is newline-delimited JSON representing a single captured agent session.",
                 "The trace schema is designed for upload-first preservation so you can keep the original session history and convert it later for training.",
+                "Teich normalizes split assistant fragments during trace copy and conversion so the semantic order is reasoning first, optional assistant text second, and tool calls last.",
                 "",
                 "Common top-level event groups:",
                 "",

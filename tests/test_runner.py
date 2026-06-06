@@ -617,6 +617,85 @@ def test_claude_code_extract_makes_native_session_tree_readable(tmp_path: Path):
     assert oct(session_file.stat().st_mode & 0o777) == "0o666"
 
 
+def test_claude_code_extract_orders_split_reasoning_before_output(tmp_path: Path):
+    config = Config(
+        agent={"provider": "claude-code"},
+        output={"traces_dir": tmp_path / "output", "sandbox_dir": tmp_path / "sandbox"},
+    )
+    with patch.object(ClaudeCodeRunner, "_ensure_image"):
+        runner = ClaudeCodeRunner(config)
+
+    home_dir = tmp_path / "home"
+    session_file = home_dir / "projects" / "-workspace" / "native-session.jsonl"
+    session_file.parent.mkdir(parents=True)
+    session_file.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {"role": "assistant", "content": [{"type": "text", "text": "I'll edit it."}]},
+                        "sessionId": "native-session",
+                        "timestamp": "2026-05-13T00:00:02.000Z",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "thinking", "thinking": "Need a small edit."}],
+                        },
+                        "sessionId": "native-session",
+                        "timestamp": "2026-05-13T00:00:03.000Z",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "tool_use", "id": "toolu_1", "name": "Edit", "input": {}}],
+                        },
+                        "sessionId": "native-session",
+                        "timestamp": "2026-05-13T00:00:04.000Z",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "redacted_thinking", "data": "opaque"}],
+                        },
+                        "sessionId": "native-session",
+                        "timestamp": "2026-05-13T00:00:05.000Z",
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = runner._extract_native_session_file(
+        "native-session",
+        home_dir,
+        set(),
+        datetime.fromtimestamp(0, tz=timezone.utc),
+    )
+
+    rows = [json.loads(line) for line in result.read_text(encoding="utf-8").splitlines()]
+    assert rows[0]["message"]["content"][0]["type"] == "thinking"
+    assert rows[0]["timestamp"] == "2026-05-13T00:00:02.000Z"
+    assert rows[1]["message"]["content"][0]["type"] == "redacted_thinking"
+    assert rows[1]["timestamp"] == "2026-05-13T00:00:03.000Z"
+    assert rows[2]["message"]["content"][0]["type"] == "text"
+    assert rows[2]["timestamp"] == "2026-05-13T00:00:04.000Z"
+    assert rows[3]["message"]["content"][0]["type"] == "tool_use"
+    assert rows[3]["timestamp"] == "2026-05-13T00:00:05.000Z"
+
+
 def test_claude_code_runner_uses_continue_for_followups(tmp_path: Path):
     config = Config(
         agent={"provider": "claude"},
@@ -2931,7 +3010,102 @@ def test_copy_normalized_session_file_preserves_codex_native_reasoning_event(tmp
 
     CodexRunner._copy_normalized_session_file(source, destination)
 
-    assert destination.read_text(encoding="utf-8") == source.read_text(encoding="utf-8")
+    rows = [json.loads(line) for line in destination.read_text(encoding="utf-8").splitlines()]
+    assert rows[0]["payload"]["summary"] == [
+        {"type": "summary_text", "text": "Use a direct factorial implementation."}
+    ]
+    assert rows[0]["payload"]["content"] == [
+        {"type": "reasoning_text", "text": "Use a direct factorial implementation."}
+    ]
+    assert rows[1]["payload"]["type"] == "message"
+
+
+def test_copy_normalized_session_file_orders_codex_late_reasoning_before_tool_call(tmp_path: Path):
+    source = tmp_path / "source.jsonl"
+    destination = tmp_path / "destination.jsonl"
+    source.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "timestamp": "2026-05-13T00:00:02.000Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call",
+                            "name": "exec_command",
+                            "call_id": "call_1",
+                            "arguments": '{"cmd":"touch app.py"}',
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "timestamp": "2026-05-13T00:00:03.000Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "reasoning",
+                            "summary": [],
+                            "content": [{"type": "reasoning_text", "text": "Create the file first."}],
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    CodexRunner._copy_normalized_session_file(source, destination)
+
+    rows = [json.loads(line) for line in destination.read_text(encoding="utf-8").splitlines()]
+    assert rows[0]["payload"]["type"] == "reasoning"
+    assert rows[0]["timestamp"] == "2026-05-13T00:00:02.000Z"
+    assert rows[0]["payload"]["summary"] == [{"type": "summary_text", "text": "Create the file first."}]
+    assert rows[1]["payload"]["type"] == "function_call"
+    assert rows[1]["timestamp"] == "2026-05-13T00:00:03.000Z"
+    assert rows[1]["payload"]["call_id"] == "call_1"
+
+
+def test_copy_normalized_session_file_orders_codex_reasoning_before_text(tmp_path: Path):
+    source = tmp_path / "source.jsonl"
+    destination = tmp_path / "destination.jsonl"
+    source.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "timestamp": "2026-05-13T00:00:02.000Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "I'll create it."}],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "timestamp": "2026-05-13T00:00:03.000Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "reasoning",
+                            "summary": [{"text": "Create the file first."}],
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    CodexRunner._copy_normalized_session_file(source, destination)
+
+    rows = [json.loads(line) for line in destination.read_text(encoding="utf-8").splitlines()]
+    assert rows[0]["payload"]["type"] == "reasoning"
+    assert rows[0]["timestamp"] == "2026-05-13T00:00:02.000Z"
+    assert rows[1]["payload"]["type"] == "message"
+    assert rows[1]["timestamp"] == "2026-05-13T00:00:03.000Z"
 
 
 def test_copy_normalized_session_file_preserves_codex_native_prompt_file_user_message(tmp_path: Path):
@@ -3205,6 +3379,26 @@ def test_chat_runner_writes_structured_dataset_row_from_responses_api(tmp_path: 
     assert request.headers["User-agent"] == "teich"
     body = json.loads(request.data.decode("utf-8"))
     assert "instructions" not in body
+
+
+def test_chat_runner_normalizes_openrouter_chat_completion_reasoning_usage():
+    usage = ChatRunner._normalize_usage(
+        {
+            "prompt_tokens": 263,
+            "completion_tokens": 80,
+            "total_tokens": 343,
+            "completion_tokens_details": {"reasoning_tokens": 67},
+            "cost": 0.000032548824,
+        }
+    )
+
+    assert usage == {
+        "input": 263,
+        "output": 80,
+        "reasoning": 67,
+        "totalTokens": 343,
+        "cost": {"total": 0.000032548824},
+    }
 
 
 def test_chat_runner_uses_prompt_level_system_prompt(tmp_path: Path):
