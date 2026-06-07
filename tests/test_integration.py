@@ -66,6 +66,17 @@ class TestDockerImage:
         assert "npx playwright install --with-deps chromium" in content
         assert 'ENV NODE_PATH="/usr/local/lib/node_modules"' in content
 
+    def test_dockerfile_allows_non_root_agents_to_install_system_packages(self):
+        """Verify the runtime keeps passwordless apt wrappers for generated agents."""
+        dockerfile = Path(__file__).parent.parent / "docker" / "codex-runtime.Dockerfile"
+        content = dockerfile.read_text(encoding="utf-8")
+        assert "sudo" in content
+        assert "codex ALL=(ALL) NOPASSWD:ALL" in content
+        assert "exec sudo /usr/bin/apt-get" in content
+        assert "exec sudo /usr/bin/apt" in content
+        assert "chmod +x /usr/local/bin/apt-get /usr/local/bin/apt" in content
+        assert "USER codex" in content
+
     @requires_docker
     @pytest.mark.slow  # Takes 2-3 minutes, skip by default
     def test_docker_build(self, tmp_path):

@@ -8,6 +8,7 @@ from datasets import Dataset
 import pytest
 
 from teich import load_traces, mask_data, prepare_data, preview_sft_example, row_fits_context
+from teich.converter import convert_trace_to_training_example
 from teich.formatter import _labels_from_offsets, _reconcile_marker_boundary_whitespace
 
 
@@ -986,6 +987,101 @@ def test_mask_data_applies_policy_flags_to_typed_prepare_spans():
     assert "private reasoning" not in non_model_text
     assert "final answer" not in non_model_text
     assert "<tool_call>bash</tool_call>" not in non_model_text
+
+
+def test_converted_trace_prepares_and_masks_reasoning_text_tool_order(tmp_path: Path):
+    trace_file = tmp_path / "codex-order.jsonl"
+    events = [
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Create a file"}],
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "exec_command",
+                "call_id": "call_1",
+                "arguments": '{"cmd":"touch app.py"}',
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "Need to create the file first."}],
+            },
+        },
+        {"type": "event_msg", "payload": {"type": "agent_message"}},
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "I'll create it now."}],
+            },
+        },
+    ]
+    trace_file.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+    example = convert_trace_to_training_example(trace_file).to_dict()
+
+    class OrderedToolTokenizer(FakeTokenizer):
+        def apply_chat_template(
+            self,
+            messages,
+            *,
+            tokenize=False,
+            add_generation_prompt=False,
+            tools=None,
+            enable_thinking=True,
+            preserve_thinking=True,
+            **kwargs,
+        ):
+            parts: list[str] = []
+            for message in messages:
+                segment = f"<{message['role']}>"
+                if message["role"] == "assistant" and enable_thinking and preserve_thinking:
+                    reasoning = message.get("reasoning_content")
+                    if reasoning:
+                        segment += f"<think>{reasoning}</think>"
+                if message.get("content"):
+                    segment += str(message["content"])
+                if message["role"] == "assistant":
+                    for tool_call in message.get("tool_calls") or []:
+                        segment += f"<tool_call>{tool_call['function']['name']}</tool_call>"
+                segment += f"</{message['role']}>"
+                parts.append(segment)
+            if add_generation_prompt:
+                parts.append("<assistant>")
+            rendered = "".join(parts)
+            if tokenize:
+                return self(rendered)
+            return rendered
+
+    tokenizer = OrderedToolTokenizer()
+
+    training_data = prepare_and_mask_for_test(
+        Dataset.from_list([example]),
+        tokenizer,
+        include_debug_columns=True,
+    )
+    row = training_data[0]
+    supervised_text = tokenizer.decode([token for token in row["labels"] if token != -100])
+
+    assert (
+        row["text"].index("Need to create the file first.")
+        < row["text"].index("I'll create it now.")
+        < row["text"].index("<tool_call>exec_command</tool_call>")
+    )
+    assert (
+        supervised_text.index("Need to create the file first.")
+        < supervised_text.index("I'll create it now.")
+        < supervised_text.index("<tool_call>exec_command</tool_call>")
+    )
 
 
 def test_prepare_data_can_return_plain_rendered_text_without_teich_masking():

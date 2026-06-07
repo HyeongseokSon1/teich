@@ -426,6 +426,99 @@ def test_codex_run_session_salvages_complete_trace_after_nonzero_exit(tmp_path: 
     mock_copy_snapshot.assert_called_once()
 
 
+def test_codex_run_session_retries_clean_exit_with_incomplete_trace(tmp_path: Path):
+    config = Config(
+        output={
+            "traces_dir": tmp_path / "output",
+            "sandbox_dir": tmp_path / "sandbox",
+            "failures_dir": tmp_path / "failures",
+        }
+    )
+
+    with patch.object(CodexRunner, '_ensure_image'):
+        runner = CodexRunner(config)
+
+    commands: list[list[str]] = []
+
+    def mounted_codex_home(command: list[str]) -> Path:
+        mounts = [command[index + 1] for index, item in enumerate(command) if item == "-v"]
+        match = next(mount for mount in mounts if mount.endswith(":/home/codex/.codex"))
+        return Path(match.rsplit(":", maxsplit=1)[0])
+
+    def write_trace(command: list[str], complete: bool) -> None:
+        trace_path = mounted_codex_home(command) / "sessions" / "codex-retry.jsonl"
+        trace_path.parent.mkdir(parents=True, exist_ok=True)
+        rows = [
+            {"type": "session_meta", "payload": {"id": "codex-retry", "model_provider": "openrouter"}},
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Build app"}],
+                },
+            },
+        ]
+        if complete:
+            rows.append(
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Done"}],
+                    },
+                }
+            )
+        else:
+            rows.extend(
+                [
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call",
+                            "name": "exec_command",
+                            "arguments": "{",
+                            "call_id": "call-bad",
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call_output",
+                            "call_id": "call-bad",
+                            "output": "failed to parse function arguments: EOF while parsing an object at line 1 column 1",
+                        },
+                    },
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "task_complete",
+                            "last_agent_message": None,
+                        },
+                    },
+                ]
+            )
+        trace_path.write_text(
+            "\n".join(json.dumps(row, separators=(",", ":")) for row in rows) + "\n",
+            encoding="utf-8",
+        )
+
+    def run_then_retry(command, *args, **kwargs) -> None:
+        commands.append(command)
+        write_trace(command, complete=len(commands) > 1)
+
+    with patch.object(runner, "_run_process", side_effect=run_then_retry) as mock_run_process, \
+         patch.object(runner, "_copy_workspace_snapshot"):
+        result = runner.run_session("Build app", "codex-retry")
+
+    assert result == tmp_path / "output" / "codex-retry.jsonl"
+    assert mock_run_process.call_count == 2
+    assert "resume --last" not in " ".join(commands[0])
+    assert "resume --last" in " ".join(commands[1])
+    assert not list((tmp_path / "failures").glob("*.jsonl"))
+
+
 def test_docker_runners_keep_long_prompt_out_of_host_command_line(tmp_path: Path):
     long_prompt = "x" * 40000
 
@@ -619,6 +712,7 @@ def test_claude_openrouter_proxy_strips_decoded_compression_headers(tmp_path: Pa
             body = self.rfile.read(int(self.headers.get("content-length", "0")))
             seen["accept_encoding"] = self.headers.get("accept-encoding")
             seen["authorization"] = self.headers.get("authorization")
+            seen["openrouter_cache"] = self.headers.get("x-openrouter-cache")
             seen["path"] = self.path
             seen["body"] = json.loads(body.decode("utf-8"))
             compressed = gzip.compress(response_payload)
@@ -653,11 +747,29 @@ def test_claude_openrouter_proxy_strips_decoded_compression_headers(tmp_path: Pa
         _wait_for_tcp_port(proxy_port)
         request = Request(
             f"http://127.0.0.1:{proxy_port}/v1/messages?beta=true",
-            data=json.dumps({"model": "claude-sonnet-4-6", "thinking": {"type": "enabled"}}).encode("utf-8"),
+            data=json.dumps(
+                {
+                    "model": "claude-sonnet-4-6",
+                    "thinking": {"type": "enabled"},
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "cache me",
+                                    "cache_control": {"type": "ephemeral"},
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ).encode("utf-8"),
             headers={
                 "content-type": "application/json",
                 "x-api-key": "sk-test",
                 "accept-encoding": "gzip, deflate, br",
+                "x-openrouter-cache": "true",
             },
             method="POST",
         )
@@ -670,8 +782,23 @@ def test_claude_openrouter_proxy_strips_decoded_compression_headers(tmp_path: Pa
         assert "content-length" not in headers
         assert seen["accept_encoding"] == "gzip, deflate, br"
         assert seen["authorization"] == "Bearer sk-test"
+        assert seen["openrouter_cache"] == "true"
         assert seen["path"] == "/v1/messages?beta=true"
-        assert seen["body"] == {"model": "minimax/minimax-m3"}
+        assert seen["body"] == {
+            "model": "minimax/minimax-m3",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "cache me",
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                }
+            ],
+        }
     finally:
         process.terminate()
         try:
@@ -861,8 +988,40 @@ def test_claude_code_runner_uses_proxy_for_custom_non_claude_model(tmp_path: Pat
     with patch.object(ClaudeCodeRunner, "_ensure_image"):
         runner = ClaudeCodeRunner(config)
 
-    with patch.object(runner, "_run_native_process_with_progress") as mock_run, \
-         patch.object(runner, "_extract_native_session_file", return_value=tmp_path / "output" / "trace.jsonl"), \
+    def write_complete_trace(_command, _container_name, **kwargs) -> None:
+        home_dir = kwargs["home_dir"]
+        trace_file = home_dir / "projects" / "-workspace" / "trace.jsonl"
+        trace_file.parent.mkdir(parents=True, exist_ok=True)
+        trace_file.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "user",
+                            "sessionId": "claude-custom-session",
+                            "message": {"role": "user", "content": "smoke"},
+                        },
+                        separators=(",", ":"),
+                    ),
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "sessionId": "claude-custom-session",
+                            "message": {
+                                "role": "assistant",
+                                "model": "claude-sonnet-4-6",
+                                "content": [{"type": "text", "text": "done"}],
+                            },
+                        },
+                        separators=(",", ":"),
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    with patch.object(runner, "_run_native_process_with_progress", side_effect=write_complete_trace) as mock_run, \
          patch.object(runner, "_copy_workspace_snapshot"):
         runner.run_session("smoke", "claude-custom-session")
 
@@ -888,37 +1047,138 @@ def test_claude_code_run_session_salvages_complete_trace_after_nonzero_exit(tmp_
     with patch.object(ClaudeCodeRunner, "_ensure_image"):
         runner = ClaudeCodeRunner(config)
 
-    trace_path = tmp_path / "output" / "claude.jsonl"
-    trace_path.parent.mkdir(parents=True)
-    trace_path.write_text(
-        "\n".join(
-            [
-                json.dumps({"type": "user", "sessionId": "claude-salvage", "message": {"role": "user", "content": "Build app"}}),
-                json.dumps(
-                    {
-                        "type": "assistant",
-                        "sessionId": "claude-salvage",
-                        "message": {
-                            "role": "assistant",
-                            "content": [{"type": "text", "text": "Done"}],
-                        },
-                    }
-                ),
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
     exit_error = subprocess.CalledProcessError(1, ["claude"], output="", stderr="exited after writing trace")
 
-    with patch.object(runner, "_run_native_process_with_progress", side_effect=exit_error), \
-         patch.object(runner, "_extract_native_session_file", return_value=trace_path) as mock_extract, \
+    def fail_after_writing_complete_trace(_command, _container_name, **kwargs) -> None:
+        home_dir = kwargs["home_dir"]
+        trace_path = home_dir / "projects" / "-workspace" / "claude.jsonl"
+        trace_path.parent.mkdir(parents=True, exist_ok=True)
+        trace_path.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "user",
+                            "sessionId": "claude-salvage",
+                            "message": {"role": "user", "content": "Build app"},
+                        },
+                        separators=(",", ":"),
+                    ),
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "sessionId": "claude-salvage",
+                            "message": {
+                                "role": "assistant",
+                                "model": "claude-sonnet-4-6",
+                                "content": [{"type": "text", "text": "Done"}],
+                            },
+                        },
+                        separators=(",", ":"),
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        raise exit_error
+
+    with patch.object(runner, "_run_native_process_with_progress", side_effect=fail_after_writing_complete_trace) as mock_run, \
          patch.object(runner, "_copy_workspace_snapshot") as mock_copy_snapshot:
         result = runner.run_session("Build app", "claude-salvage")
 
-    assert result == trace_path
-    mock_extract.assert_called_once()
+    assert result == tmp_path / "output" / "claude.jsonl"
+    mock_run.assert_called_once()
     mock_copy_snapshot.assert_called_once()
+
+
+def test_claude_code_run_session_retries_provider_error_trace_before_exporting(tmp_path: Path):
+    config = Config(
+        agent={"provider": "claude-code"},
+        api=APIConfig(provider="anthropic", api_key="sk-ant-test"),
+        model=ModelConfig(model="claude-sonnet-4-6", approval_policy="never"),
+        output={
+            "traces_dir": tmp_path / "output",
+            "sandbox_dir": tmp_path / "sandbox",
+            "failures_dir": tmp_path / "failures",
+        },
+    )
+    with patch.object(ClaudeCodeRunner, "_ensure_image"):
+        runner = ClaudeCodeRunner(config)
+
+    commands: list[list[str]] = []
+
+    def write_native_trace(home_dir: Path, *, complete: bool) -> None:
+        trace_path = home_dir / "projects" / "-workspace" / "claude-retry.jsonl"
+        trace_path.parent.mkdir(parents=True, exist_ok=True)
+        rows = [
+            {
+                "type": "user",
+                "sessionId": "claude-retry",
+                "uuid": "user-1",
+                "message": {"role": "user", "content": "Build app"},
+            }
+        ]
+        if complete:
+            rows.append(
+                {
+                    "type": "assistant",
+                    "sessionId": "claude-retry",
+                    "uuid": "assistant-2",
+                    "parentUuid": "user-1",
+                    "message": {
+                        "role": "assistant",
+                        "model": "claude-sonnet-4-6",
+                        "content": [{"type": "text", "text": "Recovered and finished."}],
+                    },
+                }
+            )
+        else:
+            rows.append(
+                {
+                    "type": "assistant",
+                    "sessionId": "claude-retry",
+                    "uuid": "assistant-error",
+                    "parentUuid": "user-1",
+                    "isApiErrorMessage": True,
+                    "error": "api_error",
+                    "message": {
+                        "role": "assistant",
+                        "model": "<synthetic>",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": 'API Error: ZlibError fetching "http://127.0.0.1:17891/v1/messages?beta=true".',
+                            }
+                        ],
+                    },
+                }
+            )
+        trace_path.write_text(
+            "\n".join(json.dumps(row, separators=(",", ":")) for row in rows) + "\n",
+            encoding="utf-8",
+        )
+
+    def fail_then_recover(command, _container_name, **kwargs) -> None:
+        commands.append(command)
+        write_native_trace(kwargs["home_dir"], complete=len(commands) > 1)
+        if len(commands) == 1:
+            raise subprocess.CalledProcessError(
+                1,
+                command,
+                output="",
+                stderr='API Error: ZlibError fetching "http://127.0.0.1:17891/v1/messages?beta=true".',
+            )
+
+    with patch.object(runner, "_run_native_process_with_progress", side_effect=fail_then_recover) as mock_run, \
+         patch.object(runner, "_copy_workspace_snapshot"):
+        result = runner.run_session("Build app", "claude-retry")
+
+    assert result == tmp_path / "output" / "claude-retry.jsonl"
+    assert mock_run.call_count == 2
+    assert "--continue" not in " ".join(commands[0])
+    assert "--continue" in " ".join(commands[1])
+    assert not list((tmp_path / "failures").glob("*.jsonl"))
 
 
 def test_claude_code_extract_makes_native_session_tree_readable(tmp_path: Path):
@@ -1058,26 +1318,60 @@ def test_claude_code_runner_uses_continue_for_followups(tmp_path: Path):
         nonlocal native_home
         native_home = _claude_home_from_command(command)
 
+    calls: list[list[str]] = []
+
     def fake_run(command: list[str], _container_name: str | None, **_kwargs: object) -> tuple[str, str]:
-        if native_home is None:
-            _write_fake_claude_native_session(command, prompt="Build app")
-        else:
-            session_file = native_home / "projects" / "-workspace" / "native-claude-session.jsonl"
-            session_file.parent.mkdir(parents=True, exist_ok=True)
-            session_file.write_text(
-                json.dumps(
+        calls.append(command)
+        home_dir = native_home or _kwargs["home_dir"]
+        session_file = home_dir / "projects" / "-workspace" / "native-claude-session.jsonl"
+        session_file.parent.mkdir(parents=True, exist_ok=True)
+        rows = [
+            {
+                "type": "user",
+                "message": {"role": "user", "content": "Build app"},
+                "uuid": "user-uuid",
+                "parentUuid": None,
+                "sessionId": "native-claude-session",
+            },
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "done"}],
+                },
+                "uuid": "assistant-uuid",
+                "parentUuid": "user-uuid",
+                "sessionId": "native-claude-session",
+            },
+        ]
+        if len(calls) > 1:
+            rows.extend(
+                [
                     {
                         "type": "user",
-                        "message": {"role": "user", "content": "Build app"},
-                        "uuid": "user-uuid",
-                        "parentUuid": None,
+                        "message": {"role": "user", "content": "Add tests"},
+                        "uuid": "user-followup-uuid",
+                        "parentUuid": "assistant-uuid",
                         "sessionId": "native-claude-session",
                     },
-                    separators=(",", ":"),
-                )
-                + "\n",
-                encoding="utf-8",
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "role": "assistant",
+                            "model": "claude-sonnet-4-6",
+                            "content": [{"type": "text", "text": "added tests"}],
+                        },
+                        "uuid": "assistant-followup-uuid",
+                        "parentUuid": "user-followup-uuid",
+                        "sessionId": "native-claude-session",
+                    },
+                ]
             )
+        session_file.write_text(
+            "\n".join(json.dumps(row, separators=(",", ":")) for row in rows) + "\n",
+            encoding="utf-8",
+        )
         return '{"type":"result","result":"done"}\n', ""
 
     with patch.object(runner, "_start_container", side_effect=fake_start) as mock_start, \
@@ -2506,7 +2800,12 @@ def test_summarize_trace_file_reads_structured_chat_usage(tmp_path: Path):
                 "response": "Hi!",
                 "model": "gpt-4.1-mini",
                 "provider": "openai",
-                "usage": {"prompt_tokens": 4, "completion_tokens": 3, "total_tokens": 7},
+                "usage": {
+                    "prompt_tokens": 4,
+                    "completion_tokens": 3,
+                    "total_tokens": 7,
+                    "prompt_tokens_details": {"cached_tokens": 2, "cache_write_tokens": 1},
+                },
             }
         )
         + "\n",
@@ -2519,6 +2818,8 @@ def test_summarize_trace_file_reads_structured_chat_usage(tmp_path: Path):
     assert metrics.model == "gpt-4.1-mini"
     assert metrics.input_tokens == 4
     assert metrics.output_tokens == 3
+    assert metrics.cache_read_tokens == 2
+    assert metrics.cache_write_tokens == 1
     assert metrics.total_tokens == 7
     assert metrics.est_total_tokens == 7
     assert metrics.has_token_usage is True
@@ -2549,6 +2850,44 @@ def test_summarize_trace_file_keeps_missing_provider_usage_unknown(tmp_path: Pat
     assert metrics.total_cost == 0.0
     assert metrics.has_token_usage is False
     assert metrics.has_cost is False
+
+
+def test_summarize_trace_file_reads_external_session_cache_metrics(tmp_path: Path):
+    trace_file = tmp_path / "external-trace.jsonl"
+    trace_file.write_text(
+        json.dumps(
+            {
+                "type": "external_session_meta",
+                "payload": {
+                    "model_provider": "openrouter",
+                    "model": "minimax/minimax-m3",
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                    "reasoning_tokens": 2,
+                    "cache_read_tokens": 7,
+                    "cache_write_tokens": 3,
+                    "total_tokens": 27,
+                    "total_cost": 0.004,
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    metrics = CodexRunner._summarize_trace_file(trace_file)
+
+    assert metrics.provider == "openrouter"
+    assert metrics.model == "minimax/minimax-m3"
+    assert metrics.input_tokens == 10
+    assert metrics.output_tokens == 5
+    assert metrics.reasoning_tokens == 2
+    assert metrics.cache_read_tokens == 7
+    assert metrics.cache_write_tokens == 3
+    assert metrics.total_tokens == 27
+    assert metrics.total_cost == 0.004
+    assert metrics.has_token_usage is True
+    assert metrics.has_cost is True
 
 
 def test_summarize_trace_file_reads_hermes_session_meta(tmp_path: Path):
@@ -3845,6 +4184,58 @@ def test_chat_runner_prefers_openrouter_generation_stats_usage(tmp_path: Path):
     stats_request = mock_urlopen.call_args_list[1].args[0]
     assert mock_urlopen.call_args_list[1].kwargs["timeout"] == 3
     assert stats_request.full_url == "https://openrouter.ai/api/v1/generation?id=gen-openrouter-123"
+
+
+def test_chat_usage_reads_openrouter_prompt_cache_details():
+    usage = ChatRunner._normalize_usage(
+        {
+            "prompt_tokens": 10339,
+            "completion_tokens": 60,
+            "total_tokens": 10399,
+            "prompt_tokens_details": {
+                "cached_tokens": 10318,
+                "cache_write_tokens": 21,
+            },
+        }
+    )
+
+    assert usage == {
+        "input": 10339,
+        "output": 60,
+        "reasoning": 0,
+        "totalTokens": 10399,
+        "cacheRead": 10318,
+        "cacheWrite": 21,
+    }
+
+
+def test_openrouter_generation_stats_reads_prompt_cache_details():
+    usage = DockerRuntimeRunner._openrouter_usage_from_generation_data(
+        {
+            "id": "gen-openrouter-cache",
+            "model": "qwen/qwen3-coder-plus",
+            "provider_name": "Qwen",
+            "native_tokens_prompt": 10339,
+            "native_tokens_completion": 60,
+            "prompt_tokens_details": {
+                "cached_tokens": 10318,
+                "cache_write_tokens": 21,
+            },
+            "total_cost": 0.001,
+        }
+    )
+
+    assert usage == {
+        "input": 10339,
+        "output": 60,
+        "reasoning": 0,
+        "cacheRead": 10318,
+        "totalTokens": 10399,
+        "cacheWrite": 21,
+        "cost": {"total": 0.001},
+        "generation_id": "gen-openrouter-cache",
+        "provider_name": "Qwen",
+    }
 
 
 def test_chat_runner_supports_follow_up_prompts_as_multiturn_rows(tmp_path: Path):

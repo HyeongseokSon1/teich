@@ -1254,6 +1254,114 @@ def test_normalize_claude_code_trace_groups_message_fragments_and_drops_blank_te
     ]
 
 
+def test_convert_claude_code_realistic_fragments_preserve_each_reasoning_turn(tmp_path: Path):
+    trace_file = tmp_path / "claude-realistic-fragments.jsonl"
+    events = [
+        {
+            "type": "user",
+            "sessionId": "session-1",
+            "uuid": "user-1",
+            "message": {"role": "user", "content": "Explore the repo"},
+        },
+        {
+            "type": "assistant",
+            "sessionId": "session-1",
+            "uuid": "assistant-1-thinking",
+            "parentUuid": "user-1",
+            "timestamp": "2026-05-13T00:00:01.000Z",
+            "message": {
+                "id": "msg_1",
+                "role": "assistant",
+                "model": "claude-sonnet-4-6",
+                "content": [{"type": "thinking", "thinking": "First I need to inspect the project files."}],
+            },
+        },
+        {
+            "type": "assistant",
+            "sessionId": "session-1",
+            "uuid": "assistant-1-tool",
+            "parentUuid": "assistant-1-thinking",
+            "timestamp": "2026-05-13T00:00:02.000Z",
+            "message": {
+                "id": "msg_1",
+                "role": "assistant",
+                "model": "claude-sonnet-4-6",
+                "content": [{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls"}}],
+            },
+        },
+        {
+            "type": "user",
+            "sessionId": "session-1",
+            "uuid": "tool-result-1",
+            "parentUuid": "assistant-1-tool",
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "README.md\nsrc"}],
+            },
+        },
+        {
+            "type": "assistant",
+            "sessionId": "session-1",
+            "uuid": "assistant-blank",
+            "parentUuid": "tool-result-1",
+            "timestamp": "2026-05-13T00:00:03.000Z",
+            "message": {"id": "msg_2", "role": "assistant", "model": "claude-sonnet-4-6", "content": []},
+        },
+        {
+            "type": "assistant",
+            "sessionId": "session-1",
+            "uuid": "assistant-period",
+            "parentUuid": "assistant-blank",
+            "timestamp": "2026-05-13T00:00:04.000Z",
+            "message": {
+                "id": "msg_2",
+                "role": "assistant",
+                "model": "claude-sonnet-4-6",
+                "content": [{"type": "text", "text": "."}],
+            },
+        },
+        {
+            "type": "assistant",
+            "sessionId": "session-1",
+            "uuid": "assistant-2-thinking",
+            "parentUuid": "assistant-period",
+            "timestamp": "2026-05-13T00:00:05.000Z",
+            "message": {
+                "id": "msg_2",
+                "role": "assistant",
+                "model": "claude-sonnet-4-6",
+                "content": [{"type": "thinking", "thinking": "Next I should read the README before editing."}],
+            },
+        },
+        {
+            "type": "assistant",
+            "sessionId": "session-1",
+            "uuid": "assistant-2-tool",
+            "parentUuid": "assistant-2-thinking",
+            "timestamp": "2026-05-13T00:00:06.000Z",
+            "message": {
+                "id": "msg_2",
+                "role": "assistant",
+                "model": "claude-sonnet-4-6",
+                "content": [
+                    {"type": "tool_use", "id": "toolu_2", "name": "Read", "input": {"file_path": "README.md"}}
+                ],
+            },
+        },
+    ]
+    trace_file.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+
+    example = convert_trace_to_training_example(trace_file)
+
+    assistant_messages = [message for message in example.messages if message["role"] == "assistant"]
+    assert [message.get("reasoning_content") for message in assistant_messages] == [
+        "First I need to inspect the project files.",
+        "Next I should read the README before editing.",
+    ]
+    assert [message["tool_calls"][0]["function"]["name"] for message in assistant_messages] == ["Bash", "Read"]
+    assert all(message.get("content", "") != "." for message in assistant_messages)
+
+
 def test_convert_trace_normalizes_nested_json_encoded_tool_arguments(tmp_path: Path):
     trace_file = tmp_path / "codex-nested-tool-args.jsonl"
     events = [

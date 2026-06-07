@@ -558,6 +558,7 @@ class TraceMetrics:
                 "cacheRead",
                 "cached_input_tokens",
                 "cacheWrite",
+                "prompt_tokens_details",
                 "totalTokens",
                 "total_tokens",
             ),
@@ -570,8 +571,18 @@ class TraceMetrics:
             or usage.get("reasoning_tokens")
             or usage.get("reasoning_output_tokens")
         )
-        self.cache_read_tokens += self._int_value(usage.get("cacheRead") or usage.get("cached_input_tokens"))
-        self.cache_write_tokens += self._int_value(usage.get("cacheWrite"))
+        prompt_token_details = usage.get("prompt_tokens_details")
+        if not isinstance(prompt_token_details, dict):
+            prompt_token_details = {}
+        self.cache_read_tokens += self._int_value(
+            usage.get("cacheRead")
+            or usage.get("cached_input_tokens")
+            or prompt_token_details.get("cached_tokens")
+        )
+        self.cache_write_tokens += self._int_value(
+            usage.get("cacheWrite")
+            or prompt_token_details.get("cache_write_tokens")
+        )
         total_tokens = self._int_value(usage.get("totalTokens") or usage.get("total_tokens"))
         if total_tokens:
             self.total_tokens += total_tokens
@@ -1683,10 +1694,22 @@ class DockerRuntimeRunner:
             data.get("native_tokens_completion") or data.get("tokens_completion")
         )
         reasoning_tokens = TraceMetrics._int_value(data.get("native_tokens_reasoning"))
-        cache_read_tokens = TraceMetrics._int_value(data.get("native_tokens_cached"))
+        prompt_token_details = data.get("prompt_tokens_details")
+        if not isinstance(prompt_token_details, dict):
+            prompt_token_details = {}
+        cache_read_tokens = TraceMetrics._int_value(
+            data.get("native_tokens_cached")
+            or data.get("cacheRead")
+            or data.get("cached_input_tokens")
+            or prompt_token_details.get("cached_tokens")
+        )
+        cache_write_tokens = TraceMetrics._int_value(
+            data.get("cacheWrite")
+            or prompt_token_details.get("cache_write_tokens")
+        )
         total_tokens = input_tokens + output_tokens + reasoning_tokens
         cost = data.get("total_cost")
-        if not total_tokens and not isinstance(cost, (int, float)):
+        if not total_tokens and not cache_read_tokens and not cache_write_tokens and not isinstance(cost, (int, float)):
             return None
         usage: dict[str, Any] = {
             "input": input_tokens,
@@ -1695,6 +1718,8 @@ class DockerRuntimeRunner:
             "cacheRead": cache_read_tokens,
             "totalTokens": total_tokens,
         }
+        if cache_write_tokens:
+            usage["cacheWrite"] = cache_write_tokens
         if isinstance(cost, (int, float)) and not isinstance(cost, bool):
             usage["cost"] = {"total": float(cost)}
         generation_id = data.get("id")
@@ -1827,24 +1852,7 @@ class DockerRuntimeRunner:
                 if event_type == "external_session_meta":
                     payload = event.get("payload")
                     if isinstance(payload, dict):
-                        provider = payload.get("model_provider")
-                        model = payload.get("model")
-                        if isinstance(provider, str) and provider.strip() and not metrics.provider:
-                            metrics.provider = provider.strip()
-                        if isinstance(model, str) and model.strip() and not metrics.model:
-                            metrics.model = model.strip()
-                        input_tokens = TraceMetrics._int_value(payload.get("input_tokens"))
-                        output_tokens = TraceMetrics._int_value(payload.get("output_tokens"))
-                        total_tokens = TraceMetrics._int_value(payload.get("total_tokens"))
-                        if TraceMetrics._has_any_key(payload, ("input_tokens", "output_tokens", "total_tokens")):
-                            metrics.has_token_usage = True
-                        metrics.input_tokens += input_tokens
-                        metrics.output_tokens += output_tokens
-                        metrics.total_tokens += total_tokens or input_tokens + output_tokens
-                        cost = payload.get("total_cost")
-                        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
-                            metrics.has_cost = True
-                            metrics.total_cost += float(cost)
+                        cls._apply_hermes_session_metrics(metrics, payload)
                     continue
 
                 if event_type == "system" and event.get("subtype") == "init":
@@ -2515,14 +2523,12 @@ class CodexRunner(DockerRuntimeRunner):
             *self._build_codex_agent_command(resume=resume),
         ]
 
-    def _extract_session_file(
+    def _latest_session_source_file(
         self,
-        session_id: str,
         codex_home: Path,
         existing_sessions: set[Path],
         started_at: datetime,
-    ) -> Path:
-        """Extract a session file from the mounted CODEX_HOME and save it to output."""
+    ) -> Path | None:
         session_files = self._list_session_files(codex_home)
         fresh_files = [path for path in session_files if path.resolve() not in existing_sessions]
         if not fresh_files:
@@ -2532,8 +2538,20 @@ class CodexRunner(DockerRuntimeRunner):
                 if datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc) >= started_at
             ]
         if not fresh_files:
+            return None
+        return max(fresh_files, key=lambda path: path.stat().st_mtime)
+
+    def _extract_session_file(
+        self,
+        session_id: str,
+        codex_home: Path,
+        existing_sessions: set[Path],
+        started_at: datetime,
+    ) -> Path:
+        """Extract a session file from the mounted CODEX_HOME and save it to output."""
+        source_path = self._latest_session_source_file(codex_home, existing_sessions, started_at)
+        if source_path is None:
             raise RuntimeError(f"No session file found for {session_id}")
-        source_path = max(fresh_files, key=lambda path: path.stat().st_mtime)
         destination = self._resolve_output_path(source_path.name)
         destination.parent.mkdir(parents=True, exist_ok=True)
         self._copy_normalized_session_file(source_path, destination)
@@ -2588,41 +2606,58 @@ class CodexRunner(DockerRuntimeRunner):
                     container_name,
                 )
             for turn_index, turn_prompt in enumerate(turn_prompts):
-                if len(turn_prompts) > 1:
-                    cmd = self._build_codex_exec_command(container_name, resume=turn_index > 0)
-                else:
-                    cmd = self._build_codex_command(
-                        turn_prompt,
-                        workspace,
-                        codex_home,
-                        container_name,
-                        resume=turn_index > 0,
-                    )
-                try:
-                    self._run_process(
-                        cmd,
-                        session_id,
-                        started_at,
-                        codex_home / "sessions",
-                        progress_callback,
-                        progress_base,
-                        container_name,
-                        turn_prompt,
-                        remove_container_on_error=len(turn_prompts) <= 1,
-                    )
-                except subprocess.TimeoutExpired:
-                    raise RuntimeError(
-                        f"Session {session_id[:8]} timed out after {self.config.timeout_seconds}s"
-                    )
-                except subprocess.CalledProcessError as e:
-                    stderr = e.stderr if isinstance(e.stderr, str) else (e.stderr or "")
-                    if "'type' of tool must be 'function'" in stderr:
-                        stderr = (
-                            f"{stderr}\nHint: this custom provider endpoint is not fully compatible with Codex's Responses API tool format. "
-                            "Use a provider that supports Codex Responses semantics, or use Codex OSS mode with a supported local provider."
+                expected_turns = turn_prompts[: turn_index + 1]
+                for attempt in range(AGENT_TURN_RETRY_LIMIT + 1):
+                    resume = turn_index > 0 or attempt > 0
+                    if len(turn_prompts) > 1:
+                        cmd = self._build_codex_exec_command(container_name, resume=resume)
+                    else:
+                        cmd = self._build_codex_command(
+                            turn_prompt,
+                            workspace,
+                            codex_home,
+                            container_name,
+                            resume=resume,
                         )
+                    process_error: subprocess.CalledProcessError | None = None
+                    details = ""
+                    try:
+                        self._run_process(
+                            cmd,
+                            session_id,
+                            started_at,
+                            codex_home / "sessions",
+                            progress_callback,
+                            progress_base,
+                            container_name,
+                            turn_prompt,
+                            remove_container_on_error=len(turn_prompts) <= 1,
+                        )
+                    except subprocess.TimeoutExpired:
+                        raise RuntimeError(
+                            f"Session {session_id[:8]} timed out after {self.config.timeout_seconds}s"
+                        )
+                    except subprocess.CalledProcessError as exc:
+                        process_error = exc
+                        stderr = exc.stderr if isinstance(exc.stderr, str) else (exc.stderr or "")
+                        stdout = exc.stdout if isinstance(exc.stdout, str) else (exc.stdout or "")
+                        details = stderr.strip() or stdout.strip() or str(exc)
+                        if "'type' of tool must be 'function'" in details:
+                            details = (
+                                f"{details}\nHint: this custom provider endpoint is not fully compatible with Codex's Responses API tool format. "
+                                "Use a provider that supports Codex Responses semantics, or use Codex OSS mode with a supported local provider."
+                            )
+
+                    source_trace = self._latest_session_source_file(codex_home, existing_sessions, started_at)
+                    if source_trace is None and process_error is None:
+                        break
+                    if source_trace is not None and self._trace_contains_completed_turns(source_trace, expected_turns):
+                        break
+                    if attempt < AGENT_TURN_RETRY_LIMIT:
+                        continue
+
+                    failure_trace_checked = True
                     if turn_index == len(turn_prompts) - 1:
-                        failure_trace_checked = True
                         try:
                             trace_path = self._extract_session_file(
                                 session_id,
@@ -2638,8 +2673,7 @@ class CodexRunner(DockerRuntimeRunner):
                                 self._copy_workspace_snapshot(workspace, self._sandbox_destination(trace_path))
                                 return trace_path
                             failure_trace_saved = True
-                    else:
-                        failure_trace_checked = True
+                    elif source_trace is not None:
                         try:
                             trace_path = self._extract_session_file(
                                 session_id,
@@ -2652,7 +2686,14 @@ class CodexRunner(DockerRuntimeRunner):
                         if trace_path is not None:
                             self._discard_output_file(trace_path)
                             failure_trace_saved = True
-                    raise RuntimeError(f"Session {session_id[:8]} failed: {stderr}")
+                    if process_error is not None:
+                        raise RuntimeError(
+                            f"Session {session_id[:8]} failed after {AGENT_TURN_RETRY_LIMIT} turn retries: {details}"
+                        ) from process_error
+                    raise RuntimeError(
+                        f"Session {session_id[:8]} stopped before completing turn {turn_index + 1} "
+                        f"after {AGENT_TURN_RETRY_LIMIT} retries"
+                    )
             trace_path = self._extract_session_file(
                 session_id,
                 codex_home,
@@ -3347,49 +3388,45 @@ class ClaudeCodeRunner(ExternalCliRunner):
             for turn_index, turn_prompt in enumerate(turn_prompts):
                 (workspace / TEICH_PROMPT_FILE_NAME).write_text(turn_prompt, encoding="utf-8")
                 (workspace / TEICH_PROMPT_FILE_NAME).chmod(0o666)
-                if len(turn_prompts) > 1:
-                    command = self._build_external_exec_command(container_name, continue_session=turn_index > 0)
-                else:
-                    command = self._build_external_command(
-                        workspace,
-                        home_dir,
-                        container_name,
-                        continue_session=turn_index > 0,
-                    )
-                try:
-                    self._run_native_process_with_progress(
-                        command,
-                        container_name,
-                        session_id=session_id,
-                        home_dir=home_dir,
-                        existing_sessions=existing_sessions,
-                        started_at=started_at,
-                        progress_callback=progress_callback,
-                        progress_base=progress_base,
-                    )
-                except subprocess.CalledProcessError as exc:
-                    stderr = exc.stderr if isinstance(exc.stderr, str) else (exc.stderr or "")
-                    stdout = exc.output if isinstance(exc.output, str) else (exc.output or "")
-                    details = stderr.strip() or stdout.strip()
-                    if turn_index == len(turn_prompts) - 1:
-                        failure_trace_checked = True
-                        try:
-                            trace_path = self._extract_native_session_file(
-                                session_id,
-                                home_dir,
-                                existing_sessions,
-                                started_at,
-                            )
-                        except RuntimeError:
-                            trace_path = None
-                        if trace_path is not None:
-                            accepted_trace = self._accept_trace_if_complete(trace_path, turn_prompts)
-                            if accepted_trace is not None:
-                                self._copy_workspace_snapshot(workspace, self._sandbox_destination(trace_path))
-                                return trace_path
-                            failure_trace_saved = True
+                expected_turns = turn_prompts[: turn_index + 1]
+                for attempt in range(AGENT_TURN_RETRY_LIMIT + 1):
+                    continue_session = turn_index > 0 or attempt > 0
+                    if len(turn_prompts) > 1:
+                        command = self._build_external_exec_command(container_name, continue_session=continue_session)
                     else:
-                        failure_trace_checked = True
+                        command = self._build_external_command(
+                            workspace,
+                            home_dir,
+                            container_name,
+                            continue_session=continue_session,
+                        )
+                    process_error: subprocess.CalledProcessError | None = None
+                    details = ""
+                    try:
+                        self._run_native_process_with_progress(
+                            command,
+                            container_name,
+                            session_id=session_id,
+                            home_dir=home_dir,
+                            existing_sessions=existing_sessions,
+                            started_at=started_at,
+                            progress_callback=progress_callback,
+                            progress_base=progress_base,
+                        )
+                    except subprocess.CalledProcessError as exc:
+                        process_error = exc
+                        stderr = exc.stderr if isinstance(exc.stderr, str) else (exc.stderr or "")
+                        stdout = exc.output if isinstance(exc.output, str) else (exc.output or "")
+                        details = stderr.strip() or stdout.strip() or str(exc)
+
+                    source_trace = self._latest_native_session_file(home_dir, existing_sessions, started_at)
+                    if source_trace is not None and self._trace_contains_completed_turns(source_trace, expected_turns):
+                        break
+                    if attempt < AGENT_TURN_RETRY_LIMIT:
+                        continue
+
+                    failure_trace_checked = True
+                    if source_trace is not None:
                         try:
                             trace_path = self._extract_native_session_file(
                                 session_id,
@@ -3402,8 +3439,20 @@ class ClaudeCodeRunner(ExternalCliRunner):
                         if trace_path is not None:
                             self._discard_output_file(trace_path)
                             failure_trace_saved = True
-                    raise RuntimeError(f"Session {session_id[:8]} failed: {details}") from exc
+                    if process_error is not None:
+                        raise RuntimeError(
+                            f"Session {session_id[:8]} failed after {AGENT_TURN_RETRY_LIMIT} turn retries: {details}"
+                        ) from process_error
+                    raise RuntimeError(
+                        f"Session {session_id[:8]} stopped before completing turn {turn_index + 1} "
+                        f"after {AGENT_TURN_RETRY_LIMIT} retries"
+                    )
             trace_path = self._extract_native_session_file(session_id, home_dir, existing_sessions, started_at)
+            if not self._trace_contains_completed_turns(trace_path, turn_prompts):
+                failure_trace_checked = True
+                self._discard_output_file(trace_path)
+                failure_trace_saved = True
+                raise RuntimeError(f"Session {session_id[:8]} stopped before completing all Claude Code turns")
             self._copy_workspace_snapshot(workspace, self._sandbox_destination(trace_path))
             return trace_path
         except BaseException:
@@ -4122,8 +4171,18 @@ class ChatRunner(DockerRuntimeRunner):
             or (usage.get("output_tokens_details") or {}).get("reasoning_tokens")
             or (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
         )
-        cache_read_tokens = TraceMetrics._int_value(usage.get("cacheRead") or usage.get("cached_input_tokens"))
-        cache_write_tokens = TraceMetrics._int_value(usage.get("cacheWrite"))
+        prompt_token_details = usage.get("prompt_tokens_details")
+        if not isinstance(prompt_token_details, dict):
+            prompt_token_details = {}
+        cache_read_tokens = TraceMetrics._int_value(
+            usage.get("cacheRead")
+            or usage.get("cached_input_tokens")
+            or prompt_token_details.get("cached_tokens")
+        )
+        cache_write_tokens = TraceMetrics._int_value(
+            usage.get("cacheWrite")
+            or prompt_token_details.get("cache_write_tokens")
+        )
         total_tokens = TraceMetrics._int_value(usage.get("totalTokens") or usage.get("total_tokens"))
         normalized = {
             "input": input_tokens,
