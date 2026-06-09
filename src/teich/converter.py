@@ -1545,6 +1545,21 @@ def _convert_claude_code_trace_to_training_example(
     )
 
 
+def _droid_settings_path(trace_file: Path) -> Path:
+    return trace_file.with_suffix(".settings.json")
+
+
+def _load_droid_settings_sidecar(trace_file: Path) -> dict[str, Any]:
+    settings_path = _droid_settings_path(trace_file)
+    if not settings_path.exists():
+        return {}
+    try:
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return settings if isinstance(settings, dict) else {}
+
+
 def _convert_droid_trace_to_training_example(
     trace_file: Path,
     events: list[dict[str, Any]],
@@ -1660,16 +1675,26 @@ def _convert_droid_trace_to_training_example(
             ),
             "",
         )
+    settings = _load_droid_settings_sidecar(trace_file)
+    model = settings.get("model")
+    provider_lock = settings.get("providerLock")
     metadata: dict[str, Any] = {
         "source_file": trace_file.name,
         "session_id": session_id or trace_file.stem,
         "trace_type": "droid",
-        "model_provider": "factory",
-        "model": None,
+        "model_provider": provider_lock if isinstance(provider_lock, str) and provider_lock.strip() else "factory",
+        "model": model if isinstance(model, str) and model.strip() else None,
         "cwd": cwd,
         "title": title,
         "turn_count": sum(1 for message in messages if message.get("role") == "user"),
     }
+    usage = settings.get("tokenUsage")
+    if isinstance(usage, dict) and usage:
+        metadata["usage"] = usage
+    for settings_key, metadata_key in (("reasoningEffort", "reasoning_effort"), ("autonomyLevel", "autonomy_level")):
+        value = settings.get(settings_key)
+        if isinstance(value, str) and value.strip():
+            metadata[metadata_key] = value.strip()
     return TrainingExample(
         source_file=trace_file,
         prompt=prompt,

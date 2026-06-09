@@ -586,6 +586,66 @@ def test_convert_droid_trace(tmp_path: Path):
     assert "LS" in tool_names
 
 
+def test_convert_droid_trace_reads_settings_sidecar(tmp_path: Path):
+    trace_file = tmp_path / "droid-settings.jsonl"
+    events = [
+        {"type": "session_start", "id": "droid-session", "version": 2, "cwd": "/workspace/project"},
+        {
+            "type": "message",
+            "id": "message-1",
+            "message": {"role": "user", "content": [{"type": "text", "text": "Say hi"}]},
+        },
+        {
+            "type": "message",
+            "id": "message-2",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "Hi!"}]},
+        },
+    ]
+    trace_file.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+    settings = {
+        "model": "custom:Kimi-K2.6-[HF-Router]-0",
+        "reasoningEffort": "high",
+        "autonomyLevel": "medium",
+        "providerLock": "generic-chat-completion-api",
+        "tokenUsage": {
+            "inputTokens": 202809,
+            "outputTokens": 29390,
+            "cacheCreationTokens": 0,
+            "cacheReadTokens": 4843520,
+            "thinkingTokens": 0,
+            "factoryCredits": 0,
+        },
+    }
+    (tmp_path / "droid-settings.settings.json").write_text(json.dumps(settings), encoding="utf-8")
+
+    example = convert_trace_to_training_example(trace_file)
+
+    assert example.metadata["model"] == "custom:Kimi-K2.6-[HF-Router]-0"
+    assert example.metadata["model_provider"] == "generic-chat-completion-api"
+    assert example.metadata["usage"] == settings["tokenUsage"]
+    assert example.metadata["reasoning_effort"] == "high"
+    assert example.metadata["autonomy_level"] == "medium"
+
+
+def test_convert_droid_trace_without_settings_sidecar(tmp_path: Path):
+    trace_file = tmp_path / "droid-no-settings.jsonl"
+    events = [
+        {"type": "session_start", "id": "droid-session", "version": 2, "cwd": "/workspace/project"},
+        {
+            "type": "message",
+            "id": "message-1",
+            "message": {"role": "user", "content": [{"type": "text", "text": "Say hi"}]},
+        },
+    ]
+    trace_file.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+
+    example = convert_trace_to_training_example(trace_file)
+
+    assert example.metadata["model"] is None
+    assert example.metadata["model_provider"] == "factory"
+    assert "usage" not in example.metadata
+
+
 def test_convert_droid_trace_includes_builtin_tools(tmp_path: Path):
     trace_file = tmp_path / "droid-tools.jsonl"
     events = [
