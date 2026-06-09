@@ -241,6 +241,136 @@ _CLAUDE_CODE_BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     },
 }
 
+_DROID_BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
+    "Read": {
+        "description": "Read a file from the filesystem.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                "offset": {"type": "number"},
+                "limit": {"type": "number"},
+                "image_quality": {"type": "string"},
+            },
+            "required": ["file_path"],
+            "additionalProperties": True,
+        },
+    },
+    "Edit": {
+        "description": "Replace a string in a file.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                "old_str": {"type": "string"},
+                "new_str": {"type": "string"},
+            },
+            "required": ["file_path", "old_str", "new_str"],
+            "additionalProperties": True,
+        },
+    },
+    "Create": {
+        "description": "Create a new file with the given content.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                "content": {"type": "string"},
+            },
+            "required": ["file_path", "content"],
+            "additionalProperties": True,
+        },
+    },
+    "Execute": {
+        "description": "Run a shell command.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string"},
+                "summary": {"type": "string"},
+                "riskLevel": {"type": "string"},
+                "riskLevelReason": {"type": "string"},
+                "timeout": {"type": "number"},
+                "fireAndForget": {"type": "boolean"},
+            },
+            "required": ["command"],
+            "additionalProperties": True,
+        },
+    },
+    "LS": {
+        "description": "List the contents of a directory.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "directory_path": {"type": "string"},
+            },
+            "required": ["directory_path"],
+            "additionalProperties": True,
+        },
+    },
+    "Glob": {
+        "description": "Find files matching glob patterns.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "patterns": {"type": "array", "items": {"type": "string"}},
+                "folder": {"type": "string"},
+            },
+            "required": ["patterns"],
+            "additionalProperties": True,
+        },
+    },
+    "Grep": {
+        "description": "Search file contents for a pattern.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string"},
+                "path": {"type": "string"},
+                "output_mode": {"type": "string"},
+                "case_insensitive": {"type": "boolean"},
+                "fixed_string": {"type": "boolean"},
+                "head_limit": {"type": "number"},
+            },
+            "required": ["pattern"],
+            "additionalProperties": True,
+        },
+    },
+    "TodoWrite": {
+        "description": "Update the task list.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "todos": {"type": "string"},
+            },
+            "required": ["todos"],
+            "additionalProperties": True,
+        },
+    },
+    "FetchUrl": {
+        "description": "Fetch the contents of a URL.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string"},
+            },
+            "required": ["url"],
+            "additionalProperties": True,
+        },
+    },
+    "Skill": {
+        "description": "Invoke a skill.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "skill": {"type": "string"},
+            },
+            "required": ["skill"],
+            "additionalProperties": True,
+        },
+    },
+}
+
 
 @dataclass(slots=True)
 class TrainingExample:
@@ -1420,8 +1550,8 @@ def _convert_droid_trace_to_training_example(
     events: list[dict[str, Any]],
 ) -> TrainingExample:
     messages: list[dict[str, Any]] = []
-    tool_names: set[str] = set()
-    tool_schemas: dict[str, dict[str, Any]] = {}
+    tool_names: set[str] = set(_DROID_BUILTIN_TOOL_SCHEMAS)
+    tool_schemas: dict[str, dict[str, Any]] = deepcopy(_DROID_BUILTIN_TOOL_SCHEMAS)
     tool_argument_samples: dict[str, list[Any]] = {}
     tool_names_by_call_id: dict[str, str] = {}
     session_id: str | None = None

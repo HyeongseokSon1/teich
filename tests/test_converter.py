@@ -586,6 +586,34 @@ def test_convert_droid_trace(tmp_path: Path):
     assert "LS" in tool_names
 
 
+def test_convert_droid_trace_includes_builtin_tools(tmp_path: Path):
+    trace_file = tmp_path / "droid-tools.jsonl"
+    events = [
+        {"type": "session_start", "id": "droid-session", "version": 2, "cwd": "/workspace/project"},
+        {
+            "type": "message",
+            "id": "message-1",
+            "message": {"role": "user", "content": [{"type": "text", "text": "Say hi"}]},
+        },
+        {
+            "type": "message",
+            "id": "message-2",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "Hi!"}]},
+        },
+    ]
+    trace_file.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+
+    example = convert_trace_to_training_example(trace_file)
+
+    tool_names = {tool["function"]["name"] for tool in example.tools}
+    assert {"Read", "Edit", "Create", "Execute", "LS", "Glob", "Grep", "TodoWrite", "FetchUrl", "Skill"}.issubset(tool_names)
+    read_tool = next(tool for tool in example.tools if tool["function"]["name"] == "Read")
+    assert read_tool["function"]["parameters"]["properties"]["file_path"]["type"] == "string"
+    assert read_tool["function"]["parameters"]["required"] == ["file_path"]
+    glob_tool = next(tool for tool in example.tools if tool["function"]["name"] == "Glob")
+    assert glob_tool["function"]["parameters"]["properties"]["patterns"]["type"] == "array"
+
+
 def test_convert_claude_code_keeps_init_tools_without_tool_calls(tmp_path: Path):
     trace_file = tmp_path / "claude-no-tools.jsonl"
     events = [
