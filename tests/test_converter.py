@@ -646,6 +646,39 @@ def test_convert_droid_trace_without_settings_sidecar(tmp_path: Path):
     assert "usage" not in example.metadata
 
 
+def test_convert_droid_trace_prefers_user_authored_prompt(tmp_path: Path):
+    trace_file = tmp_path / "droid-prompt.jsonl"
+    events = [
+        {"type": "session_start", "id": "droid-session", "version": 2, "cwd": "/workspace/project"},
+        {
+            "type": "message",
+            "id": "message-1",
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": "<system-reminder>Injected environment context.</system-reminder>"}],
+                "visibility": "llm_only",
+            },
+        },
+        {
+            "type": "message",
+            "id": "message-2",
+            "message": {"role": "user", "content": [{"type": "text", "text": "Summarize the README"}]},
+        },
+        {
+            "type": "message",
+            "id": "message-3",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "Done."}]},
+        },
+    ]
+    trace_file.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+
+    example = convert_trace_to_training_example(trace_file)
+
+    assert example.prompt == "Summarize the README"
+    assert example.messages[0]["content"].startswith("<system-reminder>")
+    assert example.messages[1] == {"role": "user", "content": "Summarize the README"}
+
+
 def test_convert_droid_trace_skips_user_only_and_state_events(tmp_path: Path):
     trace_file = tmp_path / "droid-edge-cases.jsonl"
     events = [

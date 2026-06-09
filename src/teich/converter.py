@@ -1620,7 +1620,7 @@ def _convert_droid_trace_to_training_example(
                     )
                 continue
             content = _claude_text_from_content(content_blocks)
-            if content and not prompt:
+            if content and not prompt and payload.get("visibility") != "llm_only":
                 prompt = content
             if content:
                 messages.append({"role": "user", "content": content})
