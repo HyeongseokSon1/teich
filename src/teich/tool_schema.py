@@ -226,6 +226,276 @@ PI_BUILTIN_TOOLS: list[dict[str, Any]] = [
 ]
 
 
+HERMES_BUILTIN_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "delegate_task",
+            "description": "Spawn isolated Hermes subagents for delegated tasks.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal": {"type": "string"},
+                    "context": {"type": "string"},
+                    "toolsets": {"type": "array", "items": {"type": "string"}},
+                    "tasks": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "goal": {"type": "string"},
+                                "context": {"type": "string"},
+                                "toolsets": {"type": "array", "items": {"type": "string"}},
+                                "acp_command": {"type": "string"},
+                                "acp_args": {"type": "array", "items": {"type": "string"}},
+                                "role": {"type": "string", "enum": ["leaf", "orchestrator"]},
+                            },
+                            "required": ["goal"],
+                            "additionalProperties": True,
+                        },
+                    },
+                    "role": {"type": "string", "enum": ["leaf", "orchestrator"]},
+                    "acp_command": {"type": "string"},
+                    "acp_args": {"type": "array", "items": {"type": "string"}},
+                },
+                "additionalProperties": True,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory",
+            "description": "Add, replace, or remove durable Hermes memory entries.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["add", "replace", "remove"]},
+                    "target": {"type": "string", "enum": ["memory", "user"]},
+                    "content": {"type": "string"},
+                    "old_text": {"type": "string"},
+                },
+                "required": ["action", "target"],
+                "additionalProperties": True,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "patch",
+            "description": "Apply targeted file edits or multi-file patches.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "mode": {"type": "string", "enum": ["replace", "patch"]},
+                    "path": {"type": "string"},
+                    "old_string": {"type": "string"},
+                    "new_string": {"type": "string"},
+                    "replace_all": {"type": "boolean"},
+                    "patch": {"type": "string"},
+                    "cross_profile": {"type": "boolean"},
+                },
+                "required": ["mode"],
+                "additionalProperties": True,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "process",
+            "description": "Manage background processes started by Hermes terminal calls.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "poll", "log", "wait", "kill", "write", "submit", "close"],
+                    },
+                    "session_id": {"type": "string"},
+                    "data": {"type": "string"},
+                    "timeout": {"type": "integer"},
+                    "offset": {"type": "integer"},
+                    "limit": {"type": "integer"},
+                },
+                "required": ["action"],
+                "additionalProperties": True,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read a text file with optional pagination.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "offset": {"type": "integer"},
+                    "limit": {"type": "integer"},
+                },
+                "required": ["path"],
+                "additionalProperties": True,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_files",
+            "description": "Search file contents or filenames.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string"},
+                    "target": {"type": "string", "enum": ["content", "files"]},
+                    "path": {"type": "string"},
+                    "file_glob": {"type": "string"},
+                    "limit": {"type": "integer"},
+                    "offset": {"type": "integer"},
+                    "output_mode": {"type": "string", "enum": ["content", "files_only", "count"]},
+                    "context": {"type": "integer"},
+                },
+                "required": ["pattern"],
+                "additionalProperties": True,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "session_search",
+            "description": "Search or inspect previous Hermes sessions.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer"},
+                    "sort": {"type": "string", "enum": ["newest", "oldest"]},
+                    "session_id": {"type": "string"},
+                    "around_message_id": {"type": "integer"},
+                    "window": {"type": "integer"},
+                    "role_filter": {"type": "string"},
+                    "profile": {"type": "string"},
+                },
+                "additionalProperties": True,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "skill_manage",
+            "description": "Create, patch, edit, delete, or update files for Hermes skills.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["create", "patch", "edit", "delete", "write_file", "remove_file"],
+                    },
+                    "name": {"type": "string"},
+                    "content": {"type": "string"},
+                    "old_string": {"type": "string"},
+                    "new_string": {"type": "string"},
+                    "replace_all": {"type": "boolean"},
+                    "category": {"type": "string"},
+                    "file_path": {"type": "string"},
+                    "file_content": {"type": "string"},
+                    "absorbed_into": {"type": "string"},
+                },
+                "required": ["action", "name"],
+                "additionalProperties": True,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "skill_view",
+            "description": "View a Hermes skill or one of its linked files.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "file_path": {"type": "string"},
+                },
+                "required": ["name"],
+                "additionalProperties": True,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "skills_list",
+            "description": "List available Hermes skills.",
+            "parameters": {
+                "type": "object",
+                "properties": {"category": {"type": "string"}},
+                "additionalProperties": True,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "terminal",
+            "description": "Run shell commands in the Hermes environment.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "background": {"type": "boolean"},
+                    "timeout": {"type": "integer"},
+                    "workdir": {"type": "string"},
+                    "pty": {"type": "boolean"},
+                    "notify_on_complete": {"type": "boolean"},
+                    "watch_patterns": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["command"],
+                "additionalProperties": True,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "vision_analyze",
+            "description": "Load an image for visual analysis.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "image_url": {"type": "string"},
+                    "question": {"type": "string"},
+                },
+                "required": ["image_url", "question"],
+                "additionalProperties": True,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write content to a file, replacing existing contents.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                    "cross_profile": {"type": "boolean"},
+                },
+                "required": ["path", "content"],
+                "additionalProperties": True,
+            },
+        },
+    },
+]
+
+
 @dataclass
 class ToolCallValidationReport:
     ok: bool
@@ -647,6 +917,8 @@ def snapshot_configured_tools(config: Config) -> list[dict[str, Any]]:
         tools.extend(CODEX_BUILTIN_TOOLS)
     elif provider == "pi":
         tools.extend(PI_BUILTIN_TOOLS)
+    elif provider in {"hermes", "hermes-agent", "hermes_agent"}:
+        tools.extend(HERMES_BUILTIN_TOOLS)
     for mcp in config.mcp_servers:
         if not mcp.enabled:
             continue

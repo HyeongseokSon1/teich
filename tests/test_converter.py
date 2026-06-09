@@ -211,6 +211,116 @@ def test_convert_pi_trace_uses_teich_eof_system_prompt_metadata(tmp_path: Path):
     assert example.metadata["system_prompt"] == "Use the prompt-level system."
 
 
+def test_convert_pi_trace_uses_teich_available_tools_without_tool_calls(tmp_path: Path):
+    trace_file = tmp_path / "pi-tools.jsonl"
+    events = [
+        {"type": "session", "id": "pi-session-1"},
+        {
+            "type": "message",
+            "id": "user-1",
+            "message": {"role": "user", "content": [{"type": "text", "text": "Say hi"}]},
+        },
+        {
+            "type": "message",
+            "id": "assistant-1",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "Hi."}]},
+        },
+        {
+            "type": "custom",
+            "id": "teich-tools-1",
+            "customType": "teich-available-tools",
+            "data": {
+                "source": "teich",
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "description": "Run shell commands.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"command": {"type": "string"}},
+                                "required": ["command"],
+                            },
+                        },
+                    }
+                ],
+            },
+        },
+    ]
+    trace_file.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+
+    example = convert_trace_to_training_example(trace_file)
+
+    assert example.messages[-1] == {"role": "assistant", "content": "Hi."}
+    assert example.tools == [
+        {
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Run shell commands.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            },
+        }
+    ]
+
+
+def test_convert_codex_trace_keeps_system_prompt_and_tools_without_tool_calls(tmp_path: Path):
+    trace_file = tmp_path / "codex-tools.jsonl"
+    events = [
+        {
+            "type": "session_meta",
+            "payload": {
+                "id": "codex-session-1",
+                "base_instructions": {"text": "You are a careful coding agent."},
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Say hi"}],
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Hi."}],
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "tool_schema",
+                "name": "exec_command",
+                "schema": {
+                    "description": "Run a shell command.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}},
+                        "required": ["cmd"],
+                    },
+                },
+            },
+        },
+    ]
+    trace_file.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+
+    example = convert_trace_to_training_example(trace_file)
+
+    assert example.messages[0] == {"role": "system", "content": "You are a careful coding agent."}
+    assert example.metadata["system_prompt"] == "You are a careful coding agent."
+    assert [tool["function"]["name"] for tool in example.tools] == ["exec_command"]
+    assert example.tools[0]["function"]["parameters"]["required"] == ["cmd"]
+
+
 def test_convert_codex_trace_normalizes_custom_tool_calls(tmp_path: Path):
     trace_file = tmp_path / "codex-custom-tool.jsonl"
     events = [
@@ -368,6 +478,29 @@ def test_convert_claude_code_stream_json_trace(tmp_path: Path):
     assert bash_tool["function"]["parameters"]["properties"]["command"]["type"] == "string"
     todo_tool = next(tool for tool in example.tools if tool["function"]["name"] == "TodoWrite")
     assert todo_tool["function"]["parameters"]["properties"]["todos"]["type"] == "array"
+
+
+def test_convert_claude_code_keeps_init_tools_without_tool_calls(tmp_path: Path):
+    trace_file = tmp_path / "claude-no-tools.jsonl"
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "claude-session", "model": "claude-sonnet", "tools": ["Bash", "Edit"]},
+        {"type": "user", "session_id": "claude-session", "message": {"role": "user", "content": "Say hi"}},
+        {
+            "type": "assistant",
+            "session_id": "claude-session",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "Hi."}],
+            },
+        },
+    ]
+    trace_file.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+
+    example = convert_trace_to_training_example(trace_file)
+
+    assert example.messages[-1] == {"role": "assistant", "content": "Hi."}
+    tool_names = {tool["function"]["name"] for tool in example.tools}
+    assert {"Bash", "Edit"}.issubset(tool_names)
 
 
 def test_convert_claude_code_marks_native_api_error_message(tmp_path: Path):
@@ -563,6 +696,45 @@ def test_convert_external_agent_trace(tmp_path: Path):
         {"role": "user", "content": "Build a CLI"},
         {"role": "assistant", "content": "Built it."},
     ]
+
+
+def test_convert_external_agent_trace_uses_meta_tools_without_tool_calls(tmp_path: Path):
+    trace_file = tmp_path / "hermes-tools.jsonl"
+    events = [
+        {
+            "type": "external_session_meta",
+            "payload": {
+                "id": "hermes-session",
+                "source": "hermes-agent",
+                "model_provider": "hermes",
+                "model": "qwen/qwen3-coder",
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "delegate_task",
+                            "description": "Spawn a delegated subagent.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"goal": {"type": "string"}},
+                                "required": ["goal"],
+                            },
+                        },
+                    }
+                ],
+            },
+        },
+        {"type": "external_message", "role": "user", "content": "Plan it"},
+        {"type": "external_message", "role": "assistant", "content": "Done."},
+    ]
+    trace_file.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+
+    example = convert_trace_to_training_example(trace_file)
+
+    assert example.metadata["trace_type"] == "hermes-agent"
+    assert example.messages[-1] == {"role": "assistant", "content": "Done."}
+    assert [tool["function"]["name"] for tool in example.tools] == ["delegate_task"]
+    assert example.tools[0]["function"]["parameters"]["required"] == ["goal"]
 
 
 def test_convert_external_agent_trace_preserves_hermes_tool_calls_and_parent_metadata(tmp_path: Path):

@@ -3,9 +3,9 @@
   <h1>Teich</h1>
   <p><strong>Agent SFT data infrastructure for generation, normalization, chat-template rendering, response masking, and training audits.</strong></p>
   <p>
-    <a href="https://pepy.tech/projects/teich"><img alt="PyPI Downloads" src="https://static.pepy.tech/personalized-badge/teich?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads"></a>
+    <a href="https://pepy.tech/projects/teich"><img alt="PyPI Downloads" src="https://img.shields.io/pepy/dt/teich?label=downloads&color=green"></a>
     <a href="https://pypi.org/project/teich/"><img alt="PyPI" src="https://img.shields.io/pypi/v/teich?label=pypi&color=black"></a>
-    <a href="https://pypi.org/project/teich/"><img alt="Python versions" src="https://img.shields.io/pypi/pyversions/teich?color=green"></a>
+    <a href="https://pypi.org/project/teich/"><img alt="Python versions" src="https://img.shields.io/badge/python-%3E%3D3.10-green"></a>
     <a href="LICENSE"><img alt="License" src="https://img.shields.io/pypi/l/teich?color=black"></a>
   </p>
 </div>
@@ -226,7 +226,7 @@ Uploaded artifacts include:
 
 - Generated JSONL
 - Dataset `README.md`
-- Embedded tool-schema snapshot in the dataset card when tools are present
+- Configured tool-schema snapshots in generated traces and in the dataset card when tools are present
 
 If a long run is interrupted, use:
 
@@ -255,10 +255,10 @@ Recommended `prompts.jsonl`:
 
 ### Provider notes
 
-- `codex` copies the native Codex session JSONL out of the mounted `CODEX_HOME/sessions` directory, then normalizes known Codex event-shape edge cases so reasoning summaries are visible and split assistant turns render as thinking before text/tool use.
-- `pi` copies the native Pi session JSONL out of the mounted `/home/codex/pi-sessions` directory, then normalizes and validates tool-call structure before writing output. For OpenRouter, Teich forces Pi onto the chat/completions wire path because Pi's OpenRouter Responses adapter can stall before the first session event.
+- `codex` copies the native Codex session JSONL out of the mounted `CODEX_HOME/sessions` directory, then normalizes known Codex event-shape edge cases so reasoning summaries are visible and split assistant turns render as thinking before text/tool use. Teich appends configured `tool_schema` metadata so tools remain available for training even if the model did not call them.
+- `pi` copies the native Pi session JSONL out of the mounted `/home/codex/pi-sessions` directory, then normalizes and validates tool-call structure before writing output. Teich appends prompt-level system metadata and configured tool metadata as `custom` events. For OpenRouter, Teich forces Pi onto the chat/completions wire path because Pi's OpenRouter Responses adapter can stall before the first session event.
 - `claude-code` copies Claude Code's native transcript JSONL from `.claude/projects/...` so the output keeps Claude's own `user`, `assistant`, `system`, and `result` event format. Split assistant fragments are normalized so thinking appears before the text or tool use it explains. With OpenRouter non-Claude models, Teich runs a local in-container proxy: Claude Code sees a Claude surrogate model name, while the proxy rewrites outbound requests back to the configured model. The native assistant/result events keep the provider-returned model and usage fields when Claude Code records them.
-- `hermes` runs with built-in toolsets `safe,terminal,file,skills,memory,session_search,delegation`, then exports each Hermes Agent `state.db` session as a Teich external trace: an `external_session_meta` event followed by explicit `external_message` events. Hermes' internal `system_prompt` remains metadata-only instead of becoming supervised training text. Delegated subagents remain separate trace files rather than being merged into the orchestrator session; child traces include `parent_session_id`.
+- `hermes` runs with built-in toolsets `safe,terminal,file,skills,memory,session_search,delegation`, then exports each Hermes Agent `state.db` session as a Teich external trace: an `external_session_meta` event followed by explicit `external_message` events. Hermes' internal `system_prompt`, enabled toolsets, and configured tools remain metadata on each trace. Delegated subagents remain separate trace files rather than being merged into the orchestrator session; child traces include `parent_session_id`.
 - `chat` calls an OpenAI-compatible API directly and writes structured training rows instead of raw agent traces.
 
 When converting preserved traces to training rows, Teich normalizes split assistant fragments into model-turn order: `reasoning_content` first, optional assistant `content` second, and `tool_calls` last. If a backend emits thinking after a text or tool-call fragment, Teich moves that thinking back in front of the output it explains.
@@ -519,7 +519,7 @@ Training examples include:
 - `prompt`: initial task description
 - `follow_up_prompts`: optional additional chat turns generated after the initial prompt
 - `messages`: chat history (system, user, assistant, tool)
-- `tools`: tool schemas used in the session
+- `tools`: tool schemas available to the session, including tools that were not called
 - `metadata`: session info, model, timestamps, and usage when available
 
 Structured chat datasets can also include convenience top-level fields like:

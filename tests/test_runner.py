@@ -1423,6 +1423,9 @@ def test_hermes_runner_uses_chat_query_and_prompt_file(tmp_path: Path):
     assert rows[0]["payload"]["source"] == "hermes-agent"
     assert rows[0]["payload"]["hermes_source"] == "cli"
     assert rows[0]["payload"]["model_provider"] == "openrouter"
+    assert rows[0]["payload"]["toolsets"] == ["safe", "terminal", "file", "skills", "memory", "session_search", "delegation"]
+    tool_names = {tool["function"]["name"] for tool in rows[0]["payload"]["tools"]}
+    assert {"delegate_task", "terminal", "read_file", "write_file"}.issubset(tool_names)
     assert rows[1]["type"] == "external_message"
     assert rows[1]["role"] == "user"
     assert rows[1]["content"] == long_prompt
@@ -3581,6 +3584,63 @@ def test_codex_copies_metadata_only_trace_without_export_validation(tmp_path: Pa
     CodexRunner._copy_normalized_session_file(source, destination)
 
     assert destination.read_text(encoding="utf-8") == source.read_text(encoding="utf-8")
+
+
+def test_codex_finalizer_appends_configured_tool_schemas(tmp_path: Path):
+    config = Config(output={"traces_dir": tmp_path / "output"})
+    with patch.object(CodexRunner, '_ensure_image'):
+        runner = CodexRunner(config)
+
+    trace_file = tmp_path / "trace.jsonl"
+    trace_file.write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "session_meta", "payload": {"id": "codex-session"}}),
+                json.dumps(
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "Say hi"}],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "Hi."}],
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "exec_command",
+            "description": "Run commands.",
+            "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"]},
+        },
+    }
+
+    with patch("teich.runner.snapshot_configured_tools", return_value=[tool]):
+        runner._finalize_trace_export(trace_file)
+
+    rows = [json.loads(line) for line in trace_file.read_text(encoding="utf-8").splitlines()]
+    schema_rows = [
+        row for row in rows
+        if row.get("type") == "response_item" and row.get("payload", {}).get("type") == "tool_schema"
+    ]
+    assert len(schema_rows) == 1
+    assert schema_rows[0]["payload"]["name"] == "exec_command"
+    assert schema_rows[0]["payload"]["schema"]["parameters"]["required"] == ["cmd"]
 
 
 def test_lmstudio_provider_uses_native_oss_flags():
@@ -5751,6 +5811,55 @@ def test_pi_runner_appends_prompt_level_system_metadata_at_end(tmp_path: Path):
         "systemPrompt": "Use the prompt-level system.",
         "source": "teich",
     }
+
+
+def test_pi_runner_finalizer_appends_available_tools_metadata(tmp_path: Path):
+    config = Config(agent={"provider": "pi"}, output={"traces_dir": tmp_path / "output"})
+    with patch.object(PiRunner, '_ensure_image'):
+        runner = PiRunner(config)
+
+    trace_file = tmp_path / "trace.jsonl"
+    trace_file.write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "session", "id": "pi-session"}),
+                json.dumps(
+                    {
+                        "type": "message",
+                        "id": "user-1",
+                        "message": {"role": "user", "content": [{"type": "text", "text": "Hello"}]},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "message",
+                        "id": "assistant-1",
+                        "message": {"role": "assistant", "content": [{"type": "text", "text": "Hi"}]},
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "Run shell commands.",
+            "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]},
+        },
+    }
+
+    with patch("teich.runner.snapshot_configured_tools", return_value=[tool]):
+        runner._finalize_trace_export(trace_file)
+
+    rows = [json.loads(line) for line in trace_file.read_text(encoding="utf-8").splitlines()]
+    metadata_event = rows[-1]
+    assert metadata_event["type"] == "custom"
+    assert metadata_event["customType"] == "teich-available-tools"
+    assert metadata_event["data"]["source"] == "teich"
+    assert metadata_event["data"]["tools"][0]["function"]["name"] == "bash"
 
 
 def test_pi_runner_does_not_duplicate_prompt_level_system_metadata(tmp_path: Path):

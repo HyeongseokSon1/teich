@@ -65,6 +65,19 @@ def test_snapshot_configured_tools_uses_pi_builtins():
     assert "edit" in names
 
 
+def test_snapshot_configured_tools_uses_hermes_builtins():
+    config = Config(agent={"provider": "hermes"})
+
+    tools = snapshot_configured_tools(config)
+
+    names = [tool["function"]["name"] for tool in tools]
+    assert "delegate_task" in names
+    assert "terminal" in names
+    assert "read_file" in names
+    assert "write_file" in names
+    assert "session_search" in names
+
+
 def test_codex_builtin_tool_schema_matches_normalized_tool_calls():
     config = Config(agent={"provider": "codex"})
     row = {

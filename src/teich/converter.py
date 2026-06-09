@@ -10,6 +10,8 @@ from typing import Any, Literal
 
 _INLINE_THINKING_BLOCK_PATTERN = re.compile(r"<(think|thinking)>(.*?)</\1>", re.DOTALL)
 PI_SYSTEM_PROMPT_CUSTOM_TYPE = "teich-system-prompt"
+TEICH_AVAILABLE_TOOLS_CUSTOM_TYPE = "teich-available-tools"
+TEICH_TRACE_CONTEXT_ITEM_TYPE = "teich_context"
 TraceType = Literal["claude_code", "codex", "external_agent", "hermes", "pi"]
 
 _CLAUDE_CODE_BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
@@ -844,6 +846,87 @@ def _build_tool_entry(name: str, schema: dict[str, Any] | None = None) -> dict[s
     return {"type": "function", "function": function}
 
 
+def _tool_entry_name(tool: dict[str, Any]) -> str | None:
+    function = tool.get("function") if isinstance(tool, dict) else None
+    name = function.get("name") if isinstance(function, dict) else None
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    return None
+
+
+def _tool_entry_schema(tool: dict[str, Any]) -> dict[str, Any]:
+    function = tool.get("function") if isinstance(tool, dict) else None
+    if not isinstance(function, dict):
+        return {}
+    return {key: deepcopy(value) for key, value in function.items() if key != "name"}
+
+
+def _normalize_explicit_tool_entry(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    if value.get("type") == "function":
+        function = value.get("function")
+        if isinstance(function, dict):
+            name = function.get("name")
+            if isinstance(name, str) and name.strip():
+                normalized = deepcopy(value)
+                normalized["type"] = "function"
+                normalized["function"] = dict(normalized["function"])
+                normalized["function"]["name"] = name.strip()
+                return normalized
+    name = value.get("name")
+    if isinstance(name, str) and name.strip():
+        schema = {key: deepcopy(val) for key, val in value.items() if key != "name"}
+        return _build_tool_entry(name.strip(), schema)
+    return None
+
+
+def _add_explicit_tools(
+    raw_tools: Any,
+    explicit_tools: dict[str, dict[str, Any]],
+    tool_names: set[str],
+    tool_schemas: dict[str, dict[str, Any]],
+) -> None:
+    if not isinstance(raw_tools, list):
+        return
+    for raw_tool in raw_tools:
+        tool = _normalize_explicit_tool_entry(raw_tool)
+        if tool is None:
+            continue
+        name = _tool_entry_name(tool)
+        if name is None:
+            continue
+        explicit_tools[name] = tool
+        tool_names.add(name)
+        schema = _tool_entry_schema(tool)
+        if schema:
+            tool_schemas[name] = {**tool_schemas.get(name, {}), **schema}
+
+
+def _build_tools_from_snapshots_and_calls(
+    tool_names: set[str],
+    tool_schemas: dict[str, dict[str, Any]],
+    tool_argument_samples: dict[str, list[Any]],
+    explicit_tools: dict[str, dict[str, Any]] | None = None,
+    tool_descriptions: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    tools: list[dict[str, Any]] = []
+    explicit_tools = explicit_tools or {}
+    tool_descriptions = tool_descriptions or {}
+    for name in sorted(tool_names):
+        schema = (
+            _tool_entry_schema(explicit_tools[name])
+            if name in explicit_tools
+            else deepcopy(tool_schemas.get(name) or {})
+        )
+        if name in tool_descriptions and "description" not in schema:
+            schema["description"] = tool_descriptions[name]
+        if "parameters" not in schema:
+            schema["parameters"] = _infer_tool_parameters_schema(tool_argument_samples.get(name, []))
+        tools.append(_build_tool_entry(name, schema))
+    return tools
+
+
 def _claude_code_tool_schema_from_definition(tool: dict[str, Any]) -> dict[str, Any]:
     schema: dict[str, Any] = {}
     description = tool.get("description")
@@ -1130,6 +1213,7 @@ def _convert_claude_code_trace_to_training_example(
     tool_names: set[str] = set(_CLAUDE_CODE_BUILTIN_TOOL_SCHEMAS)
     tool_schemas: dict[str, dict[str, Any]] = deepcopy(_CLAUDE_CODE_BUILTIN_TOOL_SCHEMAS)
     tool_argument_samples: dict[str, list[Any]] = {}
+    explicit_tools: dict[str, dict[str, Any]] = {}
     session_meta: dict[str, Any] = {}
     session_id: str | None = None
     model: str | None = None
@@ -1151,6 +1235,7 @@ def _convert_claude_code_trace_to_training_example(
                 value = payload.get("model")
                 if isinstance(value, str) and value.strip():
                     model = value.strip()
+                _add_explicit_tools(payload.get("tools"), explicit_tools, tool_names, tool_schemas)
             continue
         if event_type == "external_message":
             role = event.get("role")
@@ -1290,12 +1375,12 @@ def _convert_claude_code_trace_to_training_example(
                 if last_content != result.strip():
                     messages.append({"role": "assistant", "content": result.strip()})
 
-    tools = []
-    for name in sorted(tool_names):
-        schema = deepcopy(tool_schemas.get(name) or {})
-        if "parameters" not in schema:
-            schema["parameters"] = _infer_tool_parameters_schema(tool_argument_samples.get(name, []))
-        tools.append(_build_tool_entry(name, schema))
+    tools = _build_tools_from_snapshots_and_calls(
+        tool_names,
+        tool_schemas,
+        tool_argument_samples,
+        explicit_tools,
+    )
     if not prompt:
         prompt = next(
             (
@@ -1334,30 +1419,34 @@ def _convert_hermes_trace_to_training_example(
 ) -> TrainingExample:
     messages: list[dict[str, Any]] = []
     tool_names: set[str] = set()
+    tool_schemas: dict[str, dict[str, Any]] = {}
     tool_argument_samples: dict[str, list[Any]] = {}
+    explicit_tools: dict[str, dict[str, Any]] = {}
     session_meta: dict[str, Any] = {}
     prompt = ""
     message_events = events
-    explicit_tools: list[dict[str, Any]] | None = None
     sidecar_meta = _load_hermes_metadata_sidecar(trace_file)
     if sidecar_meta:
         session_meta = sidecar_meta
+        _add_explicit_tools(sidecar_meta.get("tools"), explicit_tools, tool_names, tool_schemas)
     if len(events) == 1 and _is_hermes_trace_row(events[0]):
         row = events[0]
         metadata = row.get("metadata")
         if isinstance(metadata, dict):
             session_meta = metadata
+            _add_explicit_tools(metadata.get("tools"), explicit_tools, tool_names, tool_schemas)
         row_prompt = row.get("task")
         if isinstance(row_prompt, str) and row_prompt.strip():
             prompt = row_prompt.strip()
         tools = row.get("tools")
         if isinstance(tools, list):
-            explicit_tools = [tool for tool in tools if isinstance(tool, dict)]
+            _add_explicit_tools(tools, explicit_tools, tool_names, tool_schemas)
         message_events = _hermes_conversation_to_events(row.get("traces"))
     elif len(events) == 1 and _is_hermes_conversation(events[0]):
         message_events = _hermes_conversation_to_events(events[0])
     elif len(events) == 1 and isinstance(events[0], dict) and isinstance(events[0].get("messages"), list):
         session_meta = {key: value for key, value in events[0].items() if key != "messages"}
+        _add_explicit_tools(events[0].get("tools"), explicit_tools, tool_names, tool_schemas)
         message_events = [event for event in events[0]["messages"] if isinstance(event, dict)]
 
     for event in message_events:
@@ -1367,6 +1456,7 @@ def _convert_hermes_trace_to_training_example(
             payload = event.get("payload")
             if isinstance(payload, dict):
                 session_meta = payload
+                _add_explicit_tools(payload.get("tools"), explicit_tools, tool_names, tool_schemas)
             continue
 
         role = event.get("role")
@@ -1438,10 +1528,12 @@ def _convert_hermes_trace_to_training_example(
         if content.strip() or normalized_role == "assistant" or tool_calls or "reasoning_content" in message:
             messages.append(message)
 
-    tools = explicit_tools or [
-        _build_tool_entry(name, {"parameters": _infer_tool_parameters_schema(tool_argument_samples.get(name, []))})
-        for name in sorted(tool_names)
-    ]
+    tools = _build_tools_from_snapshots_and_calls(
+        tool_names,
+        tool_schemas,
+        tool_argument_samples,
+        explicit_tools,
+    )
     metadata = {
         "source_file": trace_file.name,
         "session_id": session_meta.get("id") or trace_file.stem,
@@ -1584,7 +1676,9 @@ def _convert_external_agent_trace_to_training_example(
 ) -> TrainingExample:
     messages: list[dict[str, Any]] = []
     tool_names: set[str] = set()
+    tool_schemas: dict[str, dict[str, Any]] = {}
     tool_argument_samples: dict[str, list[Any]] = {}
+    explicit_tools: dict[str, dict[str, Any]] = {}
     session_meta: dict[str, Any] = {}
     prompt = ""
     for event in events:
@@ -1594,6 +1688,8 @@ def _convert_external_agent_trace_to_training_example(
             payload = event.get("payload")
             if isinstance(payload, dict):
                 session_meta = payload
+                _add_explicit_tools(payload.get("tools"), explicit_tools, tool_names, tool_schemas)
+                _add_explicit_tools(payload.get("available_tools"), explicit_tools, tool_names, tool_schemas)
             continue
         if event.get("type") != "external_message":
             continue
@@ -1658,10 +1754,12 @@ def _convert_external_agent_trace_to_training_example(
             message["tool_calls"] = tool_calls
         if content.strip() or normalized_role == "assistant" or tool_calls or "reasoning_content" in message:
             messages.append(message)
-    tools = [
-        _build_tool_entry(name, {"parameters": _infer_tool_parameters_schema(tool_argument_samples.get(name, []))})
-        for name in sorted(tool_names)
-    ]
+    tools = _build_tools_from_snapshots_and_calls(
+        tool_names,
+        tool_schemas,
+        tool_argument_samples,
+        explicit_tools,
+    )
     metadata = {
         "source_file": trace_file.name,
         "session_id": session_meta.get("id") or trace_file.stem,
@@ -1731,8 +1829,10 @@ def _convert_codex_trace_to_training_example(
     tool_argument_samples: dict[str, list[Any]] = {}
     tool_descriptions: dict[str, str] = {}
     tool_call_names: dict[str, str] = {}
+    explicit_tools: dict[str, dict[str, Any]] = {}
     session_meta: dict[str, Any] = {}
     turn_contexts: list[dict[str, Any]] = []
+    system_prompt: str | None = None
     prompt = ""
 
     for event in events:
@@ -1743,12 +1843,15 @@ def _convert_codex_trace_to_training_example(
         payload = event.get("payload")
         if event_type == "session_meta" and isinstance(payload, dict):
             session_meta = payload
+            _add_explicit_tools(payload.get("tools"), explicit_tools, tool_names, tool_schemas)
             base_instructions = payload.get("base_instructions")
             if isinstance(base_instructions, dict):
                 text = base_instructions.get("text")
-                if isinstance(text, str) and text.strip() and not _has_same_system_message(messages, text):
-                    messages.append({"role": "system", "content": text})
-                    tool_descriptions.update(_parse_tool_descriptions_from_text(text))
+                if isinstance(text, str) and text.strip():
+                    system_prompt = system_prompt or text.strip()
+                    if not _has_same_system_message(messages, text):
+                        messages.append({"role": "system", "content": text})
+                        tool_descriptions.update(_parse_tool_descriptions_from_text(text))
             continue
         if event_type == "turn_context" and isinstance(payload, dict):
             turn_contexts.append(payload)
@@ -1757,6 +1860,13 @@ def _convert_codex_trace_to_training_example(
             continue
 
         payload_type = payload.get("type")
+        if payload_type == TEICH_TRACE_CONTEXT_ITEM_TYPE:
+            value = payload.get("system_prompt")
+            if isinstance(value, str) and value.strip():
+                system_prompt = system_prompt or value.strip()
+            _add_explicit_tools(payload.get("tools"), explicit_tools, tool_names, tool_schemas)
+            continue
+
         if payload_type == "reasoning":
             reasoning = _reasoning_summary(payload)
             if reasoning:
@@ -1870,14 +1980,13 @@ def _convert_codex_trace_to_training_example(
                 tool_names.add(name)
                 tool_schemas[name] = schema
 
-    tools = []
-    for name in sorted(tool_names):
-        schema = dict(tool_schemas.get(name) or {})
-        if name in tool_descriptions and "description" not in schema:
-            schema["description"] = tool_descriptions[name]
-        if "parameters" not in schema:
-            schema["parameters"] = _infer_tool_parameters_schema(tool_argument_samples.get(name, []))
-        tools.append(_build_tool_entry(name, schema))
+    tools = _build_tools_from_snapshots_and_calls(
+        tool_names,
+        tool_schemas,
+        tool_argument_samples,
+        explicit_tools,
+        tool_descriptions,
+    )
     if not prompt:
         prompt = next(
             (
@@ -1895,6 +2004,7 @@ def _convert_codex_trace_to_training_example(
         "model_provider": session_meta.get("model_provider"),
         "cwd": session_meta.get("cwd"),
         "cli_version": session_meta.get("cli_version"),
+        "system_prompt": system_prompt or session_meta.get("system_prompt"),
         "turn_count": len(turn_contexts),
     }
     return TrainingExample(
@@ -1912,8 +2022,10 @@ def _convert_pi_trace_to_training_example(
 ) -> TrainingExample:
     messages: list[dict[str, Any]] = []
     tool_names: set[str] = set()
+    tool_schemas: dict[str, dict[str, Any]] = {}
     tool_argument_samples: dict[str, list[Any]] = {}
     tool_descriptions: dict[str, str] = {}
+    explicit_tools: dict[str, dict[str, Any]] = {}
     session_header: dict[str, Any] = {}
     model_change: dict[str, Any] = {}
     session_names: list[str] = []
@@ -1957,6 +2069,10 @@ def _convert_pi_trace_to_training_example(
             continue
         if event_type == "custom":
             teich_system_prompt = teich_system_prompt or _pi_teich_system_prompt_from_event(event)
+            if event.get("customType") == TEICH_AVAILABLE_TOOLS_CUSTOM_TYPE:
+                data = event.get("data")
+                if isinstance(data, dict):
+                    _add_explicit_tools(data.get("tools"), explicit_tools, tool_names, tool_schemas)
             continue
         if event_type != "message":
             continue
@@ -2044,16 +2160,13 @@ def _convert_pi_trace_to_training_example(
     if teich_system_prompt and not _has_same_system_message(messages, teich_system_prompt):
         messages.insert(0, {"role": "system", "content": teich_system_prompt})
 
-    tools = [
-        _build_tool_entry(
-            name,
-            {
-                **({"description": tool_descriptions[name]} if name in tool_descriptions else {}),
-                "parameters": _infer_tool_parameters_schema(tool_argument_samples.get(name, [])),
-            },
-        )
-        for name in sorted(tool_names)
-    ]
+    tools = _build_tools_from_snapshots_and_calls(
+        tool_names,
+        tool_schemas,
+        tool_argument_samples,
+        explicit_tools,
+        tool_descriptions,
+    )
     if not prompt:
         prompt = next(
             (

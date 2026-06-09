@@ -251,9 +251,9 @@ def build_traces_readme(
             [
                 "## Training-ready tools",
                 "",
-                "A complete configured `tools` schema snapshot is embedded in the collapsed section at the bottom of this README.",
-                "Use it when rendering loaded examples through your training chat template.",
-                "`load_traces` applies this snapshot to each loaded example as the `tools` field.",
+                "Generated agent traces carry configured tool schemas so tools remain available for training even when a session did not call them.",
+                "A complete dataset-level `tools` schema snapshot is also embedded in the collapsed section at the bottom of this README.",
+                "`load_traces` applies the dataset snapshot to each loaded example as a fallback `tools` field.",
                 "",
             ]
         )
@@ -281,7 +281,7 @@ def build_traces_readme(
                 "- `id`: provider session id",
                 "- `task`: first user prompt extracted from the trace",
                 "- `traces`: native conversation messages in `from` / `value` form",
-                "- `tools`: the tool schema available to that session",
+                "- `tools`: the tool schema available to that session, including tools that were not called",
                 "- `metadata`: provider, model, token, cost, parent-session, and export details",
                 "",
             ]

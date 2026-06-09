@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass
 import json
 import os
@@ -29,12 +30,14 @@ if TYPE_CHECKING:
 from .config import PromptInput
 
 from .converter import (
+    TEICH_AVAILABLE_TOOLS_CUSTOM_TYPE,
     convert_trace_to_training_example,
     convert_traces_to_training_data,
     normalize_claude_code_trace_events,
     normalize_codex_trace_event,
     normalize_codex_trace_events,
 )
+from .tool_schema import snapshot_configured_tools
 
 RUNTIME_IMAGE_NAME = "teich-runtime:v3"
 RUNTIME_DOCKERFILE_NAME = "codex-runtime.Dockerfile"
@@ -916,11 +919,28 @@ class DockerRuntimeRunner:
     def __init__(self, config: Config):
         self.config = config
         self.image_name = RUNTIME_IMAGE_NAME
+        self._configured_tools_snapshot: list[dict[str, Any]] | None = None
         self._active_processes: dict[subprocess.Popen[str], str | None] = {}
         self._active_processes_lock = threading.Lock()
         self._active_containers: set[str] = set()
         self._active_containers_lock = threading.Lock()
         self._ensure_image()
+
+    def _configured_tools(self) -> list[dict[str, Any]]:
+        if self._configured_tools_snapshot is None:
+            self._configured_tools_snapshot = snapshot_configured_tools(self.config)
+        return deepcopy(self._configured_tools_snapshot)
+
+    @staticmethod
+    def _append_jsonl_events(path: Path, events: list[dict[str, object]]) -> None:
+        if not events:
+            return
+        with path.open("a", encoding="utf-8") as handle:
+            for event in events:
+                handle.write(json.dumps(event, separators=(",", ":"), ensure_ascii=False) + "\n")
+
+    def _finalize_trace_export(self, trace_path: Path, prompt_input: PromptInput | None = None) -> None:
+        return
 
     @staticmethod
     def _runtime_dockerfile_path() -> Path:
@@ -2158,6 +2178,61 @@ class CodexRunner(DockerRuntimeRunner):
             return
         _write_jsonl_dict_events(destination, normalized_events)
 
+    @staticmethod
+    def _codex_tool_schema_event(tool: dict[str, Any]) -> dict[str, object] | None:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        if not isinstance(function, dict):
+            return None
+        name = function.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return None
+        schema = {key: deepcopy(value) for key, value in function.items() if key != "name"}
+        return {
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "type": "response_item",
+            "payload": {
+                "type": "tool_schema",
+                "name": name.strip(),
+                "schema": schema,
+                "source": "teich",
+            },
+        }
+
+    @staticmethod
+    def _codex_existing_tool_schema_names(events: list[dict[str, Any]]) -> set[str]:
+        names: set[str] = set()
+        for event in events:
+            if event.get("type") != "response_item":
+                continue
+            payload = event.get("payload")
+            if not isinstance(payload, dict) or payload.get("type") != "tool_schema":
+                continue
+            name = payload.get("name")
+            if isinstance(name, str) and name.strip():
+                names.add(name.strip())
+        return names
+
+    def _append_codex_available_tool_schemas(self, trace_path: Path) -> None:
+        if not trace_path.exists():
+            return
+        events = _read_jsonl_dict_events(trace_path) or []
+        existing_names = self._codex_existing_tool_schema_names(events)
+        metadata_events: list[dict[str, object]] = []
+        for tool in self._configured_tools():
+            event = self._codex_tool_schema_event(tool)
+            if event is None:
+                continue
+            payload = event.get("payload")
+            name = payload.get("name") if isinstance(payload, dict) else None
+            if not isinstance(name, str) or name in existing_names:
+                continue
+            existing_names.add(name)
+            metadata_events.append(event)
+        self._append_jsonl_events(trace_path, metadata_events)
+
+    def _finalize_trace_export(self, trace_path: Path, prompt_input: PromptInput | None = None) -> None:
+        self._append_codex_available_tool_schemas(trace_path)
+
     def _codex_base_url_and_proxy_target(self) -> tuple[str | None, str | None]:
         configured_base_url = self.config.get_base_url()
         base_url = configured_base_url
@@ -2470,6 +2545,7 @@ class CodexRunner(DockerRuntimeRunner):
                         if trace_path is not None:
                             accepted_trace = self._accept_trace_if_complete(trace_path, turn_prompts)
                             if accepted_trace is not None:
+                                self._finalize_trace_export(trace_path, prompt_input)
                                 self._copy_workspace_snapshot(workspace, self._sandbox_destination(trace_path))
                                 return trace_path
                             failure_trace_saved = True
@@ -2500,6 +2576,7 @@ class CodexRunner(DockerRuntimeRunner):
                 existing_sessions,
                 started_at,
             )
+            self._finalize_trace_export(trace_path, prompt_input)
             self._copy_workspace_snapshot(workspace, self._sandbox_destination(trace_path))
             return trace_path
         except BaseException:
@@ -2715,17 +2792,21 @@ class ExternalCliRunner(DockerRuntimeRunner):
             counter += 1
 
     def _session_meta_event(self, session_id: str, started_at: datetime, workspace: Path) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "id": session_id,
+            "timestamp": started_at.isoformat().replace("+00:00", "Z"),
+            "cwd": str(workspace),
+            "source": self.source_name,
+            "model_provider": self.config.api.provider or self.default_model_provider,
+            "model": self.config.get_effective_model(),
+        }
+        tools = self._configured_tools()
+        if tools:
+            payload["tools"] = tools
         return {
             "timestamp": started_at.isoformat().replace("+00:00", "Z"),
             "type": "external_session_meta",
-            "payload": {
-                "id": session_id,
-                "timestamp": started_at.isoformat().replace("+00:00", "Z"),
-                "cwd": str(workspace),
-                "source": self.source_name,
-                "model_provider": self.config.api.provider or self.default_model_provider,
-                "model": self.config.get_effective_model(),
-            },
+            "payload": payload,
         }
 
     @staticmethod
@@ -3542,6 +3623,10 @@ class HermesRunner(ExternalCliRunner):
         payload = {key: value for key, value in row.items() if key != "messages"}
         hermes_source = payload.get("source")
         payload["source"] = self.source_name
+        payload.setdefault("toolsets", HERMES_DEFAULT_TOOLSETS.split(","))
+        tools = self._configured_tools()
+        if tools:
+            payload.setdefault("tools", tools)
         if hermes_source is not None and hermes_source != "":
             payload.setdefault("hermes_source", hermes_source)
         return payload
@@ -5209,6 +5294,49 @@ class PiRunner(DockerRuntimeRunner):
         with trace_path.open("a", encoding="utf-8") as destination:
             destination.write(json.dumps(event, separators=(",", ":")) + "\n")
 
+    @staticmethod
+    def _pi_trace_includes_available_tools(trace_path: Path) -> bool:
+        try:
+            with trace_path.open("r", encoding="utf-8") as source:
+                for raw_line in source:
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    event = json.loads(line)
+                    if not isinstance(event, dict):
+                        continue
+                    if event.get("type") == "custom" and event.get("customType") == TEICH_AVAILABLE_TOOLS_CUSTOM_TYPE:
+                        data = event.get("data")
+                        tools = data.get("tools") if isinstance(data, dict) else None
+                        return isinstance(tools, list)
+        except (OSError, json.JSONDecodeError):
+            return False
+        return False
+
+    def _append_pi_available_tools_metadata(self, trace_path: Path) -> None:
+        if not trace_path.exists() or self._pi_trace_includes_available_tools(trace_path):
+            return
+        tools = self._configured_tools()
+        if not tools:
+            return
+        event = {
+            "type": "custom",
+            "id": f"teich-tools-{uuid.uuid4().hex[:8]}",
+            "parentId": None,
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "customType": TEICH_AVAILABLE_TOOLS_CUSTOM_TYPE,
+            "data": {
+                "tools": tools,
+                "source": "teich",
+            },
+        }
+        with trace_path.open("a", encoding="utf-8") as destination:
+            destination.write(json.dumps(event, separators=(",", ":"), ensure_ascii=False) + "\n")
+
+    def _finalize_trace_export(self, trace_path: Path, prompt_input: PromptInput | None = None) -> None:
+        self._append_pi_system_prompt_metadata(trace_path, prompt_input)
+        self._append_pi_available_tools_metadata(trace_path)
+
     def _latest_session_source_file(self, session_id: str, session_dir: Path, started_at: datetime) -> Path:
         session_files = self._list_session_files(session_dir)
         fresh_files = [
@@ -5353,7 +5481,7 @@ class PiRunner(DockerRuntimeRunner):
                 self._discard_output_file(trace_path)
                 failure_trace_saved = True
                 raise RuntimeError(f"Session {session_id[:8]} stopped before completing all Pi turns")
-            self._append_pi_system_prompt_metadata(trace_path, prompt_input)
+            self._finalize_trace_export(trace_path, prompt_input)
             self._copy_workspace_snapshot(workspace, self._sandbox_destination(trace_path))
             return trace_path
         except BaseException:
