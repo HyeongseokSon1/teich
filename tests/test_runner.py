@@ -1418,12 +1418,17 @@ def test_hermes_runner_uses_chat_query_and_prompt_file(tmp_path: Path):
     assert '--source teich -q "$(cat /workspace/.teich-prompt.txt)"' in command_text
     assert "OPENROUTER_API_KEY=sk-or-test" in command
     rows = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
-    assert rows[0]["source"] == "cli"
-    assert rows[0]["model_provider"] == "openrouter"
-    assert rows[0]["messages"][0]["role"] == "user"
-    assert rows[0]["messages"][0]["content"] == long_prompt
-    assert rows[0]["messages"][1]["role"] == "assistant"
-    assert rows[0]["messages"][1]["content"] == "done"
+    assert trace_path.name == "hermes-agent-hermes-session.jsonl"
+    assert rows[0]["type"] == "external_session_meta"
+    assert rows[0]["payload"]["source"] == "hermes-agent"
+    assert rows[0]["payload"]["hermes_source"] == "cli"
+    assert rows[0]["payload"]["model_provider"] == "openrouter"
+    assert rows[1]["type"] == "external_message"
+    assert rows[1]["role"] == "user"
+    assert rows[1]["content"] == long_prompt
+    assert rows[2]["type"] == "external_message"
+    assert rows[2]["role"] == "assistant"
+    assert rows[2]["content"] == "done"
 
 
 def test_hermes_runner_writes_custom_endpoint_runtime_config(tmp_path: Path):
@@ -1583,21 +1588,20 @@ def test_hermes_runner_exports_delegated_sessions_as_separate_files(tmp_path: Pa
     exported = runner._export_hermes_state_sessions(home_dir, tmp_path / "workspace")
 
     assert set(exported) == {"parent-session", "child-session"}
-    assert exported["parent-session"] == exported["child-session"]
-    rows = [json.loads(line) for line in exported["parent-session"].read_text(encoding="utf-8").splitlines()]
-    assert exported["parent-session"].name == "hermes-agent.jsonl"
-    assert len(rows) == 2
-    rows_by_session = {row["id"]: row for row in rows}
-    parent_row = rows_by_session["parent-session"]
-    child_row = rows_by_session["child-session"]
-    assert parent_row["source"] == "cli"
-    assert parent_row["parent_session_id"] is None
-    assert child_row["parent_session_id"] == "parent-session"
-    assert child_row["messages"][0]["role"] == "user"
-    assert child_row["messages"][0]["content"] == "sub task"
-    assert child_row["messages"][1]["role"] == "assistant"
-    assert child_row["messages"][1]["content"] == "subagent smoke ok"
-    assert parent_row["messages"][1]["tool_calls"][0]["function"]["name"] == "delegate_task"
+    assert exported["parent-session"].name == "hermes-agent-parent-session.jsonl"
+    assert exported["child-session"].name == "hermes-agent-child-session.jsonl"
+    parent_events = [json.loads(line) for line in exported["parent-session"].read_text(encoding="utf-8").splitlines()]
+    child_events = [json.loads(line) for line in exported["child-session"].read_text(encoding="utf-8").splitlines()]
+    assert parent_events[0]["type"] == "external_session_meta"
+    assert parent_events[0]["payload"]["source"] == "hermes-agent"
+    assert parent_events[0]["payload"]["hermes_source"] == "cli"
+    assert parent_events[0]["payload"]["parent_session_id"] is None
+    assert child_events[0]["payload"]["parent_session_id"] == "parent-session"
+    assert child_events[1]["role"] == "user"
+    assert child_events[1]["content"] == "sub task"
+    assert child_events[2]["role"] == "assistant"
+    assert child_events[2]["content"] == "subagent smoke ok"
+    assert parent_events[2]["tool_calls"][0]["function"]["name"] == "delegate_task"
 
 
 def test_hermes_runner_exports_current_state_db_fields_as_native_rows(tmp_path: Path):
@@ -1735,21 +1739,24 @@ def test_hermes_runner_exports_current_state_db_fields_as_native_rows(tmp_path: 
     exported = runner._export_hermes_state_sessions(home_dir, tmp_path / "workspace")
     rows = [json.loads(line) for line in exported["current-session"].read_text(encoding="utf-8").splitlines()]
 
-    assert len(rows) == 1
-    assert rows[0]["id"] == "current-session"
-    assert rows[0]["source"] == "cli"
-    assert rows[0]["teich_export_status"] == "completed"
-    assert rows[0]["teich_partial"] is False
-    assert rows[0]["total_tokens"] == 14
-    assert rows[0]["estimated_cost_usd"] == 0.001
-    assert rows[0]["ended_at"] == 1_778_672_003
-    assert rows[0]["system_prompt"] == "System for Hermes"
-    assert rows[0]["messages"][0]["role"] == "user"
-    assert rows[0]["messages"][0]["content"] == "inspect"
-    assert rows[0]["messages"][1]["role"] == "assistant"
-    assert rows[0]["messages"][1]["reasoning_content"] == "Need to inspect the README."
-    assert rows[0]["messages"][1]["tool_calls"][0]["function"]["name"] == "read_file"
-    assert rows[0]["messages"][1]["tool_calls"][0]["function"]["arguments"] == {"path": "README.md"}
+    assert len(rows) == 3
+    assert exported["current-session"].name == "hermes-agent-current-session.jsonl"
+    assert rows[0]["type"] == "external_session_meta"
+    assert rows[0]["payload"]["id"] == "current-session"
+    assert rows[0]["payload"]["source"] == "hermes-agent"
+    assert rows[0]["payload"]["hermes_source"] == "cli"
+    assert rows[0]["payload"]["teich_export_status"] == "completed"
+    assert rows[0]["payload"]["teich_partial"] is False
+    assert rows[0]["payload"]["total_tokens"] == 14
+    assert rows[0]["payload"]["estimated_cost_usd"] == 0.001
+    assert rows[0]["payload"]["ended_at"] == 1_778_672_003
+    assert rows[0]["payload"]["system_prompt"] == "System for Hermes"
+    assert rows[1]["role"] == "user"
+    assert rows[1]["content"] == "inspect"
+    assert rows[2]["role"] == "assistant"
+    assert rows[2]["reasoning_content"] == "Need to inspect the README."
+    assert rows[2]["tool_calls"][0]["function"]["name"] == "read_file"
+    assert rows[2]["tool_calls"][0]["function"]["arguments"] == {"path": "README.md"}
 
 
 def _write_minimal_hermes_delegation_state_db(home_dir: Path) -> None:
@@ -1824,9 +1831,14 @@ def test_hermes_runner_salvages_complete_state_db_after_nonzero_exit(tmp_path: P
          patch.object(runner, "_run_external_process", side_effect=fail_after_writing_state_db):
         result = runner.run_session("delegate this", "hermes-session")
 
-    assert result == tmp_path / "output" / "hermes-agent.jsonl"
+    assert result == tmp_path / "output" / "hermes-agent-parent-session.jsonl"
     rows = [json.loads(line) for line in result.read_text(encoding="utf-8").splitlines()]
-    assert [row["id"] for row in rows] == ["parent-session"]
+    assert rows[0]["type"] == "external_session_meta"
+    assert rows[0]["payload"]["id"] == "parent-session"
+    assert [row["content"] for row in rows if row.get("type") == "external_message"] == [
+        "delegate this",
+        "parent partial",
+    ]
 
 
 def test_run_process_removes_named_container_on_failure():
@@ -2897,6 +2909,44 @@ def test_summarize_trace_file_reads_hermes_session_meta(tmp_path: Path):
             {
                 "type": "hermes_session_meta",
                 "payload": {
+                    "model_provider": "openrouter",
+                    "model": "minimax/minimax-m2.5:free",
+                    "input_tokens": 10,
+                    "output_tokens": 4,
+                    "cache_read_tokens": 2,
+                    "reasoning_tokens": 1,
+                    "total_tokens": 17,
+                    "estimated_cost_usd": 0.001,
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    metrics = CodexRunner._summarize_trace_file(trace_file)
+
+    assert metrics.provider == "openrouter"
+    assert metrics.model == "minimax/minimax-m2.5:free"
+    assert metrics.input_tokens == 10
+    assert metrics.output_tokens == 4
+    assert metrics.cache_read_tokens == 2
+    assert metrics.reasoning_tokens == 1
+    assert metrics.total_tokens == 17
+    assert metrics.total_cost == 0.001
+    assert metrics.has_token_usage is True
+    assert metrics.has_cost is True
+
+
+def test_summarize_trace_file_reads_external_hermes_session_meta(tmp_path: Path):
+    trace_file = tmp_path / "hermes-trace.jsonl"
+    trace_file.write_text(
+        json.dumps(
+            {
+                "type": "external_session_meta",
+                "payload": {
+                    "source": "hermes-agent",
+                    "hermes_source": "cli",
                     "model_provider": "openrouter",
                     "model": "minimax/minimax-m2.5:free",
                     "input_tokens": 10,

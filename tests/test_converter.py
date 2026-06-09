@@ -579,6 +579,13 @@ def test_convert_external_agent_trace_preserves_hermes_tool_calls_and_parent_met
                 "tool_call_count": 1,
                 "input_tokens": 12,
                 "output_tokens": 5,
+                "cache_read_tokens": 3,
+                "reasoning_tokens": 2,
+                "total_tokens": 22,
+                "estimated_cost_usd": 0.001,
+                "billing_provider": "openrouter",
+                "billing_base_url": "https://openrouter.ai/api/v1",
+                "system_prompt": "Use the delegated task contract.",
             },
         },
         {"type": "external_message", "role": "user", "content": "Delegate a task"},
@@ -613,6 +620,13 @@ def test_convert_external_agent_trace_preserves_hermes_tool_calls_and_parent_met
     assert example.metadata["parent_session_id"] == "parent-session"
     assert example.metadata["tool_call_count"] == 1
     assert example.metadata["input_tokens"] == 12
+    assert example.metadata["cache_read_tokens"] == 3
+    assert example.metadata["reasoning_tokens"] == 2
+    assert example.metadata["total_tokens"] == 22
+    assert example.metadata["estimated_cost_usd"] == 0.001
+    assert example.metadata["billing_provider"] == "openrouter"
+    assert example.metadata["billing_base_url"] == "https://openrouter.ai/api/v1"
+    assert example.metadata["system_prompt"] == "Use the delegated task contract."
     assert example.messages[1]["tool_calls"][0]["function"] == {
         "name": "delegate_task",
         "arguments": {"prompt": "sub task"},

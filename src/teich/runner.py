@@ -46,8 +46,7 @@ PI_AGENT_DIR_IN_CONTAINER = "/home/codex/.pi/agent"
 PI_SESSIONS_DIR_IN_CONTAINER = "/home/codex/pi-sessions"
 WORKSPACE_IN_CONTAINER = "/workspace"
 HERMES_DEFAULT_TOOLSETS = "safe,terminal,file,skills,memory,session_search,delegation"
-HERMES_AGGREGATE_TRACE_FILE_NAME = "hermes-agent.jsonl"
-HERMES_AGGREGATE_WRITE_LOCK = threading.Lock()
+HERMES_TRACE_WRITE_LOCK = threading.Lock()
 CHAT_REQUEST_MAX_ATTEMPTS = 3
 AGENT_TURN_RETRY_LIMIT = 3
 NON_DATA_TRACE_DIR_NAMES = {"partials", "failures"}
@@ -107,205 +106,6 @@ def _is_non_data_trace_path(path: Path, traces_dir: Path, excluded_dirs: list[Pa
     return False
 
 
-HERMES_UNIVERSAL_TOOLS: list[dict[str, Any]] = [
-    {
-        "type": "function",
-        "function": {
-            "name": "terminal",
-            "description": "Execute shell commands in the session workspace.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string"},
-                    "background": {"type": "boolean", "default": False},
-                    "timeout": {"type": "integer", "minimum": 1},
-                    "workdir": {"type": "string"},
-                    "pty": {"type": "boolean", "default": False},
-                },
-                "required": ["command"],
-                "additionalProperties": True,
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "process",
-            "description": "Inspect or control background processes started by terminal.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["list", "poll", "log", "wait", "kill", "write", "submit"],
-                    },
-                    "session_id": {"type": "string"},
-                    "data": {"type": "string"},
-                    "timeout": {"type": "integer", "minimum": 1},
-                    "offset": {"type": "integer"},
-                    "limit": {"type": "integer", "minimum": 1},
-                },
-                "required": ["action"],
-                "additionalProperties": True,
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "Read a text file with optional pagination.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "offset": {"type": "integer", "minimum": 1, "default": 1},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 2000, "default": 500},
-                },
-                "required": ["path"],
-                "additionalProperties": True,
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_files",
-            "description": "Search file contents or find files by name.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string"},
-                    "target": {"type": "string", "enum": ["content", "files"], "default": "content"},
-                    "path": {"type": "string", "default": "."},
-                    "file_glob": {"type": "string"},
-                    "limit": {"type": "integer", "default": 50},
-                    "offset": {"type": "integer", "default": 0},
-                    "output_mode": {
-                        "type": "string",
-                        "enum": ["content", "files_only", "count"],
-                        "default": "content",
-                    },
-                    "context": {"type": "integer", "default": 0},
-                },
-                "required": ["pattern"],
-                "additionalProperties": True,
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "write_file",
-            "description": "Write complete file content, replacing existing content.",
-            "parameters": {
-                "type": "object",
-                "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
-                "required": ["path", "content"],
-                "additionalProperties": True,
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "patch",
-            "description": "Apply targeted file edits or multi-file patches.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "mode": {"type": "string", "enum": ["replace", "patch"], "default": "replace"},
-                    "path": {"type": "string"},
-                    "old_string": {"type": "string"},
-                    "new_string": {"type": "string"},
-                    "replace_all": {"type": "boolean", "default": False},
-                    "patch": {"type": "string"},
-                },
-                "required": ["mode"],
-                "additionalProperties": True,
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "skill_view",
-            "description": "Load a Hermes skill by name.",
-            "parameters": {
-                "type": "object",
-                "properties": {"name": {"type": "string"}},
-                "required": ["name"],
-                "additionalProperties": True,
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "skill_manage",
-            "description": "Create, update, patch, or inspect Hermes skills.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {"type": "string"},
-                    "name": {"type": "string"},
-                    "content": {"type": "string"},
-                    "path": {"type": "string"},
-                },
-                "required": ["action"],
-                "additionalProperties": True,
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "memory",
-            "description": "Store or retrieve durable session memory.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {"type": "string"},
-                    "key": {"type": "string"},
-                    "value": {"type": "string"},
-                    "query": {"type": "string"},
-                },
-                "required": ["action"],
-                "additionalProperties": True,
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "session_search",
-            "description": "Search previous Hermes session transcripts.",
-            "parameters": {
-                "type": "object",
-                "properties": {"query": {"type": "string"}, "limit": {"type": "integer", "default": 10}},
-                "required": ["query"],
-                "additionalProperties": True,
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "delegate_task",
-            "description": "Spawn an isolated delegated subagent session for a bounded task.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "prompt": {"type": "string"},
-                    "description": {"type": "string"},
-                    "subagent_type": {"type": "string"},
-                },
-                "required": ["prompt"],
-                "additionalProperties": True,
-            },
-        },
-    },
-]
 TEXT_SUBPROCESS_KWARGS = {"text": True, "encoding": "utf-8", "errors": "replace"}
 LOCAL_PROVIDER_PROXY_SCRIPT_NAME = "local_provider_proxy.js"
 CLAUDE_OPENROUTER_PROXY_SCRIPT_NAME = "claude_openrouter_proxy.js"
@@ -3692,86 +3492,6 @@ class HermesRunner(ExternalCliRunner):
             session["model_config"] = model_config
         return session
 
-    @staticmethod
-    def _hermes_tool_call_xml(tool_call: dict[str, Any]) -> str | None:
-        function = tool_call.get("function")
-        name = None
-        arguments: Any = {}
-        if isinstance(function, dict):
-            raw_name = function.get("name")
-            if isinstance(raw_name, str) and raw_name:
-                name = raw_name
-            arguments = function.get("arguments") or {}
-        raw_name = tool_call.get("name")
-        if name is None and isinstance(raw_name, str) and raw_name:
-            name = raw_name
-        if not name:
-            return None
-        if isinstance(arguments, str):
-            try:
-                arguments = json.loads(arguments)
-            except json.JSONDecodeError:
-                arguments = {"value": arguments}
-        payload = {"name": name, "arguments": arguments if isinstance(arguments, dict) else {"value": arguments}}
-        return f"<tool_call>\n{json.dumps(payload, ensure_ascii=False)}\n</tool_call>"
-
-    def _hermes_conversation_item(self, message: dict[str, object]) -> dict[str, str] | None:
-        role = message.get("role")
-        content = str(message.get("content") or "")
-        if role == "user":
-            return {"from": "human", "value": content}
-        if role == "tool":
-            payload = {
-                "tool_call_id": message.get("tool_call_id"),
-                "name": message.get("name") or message.get("tool_name"),
-                "content": content,
-            }
-            return {"from": "tool", "value": f"<tool_response>\n{json.dumps(payload, ensure_ascii=False)}\n</tool_response>"}
-        if role == "assistant":
-            parts: list[str] = []
-            reasoning = message.get("reasoning_content") or message.get("reasoning")
-            if isinstance(reasoning, str) and reasoning.strip():
-                parts.append(f"<think>\n{reasoning.strip()}\n</think>")
-            if content.strip():
-                parts.append(content)
-            tool_calls = message.get("tool_calls")
-            if isinstance(tool_calls, list):
-                for tool_call in tool_calls:
-                    if isinstance(tool_call, dict):
-                        tool_call_xml = self._hermes_tool_call_xml(tool_call)
-                        if tool_call_xml:
-                            parts.append(tool_call_xml)
-            return {"from": "gpt", "value": "\n".join(parts)}
-        return None
-
-    def _hermes_conversation_export(
-        self,
-        row: sqlite3.Row,
-        messages: list[dict[str, object]],
-    ) -> list[dict[str, str]]:
-        conversation: list[dict[str, str]] = []
-        system_prompt = self._sqlite_row_get(row, "system_prompt")
-        if isinstance(system_prompt, str) and system_prompt.strip():
-            conversation.append({"from": "system", "value": system_prompt.strip()})
-        for message in messages:
-            item = self._hermes_conversation_item(message)
-            if item is not None:
-                conversation.append(item)
-        return conversation
-
-    @staticmethod
-    def _hermes_trace_task(conversation: list[dict[str, str]]) -> str:
-        for item in conversation:
-            if item.get("from") == "human":
-                value = item.get("value")
-                if isinstance(value, str) and value.strip():
-                    return value.strip()
-        return ""
-
-    @staticmethod
-    def _hermes_tools_snapshot() -> list[dict[str, Any]]:
-        return json.loads(json.dumps(HERMES_UNIVERSAL_TOOLS))
-
     def _hermes_trace_row(
         self,
         row: sqlite3.Row,
@@ -3782,10 +3502,21 @@ class HermesRunner(ExternalCliRunner):
     ) -> dict[str, object]:
         return self._hermes_session_export(row, messages, workspace, partial=partial)
 
-    def _hermes_aggregate_trace_path(self, *, partial: bool = False) -> Path:
-        if partial:
-            return self.config.output.failures_dir / HERMES_AGGREGATE_TRACE_FILE_NAME
-        return self.config.output.traces_dir / HERMES_AGGREGATE_TRACE_FILE_NAME
+    def _resolve_hermes_trace_path(self, session_id: str, *, partial: bool = False) -> Path:
+        safe_session_id = self._safe_session_file_id(session_id)
+        destination = (
+            self.config.output.failures_dir if partial else self.config.output.traces_dir
+        ) / f"{self.source_name}-{safe_session_id}.jsonl"
+        if not destination.exists():
+            return destination
+        stem = destination.stem
+        suffix = destination.suffix
+        counter = 1
+        while True:
+            candidate = destination.with_name(f"{stem}_{counter}{suffix}")
+            if not candidate.exists():
+                return candidate
+            counter += 1
 
     def _hermes_message_export(self, row: sqlite3.Row) -> dict[str, object]:
         message = dict(row)
@@ -3798,6 +3529,71 @@ class HermesRunner(ExternalCliRunner):
             if value is not None and value != "":
                 message[key] = value
         return message
+
+    @staticmethod
+    def _hermes_external_content(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        return json.dumps(value, ensure_ascii=False)
+
+    def _hermes_external_session_payload(self, row: dict[str, object]) -> dict[str, object]:
+        payload = {key: value for key, value in row.items() if key != "messages"}
+        hermes_source = payload.get("source")
+        payload["source"] = self.source_name
+        if hermes_source is not None and hermes_source != "":
+            payload.setdefault("hermes_source", hermes_source)
+        return payload
+
+    def _hermes_external_message_event(self, message: dict[str, object]) -> dict[str, object] | None:
+        role = message.get("role")
+        if not isinstance(role, str) or not role.strip():
+            return None
+        event: dict[str, object] = {
+            "timestamp": self._hermes_timestamp(message.get("timestamp")),
+            "type": "external_message",
+            "role": role.strip(),
+            "content": self._hermes_external_content(message.get("content")),
+        }
+        passthrough_keys = (
+            "tool_call_id",
+            "tool_calls",
+            "token_count",
+            "finish_reason",
+            "reasoning",
+            "reasoning_content",
+            "reasoning_details",
+            "codex_reasoning_items",
+            "codex_message_items",
+        )
+        for key in passthrough_keys:
+            value = message.get(key)
+            if value is not None and value != "":
+                event[key] = value
+        tool_name = message.get("tool_name") or message.get("name")
+        if isinstance(tool_name, str) and tool_name.strip():
+            event["name"] = tool_name.strip()
+        return event
+
+    def _hermes_external_trace_events(self, row: dict[str, object]) -> list[dict[str, object]]:
+        payload = self._hermes_external_session_payload(row)
+        events: list[dict[str, object]] = [
+            {
+                "timestamp": payload.get("timestamp") or self._event_timestamp(),
+                "type": "external_session_meta",
+                "payload": payload,
+            }
+        ]
+        messages = row.get("messages")
+        if isinstance(messages, list):
+            for message in messages:
+                if not isinstance(message, dict):
+                    continue
+                event = self._hermes_external_message_event(message)
+                if event is not None:
+                    events.append(event)
+        return events
 
     def _export_hermes_state_sessions(
         self,
@@ -3830,15 +3626,17 @@ class HermesRunner(ExternalCliRunner):
     ) -> dict[str, Path]:
         if not rows:
             return {}
-        destination = self._hermes_aggregate_trace_path(partial=partial)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        with HERMES_AGGREGATE_WRITE_LOCK:
-            self._write_events(destination, rows)
         exported: dict[str, Path] = {}
         for row in rows:
             session_id = str(row.get("id") or "")
-            if session_id:
-                exported[session_id] = destination
+            if not session_id:
+                continue
+            events = self._hermes_external_trace_events(row)
+            with HERMES_TRACE_WRITE_LOCK:
+                destination = self._resolve_hermes_trace_path(session_id, partial=partial)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                self._write_events(destination, events)
+            exported[session_id] = destination
         return exported
 
     def _hermes_state_session_rows(

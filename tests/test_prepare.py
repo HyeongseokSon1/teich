@@ -231,16 +231,22 @@ def test_prepare_data_loads_native_agent_traces_end_to_end(tmp_path: Path):
         encoding="utf-8",
     )
     (tmp_path / "hermes.jsonl").write_text(
-        json.dumps(
-            {
-                "id": "hermes-1",
-                "source": "cli",
-                "model": "Opus-Agent",
-                "messages": [
-                    {"role": "user", "content": "Build Hermes"},
-                    {"role": "assistant", "content": "Hermes done"},
-                ],
-            }
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "external_session_meta",
+                        "payload": {
+                            "id": "hermes-1",
+                            "source": "hermes-agent",
+                            "hermes_source": "cli",
+                            "model": "Opus-Agent",
+                        },
+                    }
+                ),
+                json.dumps({"type": "external_message", "role": "user", "content": "Build Hermes"}),
+                json.dumps({"type": "external_message", "role": "assistant", "content": "Hermes done"}),
+            ]
         )
         + "\n",
         encoding="utf-8",
