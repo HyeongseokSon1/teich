@@ -1,6 +1,14 @@
-# Teich
-
-Agent SFT data infrastructure for generation, normalization, chat-template rendering, response masking, and training audits.
+<div align="center">
+  <img src="assets/teich.svg" alt="Teich logo" width="132">
+  <h1>Teich</h1>
+  <p><strong>Agent SFT data infrastructure for generation, normalization, chat-template rendering, response masking, and training audits.</strong></p>
+  <p>
+    <a href="https://pepy.tech/projects/teich"><img alt="PyPI Downloads" src="https://static.pepy.tech/personalized-badge/teich?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads"></a>
+    <a href="https://pypi.org/project/teich/"><img alt="PyPI" src="https://img.shields.io/pypi/v/teich?label=pypi&color=black"></a>
+    <a href="https://pypi.org/project/teich/"><img alt="Python versions" src="https://img.shields.io/pypi/pyversions/teich?color=green"></a>
+    <a href="LICENSE"><img alt="License" src="https://img.shields.io/pypi/l/teich?color=black"></a>
+  </p>
+</div>
 
 Teich is not only a dataset generator. It is a bridge between messy agent/chat data and model-specific supervised fine-tuning.
 
