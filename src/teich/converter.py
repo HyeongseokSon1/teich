@@ -2,17 +2,21 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
 
 _INLINE_THINKING_BLOCK_PATTERN = re.compile(r"<(think|thinking)>(.*?)</\1>", re.DOTALL)
+FIRST_MESSAGE_TIMESTAMP_METADATA_KEY = "first_message_timestamp"
 PI_SYSTEM_PROMPT_CUSTOM_TYPE = "teich-system-prompt"
 TEICH_AVAILABLE_TOOLS_CUSTOM_TYPE = "teich-available-tools"
 TEICH_TRACE_CONTEXT_ITEM_TYPE = "teich_context"
-TraceType = Literal["claude_code", "codex", "droid", "external_agent", "hermes", "pi"]
+TraceType = Literal["claude_code", "codex", "droid", "external_agent", "hermes", "openclaw", "pi"]
+_TIMESTAMP_KEYS = ("timestamp", "created_at", "createdAt")
 
 _CLAUDE_CODE_BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "Task": {
@@ -389,6 +393,79 @@ class TrainingExample:
         }
 
 
+def _normalize_timestamp_value(value: Any) -> str | None:
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    timestamp = float(value)
+    if timestamp > 10_000_000_000:
+        timestamp /= 1000
+    try:
+        return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _timestamp_from_mapping(value: Any) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    for key in _TIMESTAMP_KEYS:
+        timestamp = _normalize_timestamp_value(value.get(key))
+        if timestamp:
+            return timestamp
+    return None
+
+
+def _event_timestamp(event: Any) -> str | None:
+    if not isinstance(event, dict):
+        return None
+    for key in ("payload", "message"):
+        timestamp = _timestamp_from_mapping(event.get(key))
+        if timestamp:
+            return timestamp
+    return _timestamp_from_mapping(event)
+
+
+def _first_message_timestamp_from_events(events: list[Any], predicate: Callable[[dict[str, Any]], bool]) -> str | None:
+    for event in events:
+        if isinstance(event, dict) and predicate(event):
+            timestamp = _event_timestamp(event)
+            if timestamp:
+                return timestamp
+    return None
+
+
+def _add_first_message_timestamp(metadata: dict[str, Any], timestamp: str | None) -> None:
+    if timestamp:
+        metadata[FIRST_MESSAGE_TIMESTAMP_METADATA_KEY] = timestamp
+
+
+def _is_user_role(role: Any) -> bool:
+    return isinstance(role, str) and _normalize_role(role) == "user"
+
+
+def _is_external_user_message(event: dict[str, Any]) -> bool:
+    return event.get("type") == "external_message" and _is_user_role(event.get("role"))
+
+
+def _is_nested_user_message(event: dict[str, Any]) -> bool:
+    message = event.get("message")
+    return isinstance(message, dict) and _is_user_role(message.get("role"))
+
+
+def _is_claude_code_user_message(event: dict[str, Any]) -> bool:
+    if event.get("type") != "user" or not _is_nested_user_message(event):
+        return False
+    message = event.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    return not (
+        isinstance(content, list)
+        and any(isinstance(block, dict) and block.get("type") == "tool_result" for block in content)
+    )
+
+
 def _first_text_block(content_blocks: Any) -> str:
     if isinstance(content_blocks, str):
         return _unwrap_teich_prompt_file(content_blocks).strip()
@@ -702,6 +779,21 @@ def _codex_event_msg_payload_type(event: dict[str, Any]) -> str | None:
         return None
     payload_type = payload.get("type")
     return payload_type if isinstance(payload_type, str) else None
+
+
+def _codex_first_user_message_timestamp(events: list[Any]) -> str | None:
+    timestamp = _first_message_timestamp_from_events(
+        events,
+        lambda event: _codex_event_msg_payload_type(event) == "user_message",
+    )
+    if timestamp:
+        return timestamp
+    return _first_message_timestamp_from_events(
+        events,
+        lambda event: _codex_payload_type(event) == "message"
+        and isinstance(event.get("payload"), dict)
+        and _is_user_role(event["payload"].get("role")),
+    )
 
 
 def _codex_assistant_prefix_marker(event: dict[str, Any]) -> bool:
@@ -1081,7 +1173,18 @@ def _claude_code_tool_schema_from_definition(tool: dict[str, Any]) -> dict[str, 
     return schema
 
 
+def _is_openclaw_session_header(event: Any) -> bool:
+    if not isinstance(event, dict) or event.get("type") != "session":
+        return False
+    cwd = event.get("cwd")
+    return isinstance(cwd, str) and ".openclaw" in cwd
+
+
 def _detect_trace_type(events: list[Any], default: TraceType | None = "codex") -> TraceType | None:
+    first_event = next((event for event in events if isinstance(event, dict)), None)
+    if _is_openclaw_session_header(first_event):
+        return "openclaw"
+
     for event in events:
         if _is_hermes_conversation(event):
             return "hermes"
@@ -1352,6 +1455,10 @@ def _convert_claude_code_trace_to_training_example(
     usage: dict[str, Any] | None = None
     total_cost_usd: Any = None
     prompt = ""
+    first_message_timestamp = _first_message_timestamp_from_events(
+        events,
+        lambda event: _is_external_user_message(event) or _is_claude_code_user_message(event),
+    )
 
     for event in events:
         if not isinstance(event, dict):
@@ -1536,6 +1643,7 @@ def _convert_claude_code_trace_to_training_example(
         metadata["usage"] = usage
     if total_cost_usd is not None:
         metadata["total_cost_usd"] = total_cost_usd
+    _add_first_message_timestamp(metadata, first_message_timestamp)
     return TrainingExample(
         source_file=trace_file,
         prompt=prompt,
@@ -1741,6 +1849,10 @@ def _convert_hermes_trace_to_training_example(
         session_meta = {key: value for key, value in events[0].items() if key != "messages"}
         _add_explicit_tools(events[0].get("tools"), explicit_tools, tool_names, tool_schemas)
         message_events = [event for event in events[0]["messages"] if isinstance(event, dict)]
+    first_message_timestamp = _first_message_timestamp_from_events(
+        message_events,
+        lambda event: _is_user_role(event.get("role")),
+    )
 
     for event in message_events:
         if not isinstance(event, dict):
@@ -1859,6 +1971,7 @@ def _convert_hermes_trace_to_training_example(
         "system_prompt": session_meta.get("system_prompt"),
         "turn_count": sum(1 for message in messages if message.get("role") == "user"),
     }
+    _add_first_message_timestamp(metadata, first_message_timestamp)
     return TrainingExample(
         source_file=trace_file,
         prompt=prompt,
@@ -1914,25 +2027,33 @@ def _hermes_conversation_to_events(conversation: Any) -> list[dict[str, Any]]:
     for item in conversation:
         source_role = item.get("from")
         value = item.get("value") or ""
+        timestamp = _timestamp_from_mapping(item)
         if source_role == "system":
-            events.append({"role": "system", "content": value})
+            event = {"role": "system", "content": value}
+            if timestamp:
+                event["timestamp"] = timestamp
+            events.append(event)
         elif source_role == "human":
-            events.append({"role": "user", "content": value})
+            event = {"role": "user", "content": value}
+            if timestamp:
+                event["timestamp"] = timestamp
+            events.append(event)
         elif source_role == "tool":
             tool_blocks, fallback_content = _extract_xml_blocks(value, "tool_response")
             parsed = _normalize_json_like_value(tool_blocks[0]) if tool_blocks else fallback_content
             if not isinstance(parsed, dict):
                 parsed = {"content": parsed}
-            events.append(
-                {
-                    "role": "tool",
-                    "content": json.dumps(parsed.get("content"), ensure_ascii=False)
-                    if isinstance(parsed.get("content"), (dict, list))
-                    else str(parsed.get("content") or ""),
-                    "tool_call_id": parsed.get("tool_call_id"),
-                    "tool_name": parsed.get("name"),
-                }
-            )
+            event = {
+                "role": "tool",
+                "content": json.dumps(parsed.get("content"), ensure_ascii=False)
+                if isinstance(parsed.get("content"), (dict, list))
+                else str(parsed.get("content") or ""),
+                "tool_call_id": parsed.get("tool_call_id"),
+                "tool_name": parsed.get("name"),
+            }
+            if timestamp:
+                event["timestamp"] = timestamp
+            events.append(event)
         elif source_role == "gpt":
             thinking_blocks, without_thinking = _extract_xml_blocks(value, "think")
             tool_blocks, content = _extract_xml_blocks(without_thinking, "tool_call")
@@ -1959,6 +2080,8 @@ def _hermes_conversation_to_events(conversation: Any) -> list[dict[str, Any]]:
                 event["reasoning_content"] = "\n\n".join(block for block in thinking_blocks if block)
             if tool_calls:
                 event["tool_calls"] = tool_calls
+            if timestamp:
+                event["timestamp"] = timestamp
             events.append(event)
     return events
 
@@ -1974,6 +2097,10 @@ def _convert_external_agent_trace_to_training_example(
     explicit_tools: dict[str, dict[str, Any]] = {}
     session_meta: dict[str, Any] = {}
     prompt = ""
+    first_message_timestamp = _first_message_timestamp_from_events(
+        events,
+        _is_external_user_message,
+    )
     for event in events:
         if not isinstance(event, dict):
             continue
@@ -2090,6 +2217,7 @@ def _convert_external_agent_trace_to_training_example(
         "api_call_count": session_meta.get("api_call_count"),
         "turn_count": sum(1 for message in messages if message.get("role") == "user"),
     }
+    _add_first_message_timestamp(metadata, first_message_timestamp)
     return TrainingExample(
         source_file=trace_file,
         prompt=prompt,
@@ -2115,6 +2243,7 @@ def _convert_codex_trace_to_training_example(
     events: list[dict[str, Any]],
 ) -> TrainingExample:
     events = normalize_codex_trace_events(events)
+    first_message_timestamp = _codex_first_user_message_timestamp(events)
     messages: list[dict[str, Any]] = []
     pending_reasoning_parts: list[str] = []
     tool_names: set[str] = set()
@@ -2300,6 +2429,7 @@ def _convert_codex_trace_to_training_example(
         "system_prompt": system_prompt or session_meta.get("system_prompt"),
         "turn_count": len(turn_contexts),
     }
+    _add_first_message_timestamp(metadata, first_message_timestamp)
     return TrainingExample(
         source_file=trace_file,
         prompt=prompt,
@@ -2312,6 +2442,8 @@ def _convert_codex_trace_to_training_example(
 def _convert_pi_trace_to_training_example(
     trace_file: Path,
     events: list[dict[str, Any]],
+    *,
+    trace_type: Literal["openclaw", "pi"] = "pi",
 ) -> TrainingExample:
     messages: list[dict[str, Any]] = []
     tool_names: set[str] = set()
@@ -2326,6 +2458,11 @@ def _convert_pi_trace_to_training_example(
     teich_system_prompt: str | None = None
     prompt = ""
     invalid_tool_call_ids: set[str] = set()
+    include_teich_pi_metadata = trace_type == "pi"
+    first_message_timestamp = _first_message_timestamp_from_events(
+        events,
+        lambda event: event.get("type") == "message" and _is_nested_user_message(event),
+    )
 
     for event in events:
         if not isinstance(event, dict) or event.get("type") != "message":
@@ -2361,11 +2498,12 @@ def _convert_pi_trace_to_training_example(
                 session_names.append(name.strip())
             continue
         if event_type == "custom":
-            teich_system_prompt = teich_system_prompt or _pi_teich_system_prompt_from_event(event)
-            if event.get("customType") == TEICH_AVAILABLE_TOOLS_CUSTOM_TYPE:
-                data = event.get("data")
-                if isinstance(data, dict):
-                    _add_explicit_tools(data.get("tools"), explicit_tools, tool_names, tool_schemas)
+            if include_teich_pi_metadata:
+                teich_system_prompt = teich_system_prompt or _pi_teich_system_prompt_from_event(event)
+                if event.get("customType") == TEICH_AVAILABLE_TOOLS_CUSTOM_TYPE:
+                    data = event.get("data")
+                    if isinstance(data, dict):
+                        _add_explicit_tools(data.get("tools"), explicit_tools, tool_names, tool_schemas)
             continue
         if event_type != "message":
             continue
@@ -2473,7 +2611,7 @@ def _convert_pi_trace_to_training_example(
     metadata: dict[str, Any] = {
         "source_file": trace_file.name,
         "session_id": session_header.get("id") or trace_file.stem,
-        "trace_type": "pi",
+        "trace_type": trace_type,
         "model_provider": model_change.get("provider"),
         "model": model_change.get("modelId"),
         "cwd": session_header.get("cwd"),
@@ -2487,6 +2625,7 @@ def _convert_pi_trace_to_training_example(
     if session_names:
         metadata["session_names"] = session_names
         metadata["session_name"] = session_names[-1]
+    _add_first_message_timestamp(metadata, first_message_timestamp)
     return TrainingExample(
         source_file=trace_file,
         prompt=prompt,
@@ -2571,7 +2710,12 @@ def _structured_training_example_from_row(
     row: dict[str, Any],
     row_index: int,
 ) -> TrainingExample:
-    messages = normalize_training_messages(row.get("messages"))
+    raw_messages = row.get("messages")
+    first_message_timestamp = _first_message_timestamp_from_events(
+        raw_messages if isinstance(raw_messages, list) else [],
+        lambda message: _is_user_role(message.get("role")),
+    )
+    messages = normalize_training_messages(raw_messages)
     if not messages:
         system = row.get("system")
         if isinstance(system, str) and system.strip():
@@ -2599,6 +2743,8 @@ def _structured_training_example_from_row(
         "trace_type",
         "chat" if any(key in row for key in ("system", "thinking", "response", "model")) and not tools else "structured",
     )
+    if first_message_timestamp:
+        metadata.setdefault(FIRST_MESSAGE_TIMESTAMP_METADATA_KEY, first_message_timestamp)
     return TrainingExample(
         source_file=source_file,
         prompt=prompt,
@@ -2625,6 +2771,8 @@ def convert_trace_to_training_example(trace_file: Path) -> TrainingExample:
         return _convert_hermes_trace_to_training_example(trace_file, events)
     if trace_type == "external_agent":
         return _convert_external_agent_trace_to_training_example(trace_file, events)
+    if trace_type == "openclaw":
+        return _convert_pi_trace_to_training_example(trace_file, events, trace_type="openclaw")
     if trace_type == "pi":
         return _convert_pi_trace_to_training_example(trace_file, events)
     return _convert_codex_trace_to_training_example(trace_file, events)
@@ -2668,6 +2816,8 @@ def _convert_jsonl_file_to_training_rows(jsonl_file: Path) -> list[dict[str, Any
         return [_convert_hermes_trace_to_training_example(jsonl_file, rows).to_dict()]
     if trace_type == "external_agent":
         return [_convert_external_agent_trace_to_training_example(jsonl_file, rows).to_dict()]
+    if trace_type == "openclaw":
+        return [_convert_pi_trace_to_training_example(jsonl_file, rows, trace_type="openclaw").to_dict()]
     if trace_type == "pi":
         return [_convert_pi_trace_to_training_example(jsonl_file, rows).to_dict()]
     return [_convert_codex_trace_to_training_example(jsonl_file, rows).to_dict()]

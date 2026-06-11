@@ -22,6 +22,17 @@ def test_detect_trace_type_returns_known_trace_type():
             [{"id": "hermes-session", "source": "cli", "messages": [{"role": "user", "content": "hello"}]}],
             "hermes",
         ),
+        (
+            [
+                {
+                    "type": "session",
+                    "version": 3,
+                    "id": "openclaw-session",
+                    "cwd": "/Users/calebfahlgren/.openclaw/workspace",
+                }
+            ],
+            "openclaw",
+        ),
         ([{"type": "external_session_meta", "payload": {"source": "custom-agent"}}], "external_agent"),
         (
             [
@@ -38,6 +49,96 @@ def test_detect_trace_type_returns_known_trace_type():
 
 def test_detect_trace_type_returns_none_for_non_agent_jsonl():
     assert detect_trace_type([{"text": "hello"}, {"text": "world"}]) is None
+
+
+def test_convert_openclaw_trace_uses_distinct_type_with_shared_event_envelope(tmp_path: Path):
+    trace_file = tmp_path / "openclaw-session.jsonl"
+    events = [
+        {
+            "type": "session",
+            "version": 3,
+            "id": "0f853abd-d578-4a01-b37f-504880057fe4",
+            "timestamp": "2026-02-16T23:40:43.787Z",
+            "cwd": "/Users/calebfahlgren/.openclaw/workspace",
+        },
+        {
+            "type": "model_change",
+            "id": "d11668ab",
+            "provider": "anthropic",
+            "modelId": "claude-opus-4-6",
+        },
+        {
+            "type": "thinking_level_change",
+            "id": "1196999b",
+            "thinkingLevel": "low",
+        },
+        {
+            "type": "custom",
+            "id": "teich-system-1",
+            "customType": "teich-system-prompt",
+            "data": {"systemPrompt": "Pi runner system prompt should not contaminate OpenClaw."},
+        },
+        {
+            "type": "custom",
+            "id": "teich-tools-1",
+            "customType": "teich-available-tools",
+            "data": {
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "pi_only_tool",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ]
+            },
+        },
+        {
+            "type": "message",
+            "id": "user-1",
+            "timestamp": "2026-02-16T23:40:43.700Z",
+            "message": {
+                "role": "user",
+                "timestamp": 1771285243795,
+                "content": [{"type": "text", "text": "Hi"}],
+            },
+        },
+        {
+            "type": "message",
+            "id": "assistant-1",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "\n\n"},
+                    {"type": "thinking", "thinking": "First session, BOOTSTRAP.md exists. Let me follow it."},
+                    {"type": "text", "text": "OpenClaw response."},
+                ],
+            },
+        },
+    ]
+    trace_file.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+
+    example = convert_trace_to_training_example(trace_file)
+
+    assert example.metadata["trace_type"] == "openclaw"
+    assert example.metadata["session_id"] == "0f853abd-d578-4a01-b37f-504880057fe4"
+    assert example.metadata["model_provider"] == "anthropic"
+    assert example.metadata["model"] == "claude-opus-4-6"
+    assert example.metadata["cwd"] == "/Users/calebfahlgren/.openclaw/workspace"
+    assert example.metadata["thinking_level"] == "low"
+    assert example.metadata["first_message_timestamp"] == "2026-02-16T23:40:43.795000Z"
+    assert "system_prompt" not in example.metadata
+    assert example.prompt == "Hi"
+    assert example.tools == []
+    assert example.messages == [
+        {"role": "user", "content": "Hi"},
+        {
+            "role": "assistant",
+            "content": "OpenClaw response.",
+            "reasoning_content": "First session, BOOTSTRAP.md exists. Let me follow it.",
+        },
+    ]
 
 
 def test_convert_pi_trace_ignores_malformed_tool_calls(tmp_path: Path):
@@ -288,11 +389,17 @@ def test_convert_codex_trace_keeps_system_prompt_and_tools_without_tool_calls(tm
         },
         {
             "type": "response_item",
+            "timestamp": "2026-05-13T06:03:00.000Z",
             "payload": {
                 "type": "message",
                 "role": "user",
                 "content": [{"type": "input_text", "text": "Say hi"}],
             },
+        },
+        {
+            "type": "event_msg",
+            "timestamp": "2026-05-13T06:03:06.000Z",
+            "payload": {"type": "user_message", "message": "Say hi"},
         },
         {
             "type": "response_item",
@@ -324,6 +431,7 @@ def test_convert_codex_trace_keeps_system_prompt_and_tools_without_tool_calls(tm
 
     assert example.messages[0] == {"role": "system", "content": "You are a careful coding agent."}
     assert example.metadata["system_prompt"] == "You are a careful coding agent."
+    assert example.metadata["first_message_timestamp"] == "2026-05-13T06:03:06.000Z"
     assert [tool["function"]["name"] for tool in example.tools] == ["exec_command"]
     assert example.tools[0]["function"]["parameters"]["required"] == ["cmd"]
 
@@ -415,7 +523,12 @@ def test_convert_claude_code_stream_json_trace(tmp_path: Path):
                 "cwd": "/workspace",
             },
         },
-        {"type": "external_message", "role": "user", "content": "Inspect the project"},
+        {
+            "type": "external_message",
+            "role": "user",
+            "content": "Inspect the project",
+            "timestamp": "2026-05-14T00:00:01.000Z",
+        },
         {
             "type": "system",
             "subtype": "init",
@@ -461,6 +574,7 @@ def test_convert_claude_code_stream_json_trace(tmp_path: Path):
     assert example.metadata["trace_type"] == "claude-code"
     assert example.metadata["session_id"] == "claude-session"
     assert example.metadata["model_provider"] == "anthropic"
+    assert example.metadata["first_message_timestamp"] == "2026-05-14T00:00:01.000Z"
     assert example.prompt == "Inspect the project"
     assert example.messages[0] == {"role": "user", "content": "Inspect the project"}
     assert example.messages[1]["role"] == "assistant"
@@ -485,6 +599,51 @@ def test_convert_claude_code_stream_json_trace(tmp_path: Path):
     assert bash_tool["function"]["parameters"]["properties"]["command"]["type"] == "string"
     todo_tool = next(tool for tool in example.tools if tool["function"]["name"] == "TodoWrite")
     assert todo_tool["function"]["parameters"]["properties"]["todos"]["type"] == "array"
+
+
+def test_convert_claude_code_trace_ignores_tool_result_timestamp_for_first_message(tmp_path: Path):
+    trace_file = tmp_path / "claude-code-tool-result-timestamp.jsonl"
+    events = [
+        {
+            "type": "user",
+            "session_id": "claude-session",
+            "message": {
+                "role": "user",
+                "content": "Inspect the project",
+            },
+        },
+        {
+            "type": "assistant",
+            "session_id": "claude-session",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls"}}],
+            },
+        },
+        {
+            "type": "user",
+            "session_id": "claude-session",
+            "timestamp": "2026-05-14T00:00:02.000Z",
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "README.md\nsrc"},
+                ],
+            },
+        },
+    ]
+    trace_file.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+
+    example = convert_trace_to_training_example(trace_file)
+
+    assert example.prompt == "Inspect the project"
+    assert "first_message_timestamp" not in example.metadata
+    assert example.messages[2] == {
+        "role": "tool",
+        "tool_call_id": "toolu_1",
+        "name": "unknown_tool",
+        "content": "README.md\nsrc",
+    }
 
 
 def test_convert_droid_trace(tmp_path: Path):
@@ -962,7 +1121,12 @@ def test_convert_external_agent_trace(tmp_path: Path):
                 "model": "qwen/qwen3-coder",
             },
         },
-        {"type": "external_message", "role": "user", "content": "Build a CLI"},
+        {
+            "type": "external_message",
+            "role": "user",
+            "content": "Build a CLI",
+            "timestamp": "2026-05-15T00:00:01.000Z",
+        },
         {"type": "external_message", "role": "assistant", "content": "Built it."},
     ]
     trace_file.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
@@ -971,6 +1135,7 @@ def test_convert_external_agent_trace(tmp_path: Path):
 
     assert example.metadata["trace_type"] == "hermes-agent"
     assert example.metadata["session_id"] == "hermes-session"
+    assert example.metadata["first_message_timestamp"] == "2026-05-15T00:00:01.000Z"
     assert example.prompt == "Build a CLI"
     assert example.messages == [
         {"role": "user", "content": "Build a CLI"},
@@ -1117,7 +1282,7 @@ def test_convert_hermes_native_trace_preserves_raw_messages_and_metadata(tmp_pat
     }
     conversation = [
         {"from": "system", "value": "Use the delegated task contract."},
-        {"from": "human", "value": "Delegate a task"},
+        {"from": "human", "value": "Delegate a task", "timestamp": "2026-05-16T00:00:01.000Z"},
         {
             "from": "gpt",
             "value": '<think>\nNeed isolated context.\n</think>\n<tool_call>\n{"name": "delegate_task", "arguments": {"prompt": "sub task"}}\n</tool_call>',
@@ -1163,6 +1328,7 @@ def test_convert_hermes_native_trace_preserves_raw_messages_and_metadata(tmp_pat
     assert example.metadata["billing_base_url"] == "https://openrouter.ai/api/v1"
     assert example.metadata["estimated_cost_usd"] == 0.001
     assert example.metadata["system_prompt"] == "Use the delegated task contract."
+    assert example.metadata["first_message_timestamp"] == "2026-05-16T00:00:01.000Z"
     assert example.prompt == "Delegate a task"
     assert example.messages[2]["tool_calls"][0]["function"] == {
         "name": "delegate_task",
@@ -1937,8 +2103,10 @@ def test_convert_pi_trace_uses_thinking_blocks_and_tool_results(tmp_path: Path):
         {
             "type": "message",
             "id": "user-1",
+            "timestamp": "2026-05-17T00:00:00.000Z",
             "message": {
                 "role": "user",
+                "timestamp": "2026-05-17T00:00:01.000Z",
                 "content": [{"type": "text", "text": "Review this repo"}],
             },
         },
@@ -1978,6 +2146,7 @@ def test_convert_pi_trace_uses_thinking_blocks_and_tool_results(tmp_path: Path):
     assert example.metadata["trace_type"] == "pi"
     assert example.metadata["model_provider"] == "anthropic"
     assert example.metadata["thinking_level"] == "high"
+    assert example.metadata["first_message_timestamp"] == "2026-05-17T00:00:01.000Z"
     assert example.messages[0]["role"] == "system"
     assert "Available tools:" in example.messages[0]["content"]
     assert example.messages[2]["role"] == "assistant"

@@ -71,6 +71,7 @@ Provider output behavior:
 
 - `codex`: copies the native Codex session JSONL from mounted `CODEX_HOME/sessions` and normalizes Codex event-shape edge cases so reasoning summaries are visible and split assistant turns render as thinking before text/tool use.
 - `pi`: copies the native Pi session JSONL from mounted `/home/codex/pi-sessions`, then normalizes and validates event structure.
+- `openclaw`: imported raw OpenClaw traces are recognized when the first session event has `.openclaw` in its `cwd`. OpenClaw is not a Teich runner yet, so Teich only identifies and converts the raw events with `metadata.trace_type = "openclaw"` without applying Pi runner metadata snapshots.
 - `claude-code`: copies Claude Code's native transcript JSONL from `.claude/projects/...`, then normalizes split assistant fragments so thinking appears before the text or tool use it explains. For OpenRouter non-Claude models, a local proxy gives Claude Code a Claude surrogate model while forwarding the configured model to OpenRouter.
 - `hermes`: enables Hermes built-in toolsets `safe,terminal,file,skills,memory,session_search,delegation`, reads Hermes `state.db`, and writes each Hermes session as its own Teich external trace with `external_session_meta` and `external_message` events. Hermes' internal `system_prompt` stays metadata-only instead of becoming supervised training text. Delegated subagent sessions are separate files linked to the orchestrator by `parent_session_id`.
 - `chat`: writes structured training rows directly, without Docker or raw session capture.
@@ -216,6 +217,7 @@ Important details:
 - **`teich_supervised_spans`** are typed character span metadata. `prepare_data()` records candidate spans; `mask_data()` decides which kinds become labels.
 - **`teich_masking=False`** skips span metadata and returns plain rendered `text` rows for standard next-token training without Teich labels.
 - **Original columns are removed** after formatting unless `preserve_columns=True` or an explicit `preserve_columns=[...]` list is passed. `source`, `metadata`, `raw_index`, and `source_key` are the default provenance columns.
+- **Raw trace conversion** stores `metadata.first_message_timestamp` when a source user message has its own timestamp. It is not synthesized from session-start metadata.
 - **Oversized examples use `oversized_policy`** when `max_length` is set: `"drop"`, `"trim_followups"`, or `"error"`. The older `drop_oversized_examples` and `trim_oversized_followups` flags still work as aliases.
 - **Preparation reports** are available with `return_report=True`. The returned `PrepareReport` includes dropped rows, oversized rows, trimmed rows, token lengths, max token lengths, kept-row ids, and returned row count.
 - **Public preflight helpers**: `row_fits_context(row, tokenizer, max_length, chat_template_kwargs)` renders and measures one row, `validate_tool_calls(row)` checks declared tool names and required args, and `trace_is_complete(row)` flags rows that end on a tool result.
