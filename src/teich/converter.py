@@ -291,14 +291,11 @@ def _timestamp_from_mapping(value: Any) -> str | None:
 def _event_timestamp(event: Any) -> str | None:
     if not isinstance(event, dict):
         return None
-    timestamp = _timestamp_from_mapping(event)
-    if timestamp:
-        return timestamp
     for key in ("payload", "message"):
         timestamp = _timestamp_from_mapping(event.get(key))
         if timestamp:
             return timestamp
-    return None
+    return _timestamp_from_mapping(event)
 
 
 def _first_message_timestamp_from_events(events: list[Any], predicate: Callable[[dict[str, Any]], bool]) -> str | None:
@@ -326,6 +323,17 @@ def _is_external_user_message(event: dict[str, Any]) -> bool:
 def _is_nested_user_message(event: dict[str, Any]) -> bool:
     message = event.get("message")
     return isinstance(message, dict) and _is_user_role(message.get("role"))
+
+
+def _is_claude_code_user_message(event: dict[str, Any]) -> bool:
+    if event.get("type") != "user" or not _is_nested_user_message(event):
+        return False
+    message = event.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    return not (
+        isinstance(content, list)
+        and any(isinstance(block, dict) and block.get("type") == "tool_result" for block in content)
+    )
 
 
 def _first_text_block(content_blocks: Any) -> str:
@@ -1317,7 +1325,7 @@ def _convert_claude_code_trace_to_training_example(
     prompt = ""
     first_message_timestamp = _first_message_timestamp_from_events(
         events,
-        lambda event: _is_external_user_message(event) or (event.get("type") == "user" and _is_nested_user_message(event)),
+        lambda event: _is_external_user_message(event) or _is_claude_code_user_message(event),
     )
 
     for event in events:

@@ -90,6 +90,7 @@ def test_convert_openclaw_trace_uses_distinct_type_with_shared_event_envelope(tm
         {
             "type": "message",
             "id": "user-1",
+            "timestamp": "2026-02-16T23:40:43.700Z",
             "message": {
                 "role": "user",
                 "timestamp": 1771285243795,
@@ -591,6 +592,51 @@ def test_convert_claude_code_stream_json_trace(tmp_path: Path):
     assert bash_tool["function"]["parameters"]["properties"]["command"]["type"] == "string"
     todo_tool = next(tool for tool in example.tools if tool["function"]["name"] == "TodoWrite")
     assert todo_tool["function"]["parameters"]["properties"]["todos"]["type"] == "array"
+
+
+def test_convert_claude_code_trace_ignores_tool_result_timestamp_for_first_message(tmp_path: Path):
+    trace_file = tmp_path / "claude-code-tool-result-timestamp.jsonl"
+    events = [
+        {
+            "type": "user",
+            "session_id": "claude-session",
+            "message": {
+                "role": "user",
+                "content": "Inspect the project",
+            },
+        },
+        {
+            "type": "assistant",
+            "session_id": "claude-session",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls"}}],
+            },
+        },
+        {
+            "type": "user",
+            "session_id": "claude-session",
+            "timestamp": "2026-05-14T00:00:02.000Z",
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "README.md\nsrc"},
+                ],
+            },
+        },
+    ]
+    trace_file.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+
+    example = convert_trace_to_training_example(trace_file)
+
+    assert example.prompt == "Inspect the project"
+    assert "first_message_timestamp" not in example.metadata
+    assert example.messages[2] == {
+        "role": "tool",
+        "tool_call_id": "toolu_1",
+        "name": "unknown_tool",
+        "content": "README.md\nsrc",
+    }
 
 
 def test_convert_claude_code_keeps_init_tools_without_tool_calls(tmp_path: Path):
@@ -1777,6 +1823,7 @@ def test_convert_pi_trace_uses_thinking_blocks_and_tool_results(tmp_path: Path):
         {
             "type": "message",
             "id": "user-1",
+            "timestamp": "2026-05-17T00:00:00.000Z",
             "message": {
                 "role": "user",
                 "timestamp": "2026-05-17T00:00:01.000Z",
