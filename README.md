@@ -559,7 +559,9 @@ from teich import (
 )
 ```
 
-`detect_trace_type(events)` returns `codex`, `claude_code`, `pi`, `openclaw`, `hermes`, or `external_agent` for supported parsed trace events, and `None` for ordinary JSON rows.
+`detect_trace_type(events)` returns `codex`, `claude_code`, `droid`, `pi`, `openclaw`, `hermes`, or `external_agent` for supported parsed trace events, and `None` for ordinary JSON rows.
+
+Factory `droid` CLI sessions are supported as a conversion-only source: point `prepare_data()` or `load_traces()` at session JSONL files from `~/.factory/sessions/...` and Teich converts them directly, reading the adjacent `<session-id>.settings.json` sidecar for model and token usage metadata.
 
 `README.md` is the package readme used for PyPI, so these examples are the canonical public package docs.
 

@@ -35,6 +35,13 @@ def test_detect_trace_type_returns_known_trace_type():
         ),
         ([{"type": "external_session_meta", "payload": {"source": "hermes-agent"}}], "hermes"),
         ([{"type": "external_session_meta", "payload": {"source": "custom-agent"}}], "external_agent"),
+        (
+            [
+                {"type": "session_start", "id": "droid-session", "version": 2, "cwd": "/workspace/project"},
+                {"type": "message", "id": "message-1", "message": {"role": "user", "content": [{"type": "text", "text": "hello"}]}},
+            ],
+            "droid",
+        ),
     ]
 
     for events, expected_trace_type in cases:
@@ -651,6 +658,280 @@ def test_convert_claude_code_trace_ignores_tool_result_timestamp_for_first_messa
         "name": "unknown_tool",
         "content": "README.md\nsrc",
     }
+
+
+def test_convert_droid_trace(tmp_path: Path):
+    trace_file = tmp_path / "droid.jsonl"
+    events = [
+        {
+            "type": "session_start",
+            "id": "droid-session",
+            "title": "inspect the project",
+            "sessionTitle": "Inspect project files",
+            "owner": "caleb",
+            "version": 2,
+            "cwd": "/workspace/project",
+        },
+        {
+            "type": "message",
+            "id": "message-1",
+            "timestamp": "2026-06-02T18:55:30.274Z",
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": "Inspect the project"}],
+            },
+            "parentId": None,
+        },
+        {
+            "type": "message",
+            "id": "message-2",
+            "timestamp": "2026-06-02T18:55:35.000Z",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "I should list the files first.",
+                        "signature": "reasoning_content",
+                        "signatureProvider": "generic-chat-completion-api",
+                        "durationMs": 1200,
+                    },
+                    {"type": "text", "text": "I'll list the files."},
+                    {"type": "tool_use", "id": "LS_0", "name": "LS", "input": {"directory_path": "/workspace/project"}},
+                ],
+                "chatCompletionReasoningField": "reasoning_content",
+                "chatCompletionReasoningContent": "I should list the files first.",
+            },
+            "parentId": "message-1",
+        },
+        {
+            "type": "message",
+            "id": "message-3",
+            "timestamp": "2026-06-02T18:55:36.000Z",
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "LS_0", "is_error": False, "content": "README.md\nsrc"},
+                ],
+            },
+            "parentId": "message-2",
+        },
+        {
+            "type": "message",
+            "id": "message-4",
+            "timestamp": "2026-06-02T18:55:40.000Z",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "The project contains README.md and src."}],
+            },
+            "parentId": "message-3",
+        },
+    ]
+    trace_file.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+
+    example = convert_trace_to_training_example(trace_file)
+
+    assert example.metadata["trace_type"] == "droid"
+    assert example.metadata["session_id"] == "droid-session"
+    assert example.metadata["cwd"] == "/workspace/project"
+    assert example.metadata["title"] == "Inspect project files"
+    assert example.metadata["turn_count"] == 1
+    assert example.metadata["first_message_timestamp"] == "2026-06-02T18:55:30.274Z"
+    assert example.prompt == "Inspect the project"
+    assert example.messages[0] == {"role": "user", "content": "Inspect the project"}
+    assert example.messages[1]["role"] == "assistant"
+    assert example.messages[1]["content"] == "I'll list the files."
+    assert example.messages[1]["reasoning_content"] == "I should list the files first."
+    assert example.messages[1]["tool_calls"] == [
+        {
+            "id": "LS_0",
+            "type": "function",
+            "function": {"name": "LS", "arguments": {"directory_path": "/workspace/project"}},
+        }
+    ]
+    assert example.messages[2] == {
+        "role": "tool",
+        "tool_call_id": "LS_0",
+        "name": "LS",
+        "content": "README.md\nsrc",
+    }
+    assert example.messages[3] == {"role": "assistant", "content": "The project contains README.md and src."}
+    tool_names = {tool["function"]["name"] for tool in example.tools}
+    assert "LS" in tool_names
+
+
+def test_convert_droid_trace_reads_settings_sidecar(tmp_path: Path):
+    trace_file = tmp_path / "droid-settings.jsonl"
+    events = [
+        {"type": "session_start", "id": "droid-session", "version": 2, "cwd": "/workspace/project"},
+        {
+            "type": "message",
+            "id": "message-1",
+            "message": {"role": "user", "content": [{"type": "text", "text": "Say hi"}]},
+        },
+        {
+            "type": "message",
+            "id": "message-2",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "Hi!"}]},
+        },
+    ]
+    trace_file.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+    settings = {
+        "model": "custom:Kimi-K2.6-[HF-Router]-0",
+        "reasoningEffort": "high",
+        "autonomyLevel": "medium",
+        "providerLock": "generic-chat-completion-api",
+        "tokenUsage": {
+            "inputTokens": 202809,
+            "outputTokens": 29390,
+            "cacheCreationTokens": 0,
+            "cacheReadTokens": 4843520,
+            "thinkingTokens": 0,
+            "factoryCredits": 0,
+        },
+    }
+    (tmp_path / "droid-settings.settings.json").write_text(json.dumps(settings), encoding="utf-8")
+
+    example = convert_trace_to_training_example(trace_file)
+
+    assert example.metadata["model"] == "custom:Kimi-K2.6-[HF-Router]-0"
+    assert example.metadata["model_provider"] == "generic-chat-completion-api"
+    assert example.metadata["usage"] == settings["tokenUsage"]
+    assert example.metadata["reasoning_effort"] == "high"
+    assert example.metadata["autonomy_level"] == "medium"
+
+
+def test_convert_droid_trace_without_settings_sidecar(tmp_path: Path):
+    trace_file = tmp_path / "droid-no-settings.jsonl"
+    events = [
+        {"type": "session_start", "id": "droid-session", "version": 2, "cwd": "/workspace/project"},
+        {
+            "type": "message",
+            "id": "message-1",
+            "message": {"role": "user", "content": [{"type": "text", "text": "Say hi"}]},
+        },
+    ]
+    trace_file.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+
+    example = convert_trace_to_training_example(trace_file)
+
+    assert example.metadata["model"] is None
+    assert example.metadata["model_provider"] == "factory"
+    assert "usage" not in example.metadata
+
+
+def test_convert_droid_trace_prefers_user_authored_prompt(tmp_path: Path):
+    trace_file = tmp_path / "droid-prompt.jsonl"
+    events = [
+        {"type": "session_start", "id": "droid-session", "version": 2, "cwd": "/workspace/project"},
+        {
+            "type": "message",
+            "id": "message-1",
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": "<system-reminder>Injected environment context.</system-reminder>"}],
+                "visibility": "llm_only",
+            },
+        },
+        {
+            "type": "message",
+            "id": "message-2",
+            "message": {"role": "user", "content": [{"type": "text", "text": "Summarize the README"}]},
+        },
+        {
+            "type": "message",
+            "id": "message-3",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "Done."}]},
+        },
+    ]
+    trace_file.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+
+    example = convert_trace_to_training_example(trace_file)
+
+    assert example.prompt == "Summarize the README"
+    assert example.messages[0]["content"].startswith("<system-reminder>")
+    assert example.messages[1] == {"role": "user", "content": "Summarize the README"}
+
+
+def test_convert_droid_trace_skips_user_only_and_state_events(tmp_path: Path):
+    trace_file = tmp_path / "droid-edge-cases.jsonl"
+    events = [
+        {"type": "session_start", "id": "droid-session", "version": 2, "cwd": "/workspace/project"},
+        {
+            "type": "message",
+            "id": "message-1",
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": "No active subscription found."}],
+                "visibility": "user_only",
+            },
+        },
+        {
+            "type": "message",
+            "id": "message-2",
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this screenshot"},
+                    {"type": "image", "source": {"type": "base64", "data": "abc123"}},
+                ],
+                "visibility": "llm_only",
+            },
+        },
+        {
+            "type": "todo_state",
+            "id": "todo-1",
+            "todos": {"todos": "1. [in_progress] Describe the screenshot"},
+            "messageIndex": 1,
+        },
+        {
+            "type": "compaction_state",
+            "id": "compaction-1",
+            "summaryText": "USER: earlier conversation summary",
+        },
+        {
+            "type": "message",
+            "id": "message-3",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "It shows a terminal."}]},
+        },
+    ]
+    trace_file.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+
+    example = convert_trace_to_training_example(trace_file)
+
+    assert example.prompt == "Describe this screenshot"
+    assert example.messages == [
+        {"role": "user", "content": "Describe this screenshot"},
+        {"role": "assistant", "content": "It shows a terminal."},
+    ]
+
+
+def test_convert_droid_trace_includes_builtin_tools(tmp_path: Path):
+    trace_file = tmp_path / "droid-tools.jsonl"
+    events = [
+        {"type": "session_start", "id": "droid-session", "version": 2, "cwd": "/workspace/project"},
+        {
+            "type": "message",
+            "id": "message-1",
+            "message": {"role": "user", "content": [{"type": "text", "text": "Say hi"}]},
+        },
+        {
+            "type": "message",
+            "id": "message-2",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "Hi!"}]},
+        },
+    ]
+    trace_file.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+
+    example = convert_trace_to_training_example(trace_file)
+
+    tool_names = {tool["function"]["name"] for tool in example.tools}
+    assert {"Read", "Edit", "Create", "Execute", "LS", "Glob", "Grep", "TodoWrite", "FetchUrl", "Skill"}.issubset(tool_names)
+    read_tool = next(tool for tool in example.tools if tool["function"]["name"] == "Read")
+    assert read_tool["function"]["parameters"]["properties"]["file_path"]["type"] == "string"
+    assert read_tool["function"]["parameters"]["required"] == ["file_path"]
+    glob_tool = next(tool for tool in example.tools if tool["function"]["name"] == "Glob")
+    assert glob_tool["function"]["parameters"]["properties"]["patterns"]["type"] == "array"
 
 
 def test_convert_claude_code_keeps_init_tools_without_tool_calls(tmp_path: Path):
