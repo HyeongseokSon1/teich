@@ -309,6 +309,10 @@ def summarize_trace_events(provider: str, events: list[dict[str, Any]]) -> list[
 def _trace_user_text(provider: str, event: dict[str, Any]) -> str | None:
     """Return user-turn text when this trace event is a user message, else None."""
     if provider == "codex":
+        if event.get("type") == "response_item" and isinstance(event.get("payload"), dict):
+            payload = event["payload"]
+            if payload.get("type") == "message" and payload.get("role") == "user":
+                return _content_text(payload.get("content"))
         if event.get("type") == "event_msg" and isinstance(event.get("payload"), dict):
             payload = event["payload"]
             if payload.get("type") == "user_message":

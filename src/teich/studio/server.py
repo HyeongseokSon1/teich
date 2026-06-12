@@ -242,17 +242,20 @@ def create_app(project_dir: Path) -> FastAPI:
         provider = None
         model = None
         prompts_count = 0
+        prompts_file = str(state.root / "prompts.jsonl")
         try:
             cfg = state.load_config()
             api_key_present = bool(cfg.get_api_key())
             provider = cfg.get_agent_provider()
             model = cfg.get_effective_model()
             prompts_count = len(cfg.get_prompt_inputs())
+            prompts_file = str(state.prompts_path())
         except Exception as exc:
             config_error = str(exc)
             try:
+                prompts_file = str(state.prompts_path())
                 prompts_count = len(state.read_prompts())
-            except ValueError:
+            except Exception:
                 prompts_count = -1
         return {
             "project_dir": str(state.root),
@@ -262,7 +265,7 @@ def create_app(project_dir: Path) -> FastAPI:
             "provider": provider,
             "model": model,
             "prompts_count": prompts_count,
-            "prompts_file": str(state.prompts_path()),
+            "prompts_file": prompts_file,
             "docker": _docker_status(),
             "providers": PROVIDERS,
         }

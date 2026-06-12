@@ -171,6 +171,34 @@ def test_summarize_trace_events_includes_user_turns():
     assert [e["kind"] for e in display] == ["user", "assistant"]
 
 
+def test_summarize_codex_trace_includes_response_item_user_turns():
+    events = [
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "build a CLI"}],
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "done"}],
+            },
+        },
+    ]
+
+    display = summarize_trace_events("codex", events)
+
+    assert [(event["kind"], event["text"]) for event in display] == [
+        ("user", "build a CLI"),
+        ("assistant", "done"),
+    ]
+
+
 def test_summarize_chat_row():
     row = {
         "messages": [
@@ -212,6 +240,18 @@ def test_status_counts_inline_config_prompts(client):
     payload = client.get("/api/status").json()
 
     assert payload["prompts_count"] == 1
+
+
+def test_status_reports_config_error_for_invalid_config(client):
+    (client.project_dir / "config.yaml").write_text("not a mapping\n", encoding="utf-8")
+
+    response = client.get("/api/status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["config_error"]
+    assert payload["prompts_count"] == -1
+    assert payload["prompts_file"].endswith("prompts.jsonl")
 
 
 def test_config_endpoints(client):
