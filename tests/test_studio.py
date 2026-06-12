@@ -16,6 +16,7 @@ from teich.config import Config
 from teich.runner import SessionProgressUpdate
 from teich.studio.events import summarize_chat_row, summarize_event, summarize_trace_events
 from teich.studio.generation import RUNNER_CLASSES, GenerationJob
+from teich.studio.interactive import InteractiveSession
 from teich.studio.project import ProjectState
 from teich.studio import server as server_module
 from teich.studio.server import (
@@ -114,6 +115,17 @@ def test_import_prompts_append_and_replace(tmp_path):
     assert [row["prompt"] for row in state.read_prompts()] == ["one", "two", "three"]
     state.import_prompts_text('{"prompt": "only"}', replace=True)
     assert [row["prompt"] for row in state.read_prompts()] == ["only"]
+
+
+def test_import_prompts_rejects_non_jsonl_upload_filename(tmp_path):
+    state = ProjectState(tmp_path)
+    state.ensure_initialized()
+
+    state.import_prompts_text('{"prompt": "accepted"}', replace=True, filename="prompts.ndjson")
+
+    assert [row["prompt"] for row in state.read_prompts()] == ["accepted"]
+    with pytest.raises(ValueError, match="JSONL or NDJSON"):
+        state.import_prompts_text('{"prompt": "rejected"}', replace=True, filename="prompts.txt")
 
 
 # ---------------------------------------------------------------------------
@@ -321,13 +333,19 @@ def test_prompts_endpoints(client):
 
     imported = client.post(
         "/api/prompts/import",
-        json={"text": '{"prompt": "uploaded"}', "replace": False},
+        json={"text": '{"prompt": "uploaded"}', "replace": False, "filename": "prompts.jsonl"},
     )
     assert imported.status_code == 200
     assert len(imported.json()["prompts"]) == 2
 
     invalid = client.post("/api/prompts/import", json={"text": "{not json", "replace": False})
     assert invalid.status_code == 400
+    unsupported = client.post(
+        "/api/prompts/import",
+        json={"text": '{"prompt": "uploaded"}', "replace": False, "filename": "prompts.txt"},
+    )
+    assert unsupported.status_code == 400
+    assert "JSONL or NDJSON" in unsupported.json()["detail"]
 
 
 def test_trace_listing_and_preview(client):
@@ -366,6 +384,23 @@ def test_session_endpoints_validation(client):
     missing = client.get("/api/sessions/does-not-exist")
     assert missing.status_code == 404
     assert client.get("/api/sessions").json()["sessions"] == []
+
+
+def test_chat_session_discard_rejected_while_turn_running(tmp_path):
+    config = Config(
+        agent={"provider": "chat"},
+        model={"model": "test/model"},
+        api={"provider": "openai", "base_url": "https://api.openai.com/v1"},
+        output={"traces_dir": tmp_path / "output", "sandbox_dir": tmp_path / "sandbox"},
+    )
+    session = InteractiveSession(config)
+    session.status = "running"
+    session._busy = True
+
+    with pytest.raises(RuntimeError, match="current turn"):
+        session.discard()
+
+    assert session.status == "running"
 
 
 def test_generation_stop_prevents_later_prompt_starts(tmp_path, monkeypatch):

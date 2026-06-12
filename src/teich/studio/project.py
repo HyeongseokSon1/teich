@@ -208,8 +208,14 @@ class ProjectState:
         except ValueError:
             return str(path)
 
-    def import_prompts_text(self, text: str, *, replace: bool) -> list[dict[str, Any]]:
+    def import_prompts_text(
+        self, text: str, *, replace: bool, filename: str | None = None
+    ) -> list[dict[str, Any]]:
         """Parse uploaded JSONL text and merge or replace the current prompts."""
+        if filename:
+            suffix = Path(filename).suffix.lower()
+            if suffix not in JSONL_PROMPT_SUFFIXES:
+                raise ValueError("Prompt uploads must be JSONL or NDJSON files")
         rows: list[dict[str, Any]] = []
         for line_number, raw_line in enumerate(text.splitlines(), start=1):
             line = raw_line.strip()

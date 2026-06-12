@@ -60,6 +60,24 @@ function get(obj, path, fallback) {
   return current == null ? fallback : current;
 }
 
+function normalizeSessionProvider(provider) {
+  const normalized = String(provider || "pi").trim().toLowerCase();
+  if (["claude", "claude_code"].includes(normalized)) return "claude-code";
+  if (["hermes-agent", "hermes_agent"].includes(normalized)) return "hermes";
+  return normalized || "pi";
+}
+
+function syncSessionProviderFields() {
+  const isChat = state.sessionProvider === "chat";
+  $("#sess-system-field").hidden = !isChat;
+  $("#sess-repo-field").hidden = isChat;
+}
+
+function syncSessionProviderFromConfig() {
+  state.sessionProvider = normalizeSessionProvider(get(state.config, "agent.provider", "pi"));
+  syncSessionProviderFields();
+}
+
 // ---------------------------------------------------------------------------
 // Global state
 // ---------------------------------------------------------------------------
@@ -265,6 +283,7 @@ $("#btn-save-config").addEventListener("click", async () => {
   try {
     const result = await api("PUT", "/api/config", { config: updates });
     state.config = result.config;
+    syncSessionProviderFromConfig();
     note.textContent = "Saved to config.yaml ✓";
     note.classList.remove("error");
     setTimeout(() => { note.textContent = ""; }, 3000);
@@ -280,6 +299,7 @@ async function loadConfig() {
   try {
     const result = await api("GET", "/api/config");
     state.config = result.config || {};
+    syncSessionProviderFromConfig();
     fillConfigForm();
   } catch (err) {
     toast(`Failed to load config: ${err.message}`, "error");
@@ -404,12 +424,18 @@ $("#btn-upload-prompts").addEventListener("click", () => $("#prompts-file-input"
 $("#prompts-file-input").addEventListener("change", async (event) => {
   const file = event.target.files[0];
   if (!file) return;
+  if (!/\.(jsonl|ndjson)$/i.test(file.name)) {
+    event.target.value = "";
+    toast("Prompt uploads must be JSONL or NDJSON files.", "error");
+    return;
+  }
   const text = await file.text();
   event.target.value = "";
   try {
     const result = await api("POST", "/api/prompts/import", {
       text,
       replace: $("#upload-replace").checked,
+      filename: file.name,
     });
     state.prompts = result.prompts;
     state.promptsDirty = false;
@@ -566,12 +592,10 @@ function renderProviderSeg() {
     button.addEventListener("click", () => {
       state.sessionProvider = provider.id;
       renderProviderSeg();
-      const isChat = provider.id === "chat";
-      $("#sess-system-field").hidden = !isChat;
-      $("#sess-repo-field").hidden = isChat;
     });
     seg.appendChild(button);
   }
+  syncSessionProviderFields();
   $("#sess-model").placeholder = get(state.config, "model.model", "Use configured model");
 }
 
@@ -614,7 +638,9 @@ function setSessionStatus(status, message) {
   $("#sess-status-text").textContent = message || status;
   if (state.session) state.session.status = status;
   const busy = ["saving"].includes(status);
+  const chatRunning = state.session && state.session.mode === "chat" && status === "running";
   $("#btn-save-session").disabled = busy;
+  $("#btn-discard-session").disabled = busy || chatRunning;
   // chat composer state
   const sendDisabled = ["running", "starting", "saving", "finished", "discarded", "error"].includes(status);
   const sendBtn = $("#btn-send");
@@ -954,15 +980,8 @@ async function init() {
   await loadStatus();
   await loadConfig();
   await loadPrompts();
-  state.sessionProvider = (() => {
-    const provider = get(state.config, "agent.provider", "pi");
-    if (["claude", "claude_code"].includes(provider)) return "claude-code";
-    if (["hermes-agent", "hermes_agent"].includes(provider)) return "hermes";
-    return provider;
-  })();
+  syncSessionProviderFromConfig();
   renderProviderSeg();
-  $("#sess-system-field").hidden = state.sessionProvider !== "chat";
-  $("#sess-repo-field").hidden = state.sessionProvider === "chat";
   refreshRunSummary();
   loadCurrentJob();
   loadTracesQuiet();

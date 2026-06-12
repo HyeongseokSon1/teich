@@ -69,6 +69,7 @@ class PromptsUpdate(BaseModel):
 class PromptsImport(BaseModel):
     text: str
     replace: bool = False
+    filename: str | None = None
 
 
 class GenerateRequest(BaseModel):
@@ -307,7 +308,9 @@ def create_app(project_dir: Path) -> FastAPI:
     @app.post("/api/prompts/import")
     def import_prompts(payload: PromptsImport) -> dict[str, Any]:
         try:
-            prompts = state.import_prompts_text(payload.text, replace=payload.replace)
+            prompts = state.import_prompts_text(
+                payload.text, replace=payload.replace, filename=payload.filename
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         return {"prompts": prompts, "path": str(state.prompts_path())}
@@ -415,7 +418,10 @@ def create_app(project_dir: Path) -> FastAPI:
     @app.post("/api/sessions/{session_id}/discard")
     def discard_session(session_id: str) -> dict[str, Any]:
         session = _session(session_id)
-        session.discard()
+        try:
+            session.discard()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
         sessions.remove(session_id)
         return {"ok": True}
 

@@ -598,6 +598,8 @@ class InteractiveSession:
         with self._lock:
             if self.status == "finished":
                 return
+            if self.mode == "chat" and self._busy:
+                raise RuntimeError("Wait for the agent to finish the current turn before discarding")
             self._set_status("discarded")
         self.terminal.close()
         self._cleanup()
