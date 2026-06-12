@@ -48,6 +48,7 @@ include = [
     "/tests",
     "/docker",
     "/.github",
+    "/docs",
     "/README.md",
     "/DOCS.md",
     "/ROADMAP.md",

@@ -1,0 +1,193 @@
+# Generation
+
+Teich can generate new datasets by running agent CLIs in Docker or by calling an OpenAI-compatible chat API directly.
+
+Use generation when you want Teich to create source data for you. If you already have JSONL, a Hugging Face dataset, or a `datasets.Dataset`, use [Preparing Data](prepare-data.md) instead.
+
+If you prefer configuring prompts and steering sessions in a browser, use [Teich Studio](studio.md). It writes the same project files and output artifacts as the CLI.
+
+## Create a Project
+
+```bash
+teich init my-project
+cd my-project
+```
+
+This creates a starter `config.yaml` and `prompts.jsonl`.
+
+Run a batch:
+
+```bash
+teich generate -c config.yaml
+```
+
+Resume an interrupted batch:
+
+```bash
+teich generate -c config.yaml --resume
+```
+
+Teich scans completed output rows and skips prompts that already converted into training examples. Failed or interrupted agent traces are moved to `failures/` and are not treated as completed data.
+
+## Browser UI
+
+Launch Studio from the project directory:
+
+```bash
+teich studio
+```
+
+Studio lets you edit config, manage prompts, run or resume batches, inspect traces, and save interactive sessions as dataset traces. See [Teich Studio](studio.md).
+
+## Prompt Files
+
+JSONL or NDJSON is recommended:
+
+```jsonl
+{"prompt":"Build a simple todo list app in React"}
+{"github_repo":"armand0e/perplexica-mcp","prompt":"Improve the search flow and update tests"}
+{"system":"Answer as a concise project manager.","prompt":"Draft a compact project plan"}
+{"prompt":"Draft a compact project plan","follow_up_prompts":["Revise it for a solo developer","Add a risk checklist"]}
+```
+
+Each row can include:
+
+- `prompt`: required initial user prompt
+- `system`: optional prompt-specific system prompt
+- `github_repo`: optional `owner/repo` checkout for Docker-backed agent runs
+- `follow_up_prompts`: optional list of additional user turns
+
+`follow_up_prompts` works across providers. The `chat` provider sends each follow-up as a real additional user turn in one generated training row. Agent providers keep one Docker container alive for the full prompt sequence and resume or continue the same saved agent session for each follow-up so workspace edits, tool caches, and in-container installs remain available.
+
+CSV, JSON, and plain text prompt files are supported, but JSONL is safer for long prompts, code fences, newlines, repository metadata, and follow-up turns.
+
+## Config
+
+Minimal `config.yaml`:
+
+```yaml
+agent:
+  provider: codex  # codex, pi, claude-code, hermes, or chat
+
+model:
+  model: codex-mini-latest
+  approval_policy: never
+  sandbox: danger-full-access
+
+prompts_file: prompts.jsonl
+
+output:
+  traces_dir: ./output
+  sandbox_dir: ./sandbox
+  failures_dir: ./failures
+  pretty_name: "My Agent Traces"
+
+publish:
+  repo_id: username/my-dataset
+  hf_token: hf_xxx
+  private: false
+```
+
+Dataset tags are generated from provider and model:
+
+- `codex`, `pi`, `claude-code`, `hermes`: `agent-traces`, `format:agent-traces`, provider, model, `distillation`, `teich`
+- `chat`: `conversational`, model, `distillation`, `teich`
+
+If `publish.hf_token` is omitted, Teich also accepts `HF_TOKEN`, `HUGGINGFACE_HUB_TOKEN`, or `TEICH_HF_TOKEN`.
+
+## Outputs
+
+Provider outputs:
+
+- `codex` / `pi`: normalized copies of native agent session JSONL files in `output/`, workspace snapshots in `sandbox/`, and a dataset `README.md`
+- `claude-code`: native Claude Code transcript JSONL copied from `.claude/projects/...`, workspace snapshots in `sandbox/`, and a dataset `README.md`
+- `hermes`: one Teich external trace JSONL per Hermes `state.db` session, including delegated subagent sessions as separate files linked by `parent_session_id`
+- `chat`: text-only JSONL training rows in `output/` and a dataset `README.md`
+
+Uploaded Hugging Face dataset artifacts include:
+
+- generated JSONL
+- dataset `README.md`
+- configured tool-schema snapshots when tools are present
+
+Generation progress reports provider/model usage when Teich can retrieve it. For OpenRouter, Teich first queries the provider's generation stats API for native token and cost accounting, then falls back to harness-reported usage. If neither source is available, Teich prints `N/A`.
+
+## Providers
+
+### `codex`
+
+Copies native Codex session JSONL from mounted `CODEX_HOME/sessions` and normalizes known Codex event-shape edge cases so reasoning summaries are visible and split assistant turns render as thinking before text or tool use.
+
+Teich appends configured `tool_schema` metadata so tools remain available for training even if the model did not call them.
+
+### `pi`
+
+Copies native Pi session JSONL from mounted `/home/codex/pi-sessions`, then normalizes and validates tool-call structure before writing output.
+
+Teich appends prompt-level system metadata and configured tool metadata as `custom` events. For OpenRouter, Teich forces Pi onto the chat/completions wire path because Pi's OpenRouter Responses adapter can stall before the first session event.
+
+### `openclaw`
+
+OpenClaw is supported as an imported raw trace format. Teich recognizes it when the first session event has `.openclaw` in its `cwd`, converts it with `metadata.trace_type = "openclaw"`, and does not apply Pi runner metadata snapshots.
+
+OpenClaw is not currently a Teich runner.
+
+### `claude-code`
+
+Copies Claude Code's native transcript JSONL from `.claude/projects/...` so the output keeps Claude's own `user`, `assistant`, `system`, and `result` event format.
+
+During conversion, Teich:
+
+- normalizes split assistant fragments so thinking appears before the text or tool use it explains
+- preserves Claude runtime context such as skill listings, MCP instruction deltas, permission context, date changes, hook context, and away summaries as masked `system` messages and `metadata.system_prompt`
+- filters local slash-command artifacts such as `/model`
+- keeps `/goal` as the actual user goal text
+- turns queued prompts into real user turns
+- emits schemas for advertised native Claude Code / Claude Desktop tools even if they were only declared through deferred-tool context
+
+With OpenRouter non-Claude models, Teich runs a local in-container proxy: Claude Code sees a Claude surrogate model name, while the proxy rewrites outbound requests back to the configured model. Native assistant/result events keep provider-returned model and usage fields when Claude Code records them.
+
+### `hermes`
+
+Runs Hermes Agent with built-in toolsets:
+
+```text
+safe,terminal,file,skills,memory,session_search,delegation
+```
+
+Teich exports each Hermes `state.db` session as its own external trace with `external_session_meta` and `external_message` events. Hermes' internal `system_prompt`, enabled toolsets, and configured tools remain metadata on each trace. Delegated subagent sessions remain separate files linked by `parent_session_id`.
+
+### `chat`
+
+Calls an OpenAI-compatible API directly and writes structured training rows instead of raw agent traces.
+
+Example:
+
+```yaml
+agent:
+  provider: chat
+
+model:
+  model: gpt-4.1-mini
+
+api:
+  provider: openai
+  wire_api: responses
+```
+
+A generated line contains `messages`, `prompt`, optional `thinking`, final `response`, and `model`. With follow-ups, the same row includes alternating `user` and `assistant` messages, `follow_up_prompts`, per-turn `responses`, and final `response`.
+
+## Local Providers
+
+OpenAI-compatible local endpoints can be configured with environment variables:
+
+```bash
+export TEICH_PROVIDER=LMstudio
+export TEICH_MODEL=gemma-4
+export TEICH_BASE_URL=http://localhost:1234/v1
+export TEICH_API_KEY=llm
+
+teich generate -c config.yaml
+```
+
+This is useful for LM Studio, Ollama-compatible proxies, or local gateway services.
