@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+import sys
 from threading import Event, RLock, Thread
+from typing import Any
 
 import typer
 from huggingface_hub import HfApi
@@ -670,6 +672,61 @@ openai_api_key: null
 # Optional developer instructions injected into the runtime.
 developer_instructions: null
 '''
+
+
+def _configure_studio_event_loop_policy(
+    *,
+    platform: str = sys.platform,
+    asyncio_module: Any | None = None,
+) -> bool:
+    if platform != "win32":
+        return False
+    if asyncio_module is None:
+        import asyncio as asyncio_module
+
+    policy_cls = getattr(asyncio_module, "WindowsSelectorEventLoopPolicy", None)
+    if policy_cls is None:
+        return False
+    asyncio_module.set_event_loop_policy(policy_cls())
+    return True
+
+
+@app.command()
+def studio(
+    path: Path = typer.Argument(Path("."), help="Project directory (created/initialized if needed)"),
+    host: str = typer.Option("127.0.0.1", "--host", help="Host to bind the studio server to"),
+    port: int = typer.Option(8420, "--port", help="Port to bind the studio server to"),
+    open_browser: bool = typer.Option(True, "--open/--no-open", help="Open the studio in your browser"),
+) -> None:
+    """Launch the Teich Studio browser UI."""
+    import threading
+    import webbrowser
+
+    _configure_studio_event_loop_policy()
+
+    try:
+        import uvicorn
+
+        from .studio.server import create_app
+    except ImportError as exc:
+        console.print(f"[red]Teich Studio requires fastapi and uvicorn: {exc}[/red]")
+        console.print("Install them with: [cyan]pip install 'teich[studio]'[/cyan]")
+        raise typer.Exit(1)
+
+    project_dir = path.resolve()
+    studio_app = create_app(project_dir)
+    url = f"http://{host}:{port}"
+
+    console.print(Panel.fit("Teich Studio", style="bold blue"))
+    console.print(f"[green]Project:[/green] {project_dir}")
+    console.print(f"[green]Studio running at:[/green] [bold cyan]{url}[/bold cyan]")
+    console.print("[dim]Press Ctrl+C to stop.[/dim]")
+
+    if open_browser:
+        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+
+    uvicorn.run(studio_app, host=host, port=port, log_level="warning")
+
 
 PROMPTS_TEMPLATE = '''{"prompt":"Build a simple todo list app in React"}
 {"prompt":"Create a Python script that fetches weather data from an API"}
