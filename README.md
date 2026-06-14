@@ -104,6 +104,16 @@ Teich writes raw traces, converted training rows, sandbox snapshots, and a datas
 
 More detail: [Generation](docs/generation.md).
 
+## Quickstart: Extract Local Sessions
+
+If you already have local agent sessions, Teich can stage them as an anonymized dataset in one command:
+
+```bash
+teich extract claude --model fable-5
+```
+
+`extract` supports `claude`, `codex`, `pi`, and `hermes`. It writes anonymized traces to `data/` by default, generates a dataset `README.md`, and then asks whether to upload the folder to Hugging Face. Use `--out` / `--output` to choose another folder.
+
 ## What Teich Supports
 
 | Use case | Start here |
@@ -146,6 +156,9 @@ teich generate -c config.yaml
 
 # Resume an interrupted batch
 teich generate -c config.yaml --resume
+
+# Extract, anonymize, and stage local Claude Code traces
+teich extract claude --model fable-5 --out data
 
 # Launch the local browser UI
 teich studio

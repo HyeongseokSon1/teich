@@ -26,6 +26,12 @@ Need new data:
 teich init -> edit prompts.jsonl/config.yaml -> teich generate -> prepare_data()
 ```
 
+Already have local agent sessions:
+
+```text
+teich extract claude --model fable-5 -> optional HF upload -> prepare_data()
+```
+
 Prefer a browser:
 
 ```text
