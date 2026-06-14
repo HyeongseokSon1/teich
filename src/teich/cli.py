@@ -15,7 +15,9 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 
+from .anonymize import anonymize_path
 from .config import Config
+from .extract import ExtractProvider, extract_local_sessions
 from .runner import (
     ChatRunner,
     ClaudeCodeRunner,
@@ -37,6 +39,10 @@ app = typer.Typer(
     help="Generate agent training data using Codex, Pi, Claude Code, Hermes, or chat",
     no_args_is_help=True,
 )
+extract_app = typer.Typer(help="Extract local agent sessions into Teich output folders.")
+pool_app = typer.Typer(help="Upload anonymized traces to the Teich community pool.")
+app.add_typer(extract_app, name="extract")
+app.add_typer(pool_app, name="pool")
 NON_DATA_TRACE_DIR_NAMES = {"partials", "failures"}
 UPLOAD_IGNORE_PATTERNS = ["partials/**", "failures/**"]
 
@@ -101,15 +107,19 @@ def _try_write_completed_output_metadata(cfg: Config) -> Path | None:
         return None
 
 
-def _publish_dataset_to_hub(cfg: Config) -> str:
-    repo_id = cfg.get_publish_repo_id()
-    if not repo_id:
-        raise ValueError("No publish.repo_id configured")
-    api = HfApi(token=cfg.get_hf_token())
+def _upload_dataset_folder(
+    *,
+    folder_path: Path,
+    repo_id: str,
+    hf_token: str | None,
+    private: bool,
+    ignore_patterns: list[str],
+) -> str:
+    api = HfApi(token=hf_token)
     repo_url = api.create_repo(
         repo_id=repo_id,
         repo_type="dataset",
-        private=cfg.publish.private,
+        private=private,
         exist_ok=True,
     )
     delete_file = getattr(api, "delete_file", None)
@@ -127,20 +137,33 @@ def _publish_dataset_to_hub(cfg: Config) -> str:
     if callable(upload_large_folder):
         upload_large_folder(
             repo_id=repo_id,
-            folder_path=str(cfg.output.traces_dir),
+            folder_path=str(folder_path),
             repo_type="dataset",
-            private=cfg.publish.private,
-            ignore_patterns=_upload_ignore_patterns(cfg),
+            private=private,
+            ignore_patterns=ignore_patterns,
         )
     else:
         api.upload_folder(
-            folder_path=str(cfg.output.traces_dir),
+            folder_path=str(folder_path),
             repo_id=repo_id,
             repo_type="dataset",
             commit_message="Upload teich dataset output",
-            ignore_patterns=_upload_ignore_patterns(cfg),
+            ignore_patterns=ignore_patterns,
         )
     return str(repo_url)
+
+
+def _publish_dataset_to_hub(cfg: Config) -> str:
+    repo_id = cfg.get_publish_repo_id()
+    if not repo_id:
+        raise ValueError("No publish.repo_id configured")
+    return _upload_dataset_folder(
+        folder_path=cfg.output.traces_dir,
+        repo_id=repo_id,
+        hf_token=cfg.get_hf_token(),
+        private=cfg.publish.private,
+        ignore_patterns=_upload_ignore_patterns(cfg),
+    )
 
 
 def _prompt_publish_completed_outputs(cfg: Config) -> str | None:
@@ -169,6 +192,250 @@ def _print_interrupted_upload_hint(cfg: Config) -> None:
     console.print("[yellow]Skipping Hugging Face upload for interrupted run.[/yellow]")
     console.print("[cyan]To upload the completed outputs later, run this from the output folder:[/cyan]")
     console.print(f"  {upload_command}", soft_wrap=True)
+
+
+def _extract_dataset_config(
+    provider: ExtractProvider,
+    output: Path,
+    *,
+    model_filter: str | None = None,
+    repo_id: str | None = None,
+    hf_token: str | None = None,
+    private: bool = False,
+) -> Config:
+    model_id = model_filter or f"{provider}-local-sessions"
+    pretty_model = model_filter or provider
+    return Config.model_validate(
+        {
+            "agent": {"provider": provider},
+            "model": {"model": model_id},
+            "output": {
+                "traces_dir": output,
+                "pretty_name": f"{pretty_model} Agent Traces",
+            },
+            "publish": {
+                "repo_id": repo_id,
+                "hf_token": hf_token,
+                "private": private,
+            },
+        }
+    )
+
+
+def _write_extract_readme(
+    provider: ExtractProvider,
+    output: Path,
+    *,
+    model_filter: str | None = None,
+    repo_id: str | None = None,
+) -> Path:
+    cfg = _extract_dataset_config(provider, output, model_filter=model_filter, repo_id=repo_id)
+    return write_traces_readme(
+        cfg.output.traces_dir,
+        pretty_name=cfg.output.pretty_name,
+        tags=cfg.get_dataset_tags(),
+        model_id=cfg.model.model,
+        repo_id=cfg.get_publish_repo_id(),
+    )
+
+
+def _prompt_huggingface_upload(
+    provider: ExtractProvider,
+    output: Path,
+    *,
+    model_filter: str | None = None,
+    private: bool = False,
+) -> str | None:
+    should_upload = typer.confirm("Would you like to upload to Hugging Face?", default=False)
+    if not should_upload:
+        console.print("[yellow]Skipping Hugging Face upload.[/yellow]")
+        return None
+    repo_id = typer.prompt("Hugging Face dataset repo id (owner/name)").strip()
+    try:
+        cfg = _extract_dataset_config(provider, output, model_filter=model_filter, repo_id=repo_id, private=private)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    if not cfg.get_publish_repo_id():
+        console.print("[red]Hugging Face dataset repo id is required.[/red]")
+        raise typer.Exit(1)
+    hf_token = cfg.get_hf_token()
+    if not hf_token:
+        hf_token = typer.prompt("HF_TOKEN", hide_input=True).strip()
+        cfg = _extract_dataset_config(
+            provider,
+            output,
+            model_filter=model_filter,
+            repo_id=repo_id,
+            hf_token=hf_token,
+            private=private,
+        )
+        if not cfg.get_hf_token():
+            console.print("[red]HF_TOKEN is required to upload to Hugging Face.[/red]")
+            raise typer.Exit(1)
+    readme_path = _write_extract_readme(provider, output, model_filter=model_filter, repo_id=repo_id)
+    console.print(f"[green]Updated README:[/green] {readme_path}")
+    repo_url = _upload_dataset_folder(
+        folder_path=cfg.output.traces_dir,
+        repo_id=repo_id,
+        hf_token=cfg.get_hf_token(),
+        private=cfg.publish.private,
+        ignore_patterns=UPLOAD_IGNORE_PATTERNS,
+    )
+    console.print(f"[green]Published dataset:[/green] {repo_url}")
+    return repo_url
+
+
+def _run_extract_command(
+    provider: ExtractProvider,
+    output: Path,
+    sessions_dir: list[Path] | None,
+    *,
+    model_filter: str | None = None,
+    private: bool = False,
+) -> None:
+    console.print(Panel.fit("Teich Extract", style="bold blue"))
+    result = extract_local_sessions(
+        provider,
+        output_dir=output,
+        sources=sessions_dir,
+        model_filter=model_filter,
+        clear_destination=True,
+    )
+    if not result.source_paths:
+        console.print(f"[red]No local {provider} session folders found.[/red]")
+        console.print("[yellow]Pass one or more explicit folders with --sessions-dir.[/yellow]")
+        raise typer.Exit(1)
+    if not result.copied_files:
+        model_clause = f" matching model '{model_filter}'" if model_filter else ""
+        console.print(f"[yellow]Found {len(result.source_paths)} source path(s), but no {provider} sessions{model_clause} were extracted.[/yellow]")
+        for source in result.source_paths:
+            console.print(f"  - {source}")
+        raise typer.Exit(1)
+    stale_readme_path = output / "README.md"
+    if stale_readme_path.exists() and stale_readme_path.is_file():
+        stale_readme_path.unlink()
+    anonymize_report = anonymize_path(output, output, in_place=True)
+    readme_path = _write_extract_readme(provider, output, model_filter=model_filter)
+    totals = anonymize_report.totals
+    extracted_message = f"Extracted {result.count} {provider} trace{'s' if result.count != 1 else ''}"
+    if model_filter:
+        extracted_message += f" with {model_filter}"
+    console.print(f"[green]{extracted_message}[/green]", soft_wrap=True)
+    console.print(
+        "[cyan]Automatically scrambled[/cyan] "
+        f"{totals.get('api_key', 0)} API keys, "
+        f"{totals.get('email', 0)} email addresses, and "
+        f"{totals.get('username', 0)} username references",
+        soft_wrap=True,
+    )
+    console.print(f"[green]Wrote README:[/green] {readme_path}", soft_wrap=True)
+    console.print(f"[cyan]Data was written to[/cyan] {output}", soft_wrap=True)
+    for source in result.source_paths:
+        console.print(f"[dim]source: {source}[/dim]")
+    _prompt_huggingface_upload(provider, output, model_filter=model_filter, private=private)
+
+
+def _extract_sources_option() -> list[Path] | None:
+    return typer.Option(
+        None,
+        "--sessions-dir",
+        "-s",
+        help="Explicit session folder or file. Can be passed more than once.",
+    )
+
+
+def _extract_output_option() -> Path:
+    return typer.Option(Path("data"), "--output", "--out", "-o", help="Output directory root")
+
+
+def _extract_model_option() -> str | None:
+    return typer.Option(None, "--model", "-m", help="Only extract traces whose model metadata contains this value.")
+
+
+@extract_app.command()
+def codex(
+    output: Path = _extract_output_option(),
+    sessions_dir: list[Path] | None = _extract_sources_option(),
+    model: str | None = _extract_model_option(),
+    private: bool = typer.Option(False, "--private", help="Create the Hugging Face dataset as private if upload is confirmed."),
+) -> None:
+    """Extract local Codex sessions."""
+    _run_extract_command("codex", output, sessions_dir, model_filter=model, private=private)
+
+
+@extract_app.command()
+def claude(
+    output: Path = _extract_output_option(),
+    sessions_dir: list[Path] | None = _extract_sources_option(),
+    model: str | None = _extract_model_option(),
+    private: bool = typer.Option(False, "--private", help="Create the Hugging Face dataset as private if upload is confirmed."),
+) -> None:
+    """Extract local Claude Code sessions."""
+    _run_extract_command("claude", output, sessions_dir, model_filter=model, private=private)
+
+
+@extract_app.command()
+def pi(
+    output: Path = _extract_output_option(),
+    sessions_dir: list[Path] | None = _extract_sources_option(),
+    model: str | None = _extract_model_option(),
+    private: bool = typer.Option(False, "--private", help="Create the Hugging Face dataset as private if upload is confirmed."),
+) -> None:
+    """Extract local Pi sessions."""
+    _run_extract_command("pi", output, sessions_dir, model_filter=model, private=private)
+
+
+@extract_app.command()
+def hermes(
+    output: Path = _extract_output_option(),
+    sessions_dir: list[Path] | None = _extract_sources_option(),
+    model: str | None = _extract_model_option(),
+    private: bool = typer.Option(False, "--private", help="Create the Hugging Face dataset as private if upload is confirmed."),
+) -> None:
+    """Extract local Hermes Agent state sessions."""
+    _run_extract_command("hermes", output, sessions_dir, model_filter=model, private=private)
+
+
+@app.command()
+def anonymize(
+    input_path: Path = typer.Argument(Path("output"), help="Trace file or directory to anonymize"),
+    output: Path = typer.Option(
+        Path("output_anonymized"),
+        "--output",
+        "-o",
+        help="Anonymized output path. Ignored when --in-place is set.",
+    ),
+    in_place: bool = typer.Option(False, "--in-place", help="Overwrite files in the input path"),
+) -> None:
+    """Replace emails, home-directory usernames, and API keys with deterministic dummy values."""
+    try:
+        report = anonymize_path(input_path, output, in_place=in_place)
+    except (FileNotFoundError, ValueError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+
+    totals = report.totals
+    destination = report.input_path if in_place else report.output_path
+    console.print(f"[green]Anonymized {report.files_changed}/{len(report.files)} file(s) into {destination}[/green]")
+    if totals:
+        console.print(
+            "[cyan]Replacements:[/cyan] "
+            + " ".join(f"{key}={value}" for key, value in sorted(totals.items()))
+        )
+    else:
+        console.print("[yellow]No emails, usernames, or API keys were detected.[/yellow]")
+
+
+@pool_app.command("upload")
+def pool_upload(
+    path: Path = typer.Argument(Path("output_anonymized"), help="Anonymized trace directory to upload later"),
+) -> None:
+    """Placeholder for future Teich pool upload support."""
+    console.print("[yellow]teich pool upload is not wired to a deployed pool backend yet.[/yellow]")
+    console.print(f"[cyan]Ready path:[/cyan] {path}")
+    console.print("[dim]The command is reserved until the site has its database and upload API deployed.[/dim]")
+    raise typer.Exit(1)
 
 
 @app.command()

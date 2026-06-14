@@ -6,6 +6,8 @@ Use generation when you want Teich to create source data for you. If you already
 
 If you prefer configuring prompts and steering sessions in a browser, use [Teich Studio](studio.md). It writes the same project files and output artifacts as the CLI.
 
+If you already have local agent sessions from Claude Code, Codex, Pi, or Hermes, use `teich extract` to stage them as an anonymized dataset without running a new generation batch.
+
 ## Create a Project
 
 ```bash
@@ -28,6 +30,35 @@ teich generate -c config.yaml --resume
 ```
 
 Teich scans completed output rows and skips prompts that already converted into training examples. Failed or interrupted agent traces are moved to `failures/` and are not treated as completed data.
+
+## Extract Local Sessions
+
+Extract local sessions, anonymize them, generate a dataset README, and optionally upload the staged folder to Hugging Face:
+
+```bash
+teich extract claude --model fable-5
+```
+
+Supported harnesses:
+
+```bash
+teich extract claude
+teich extract codex
+teich extract pi
+teich extract hermes
+```
+
+By default, extracted datasets are written to `data/` under the current directory. Use `--out` or `--output` to choose a different folder:
+
+```bash
+teich extract codex --model gpt-5-codex --out codex-data
+```
+
+`--model` filters by provider model metadata, not by arbitrary prompt text. This keeps traces that actually ran with matching model identifiers such as `claude-fable-5` and excludes traces that only mention the model name in conversation text.
+
+After extraction, Teich automatically scrubs API keys, emails, and home-directory usernames while preserving embedded media payloads for conversation context. It then prints the replacement counts and asks whether to upload to Hugging Face. If you choose upload, Teich asks for a dataset repo id and uses `HF_TOKEN`, `HUGGINGFACE_HUB_TOKEN`, or `TEICH_HF_TOKEN`; if none are set, it prompts for `HF_TOKEN`.
+
+Important: anonymization is a best-effort safety pass, not a guarantee. Review the staged data yourself before uploading or publishing it, and remove anything you would not want released.
 
 ## Browser UI
 
@@ -103,6 +134,8 @@ Provider outputs:
 - `claude-code`: native Claude Code transcript JSONL copied from `.claude/projects/...`, workspace snapshots in `sandbox/`, and a dataset `README.md`
 - `hermes`: one Teich external trace JSONL per Hermes `state.db` session, including delegated subagent sessions as separate files linked by `parent_session_id`
 - `chat`: text-only JSONL training rows in `output/` and a dataset `README.md`
+
+`teich extract` writes the same trace shapes to `data/` by default, but it operates on existing local session stores and anonymizes the staged output in place before the upload prompt.
 
 Uploaded Hugging Face dataset artifacts include:
 

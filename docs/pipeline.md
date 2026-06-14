@@ -8,11 +8,19 @@ This page describes how Teich moves from raw data to trainer labels.
 flowchart TD
     A["Raw source<br/>HF repo, local traces, Dataset, source mix, or prompts"] --> B{"Need generation?"}
     B -->|"yes"| C["teich generate"]
+    B -->|"existing local sessions"| X["teich extract"]
     B -->|"no"| D["prepare_data"]
     C --> C1["Run provider<br/>codex, pi, claude-code, hermes, or chat"]
     C1 --> C2["Write raw/native traces or structured chat rows"]
     C2 --> C3["Write dataset README + tool snapshots"]
     C3 --> D
+    X --> X1["Copy local sessions<br/>claude, codex, pi, or hermes"]
+    X1 --> X2["Filter by --model metadata when requested"]
+    X2 --> X3["Anonymize staged data + write README"]
+    X3 --> X4{"upload to Hugging Face?"}
+    X4 -->|"yes"| X5["Upload JSONL + README"]
+    X4 -->|"no"| D
+    X5 --> D
     D --> E["Resolve and load sources"]
     E --> F["Convert traces to messages + tools"]
     F --> G["Render tokenizer chat template"]
