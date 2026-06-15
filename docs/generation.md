@@ -85,6 +85,14 @@ If you choose upload, Teich asks for a dataset repo id and uses `HF_TOKEN`, `HUG
 
 Important: anonymization is a best-effort safety pass, not a guarantee. Review the staged data yourself before uploading or publishing it, and remove anything you would not want released.
 
+To turn raw or extracted traces into normalized Teich JSONL rows that do not require Teich at training time, run:
+
+```bash
+teich convert data --out teich-training.jsonl
+```
+
+The output file is newline-delimited JSON with `prompt`, `messages`, `tools`, and `metadata` fields. Use this when another trainer already knows how to consume OpenAI-style message rows. Use `prepare_data()` and `mask_data()` when you want Teich to render a specific tokenizer chat template and create exact response-only labels.
+
 ## Browser UI
 
 Launch Studio from the project directory:

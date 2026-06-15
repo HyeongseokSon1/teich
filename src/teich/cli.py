@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 from pathlib import Path
 import sys
 from threading import Event, RLock, Thread
@@ -17,6 +18,7 @@ from rich.table import Table
 
 from .anonymize import anonymize_path
 from .config import Config
+from .converter import convert_traces_to_training_data
 from .extract import ExtractProvider, extract_local_sessions
 from .runner import (
     ChatRunner,
@@ -448,6 +450,39 @@ def anonymize(
         )
     else:
         console.print("[yellow]No emails, usernames, or API keys were detected.[/yellow]")
+
+
+@app.command()
+def convert(
+    input_path: Path = typer.Argument(..., help="Raw trace JSONL file or folder to convert"),
+    output: Path = typer.Option(
+        Path("teich.jsonl"),
+        "--output",
+        "--out",
+        "-o",
+        help="Output JSONL file containing normalized Teich training rows",
+    ),
+) -> None:
+    """Convert raw or extracted traces into normalized Teich JSONL rows."""
+    if not input_path.exists():
+        console.print(f"[red]Input path not found: {input_path}[/red]")
+        raise typer.Exit(1)
+    if input_path.resolve() == output.resolve():
+        console.print("[red]Output path must be different from the input path.[/red]")
+        raise typer.Exit(1)
+
+    rows = convert_traces_to_training_data(input_path)
+    if not rows:
+        console.print(f"[red]No supported trace rows found in {input_path}.[/red]")
+        raise typer.Exit(1)
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+    console.print(f"[green]Converted {len(rows)} trace row{'s' if len(rows) != 1 else ''} to {output}[/green]")
+    console.print("[cyan]Output format:[/cyan] Teich JSONL with prompt, messages, tools, and metadata.")
 
 
 @pool_app.command("upload")

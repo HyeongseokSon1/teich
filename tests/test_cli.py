@@ -51,6 +51,62 @@ def test_generate_command_missing_config():
     assert "not found" in result.output
 
 
+def test_convert_command_writes_normalized_teich_jsonl(tmp_path: Path):
+    traces_dir = tmp_path / "traces"
+    traces_dir.mkdir()
+    (traces_dir / "session.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "session_meta", "payload": {"id": "session-1", "model": "codex-fable-5"}}),
+                json.dumps(
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "Build a CLI"}],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "Built it."}],
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    output_file = tmp_path / "teich.jsonl"
+
+    result = runner.invoke(app, ["convert", str(traces_dir), "--output", str(output_file)])
+
+    assert result.exit_code == 0, result.output
+    assert "Converted 1 trace row to" in result.output
+    row = json.loads(output_file.read_text(encoding="utf-8"))
+    assert row["prompt"] == "Build a CLI"
+    assert row["messages"] == [
+        {"role": "user", "content": "Build a CLI"},
+        {"role": "assistant", "content": "Built it."},
+    ]
+    assert row["metadata"]["session_id"] == "session-1"
+    assert row["metadata"]["model"] == "codex-fable-5"
+    assert "tools" in row
+
+
+def test_convert_command_rejects_missing_input(tmp_path: Path):
+    result = runner.invoke(app, ["convert", str(tmp_path / "missing"), "--output", str(tmp_path / "out.jsonl")])
+
+    assert result.exit_code == 1
+    assert "Input path not found" in result.output
+
+
 def test_generate_command_no_prompts(tmp_path: Path):
     """Test generate command fails when no prompts configured."""
     config_file = tmp_path / "config.yaml"

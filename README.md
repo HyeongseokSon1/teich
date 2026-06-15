@@ -125,6 +125,12 @@ teich extract hermes --sessions-dir /path/to/.hermes/state.db --out data
 
 Extraction anonymizes staged traces by default. To keep the raw extracted data unchanged, pass `--no-anon` or `--no-anonymize` and review the output carefully before sharing or uploading it.
 
+To convert raw or extracted traces into normalized Teich JSONL rows that can be consumed without Teich at training time:
+
+```bash
+teich convert data --out teich-training.jsonl
+```
+
 ## What Teich Supports
 
 | Use case | Start here |
@@ -170,6 +176,9 @@ teich generate -c config.yaml --resume
 
 # Extract, anonymize, and stage local Claude Code traces
 teich extract claude --model fable-5 --out data
+
+# Convert staged raw traces to normalized Teich JSONL
+teich convert data --out teich-training.jsonl
 
 # Launch the local browser UI
 teich studio
