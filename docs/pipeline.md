@@ -9,6 +9,7 @@ flowchart TD
     A["Raw source<br/>HF repo, local traces, Dataset, source mix, or prompts"] --> B{"Need generation?"}
     B -->|"yes"| C["teich generate"]
     B -->|"existing local sessions"| X["teich extract"]
+    B -->|"want standalone JSONL"| Y["teich convert"]
     B -->|"no"| D["prepare_data"]
     C --> C1["Run provider<br/>codex, pi, claude-code, hermes, or chat"]
     C1 --> C2["Write raw/native traces or structured chat rows"]
@@ -21,6 +22,8 @@ flowchart TD
     X4 -->|"yes"| X5["Upload JSONL + README"]
     X4 -->|"no"| D
     X5 --> D
+    X3 --> Y
+    Y --> Y1["Write normalized Teich JSONL<br/>prompt, messages, tools, metadata"]
     D --> E["Resolve and load sources"]
     E --> F["Convert traces to messages + tools"]
     F --> G["Render tokenizer chat template"]
@@ -163,6 +166,7 @@ flowchart TD
 ```text
 prepare_data keeps human-readable text plus typed span metadata.
 mask_data converts the selected spans into exact token-level labels after trainer tokenization.
+teich convert writes normalized message JSONL without tokenizer rendering or token labels.
 ```
 
 This lets Teich stay compatible with TRL / Unsloth trainer flows while still controlling exactly what the model learns.

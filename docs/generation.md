@@ -63,6 +63,8 @@ teich extract claude --sessions-dir /path/to/.claude/projects --out data
 teich extract codex --sessions-dir /path/to/.codex --out data
 teich extract codex --sessions-dir /path/to/.codex/sessions --out data
 teich extract pi --sessions-dir /path/to/.pi --out data
+teich extract pi --sessions-dir /path/to/.pi/agent/sessions --out data
+teich extract pi --sessions-dir /path/to/.pi/sessions --out data
 teich extract hermes --sessions-dir /path/to/.hermes --out data
 teich extract hermes --sessions-dir /path/to/.hermes/state.db --out data
 ```

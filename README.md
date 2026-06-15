@@ -118,8 +118,13 @@ If the agent store is somewhere other than the default home-directory location, 
 
 ```bash
 teich extract claude --sessions-dir /path/to/.claude --out data
+teich extract claude --sessions-dir /path/to/.claude/projects --out data
+teich extract codex --sessions-dir /path/to/.codex --out data
 teich extract codex --sessions-dir /path/to/.codex/sessions --out data
 teich extract pi --sessions-dir /path/to/.pi --out data
+teich extract pi --sessions-dir /path/to/.pi/agent/sessions --out data
+teich extract pi --sessions-dir /path/to/.pi/sessions --out data
+teich extract hermes --sessions-dir /path/to/.hermes --out data
 teich extract hermes --sessions-dir /path/to/.hermes/state.db --out data
 ```
 
@@ -135,6 +140,7 @@ teich convert data --out teich-training.jsonl
 
 | Use case | Start here |
 | --- | --- |
+| Find command examples and options | [CLI Reference](docs/cli.md) |
 | Configure and steer runs in a browser | [Teich Studio](docs/studio.md) |
 | Generate Codex, Pi, Claude Code, Hermes, or chat data | [Generation](docs/generation.md) |
 | Load local files, folders, Hugging Face datasets, or `datasets.Dataset` objects | [Preparing Data](docs/prepare-data.md) |

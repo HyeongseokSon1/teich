@@ -15,6 +15,7 @@ from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
+from typer.core import TyperCommand, TyperGroup
 
 from .anonymize import anonymize_path
 from .config import Config
@@ -36,19 +37,141 @@ from .trace_readme import write_traces_readme
 from .tool_schema import snapshot_configured_tools
 
 console = Console()
+ROOT_EXTRA_HELP = """\
+Common workflows:
+  teich init my-project
+  teich generate -c config.yaml
+  teich extract claude --model fable-5 --out data
+  teich convert data --out teich-training.jsonl
+  teich studio
+
+For command-specific options and examples:
+  teich generate --help
+  teich extract --help
+  teich convert --help
+  teich studio --help
+"""
+EXTRACT_HELP = "Extract existing local agent sessions into a staged Teich dataset folder."
+EXTRACT_EXTRA_HELP = """\
+Common examples:
+  teich extract claude --model fable-5 --out data
+  teich extract claude --sessions-dir /path/to/.claude --out data
+  teich extract claude --sessions-dir /path/to/.claude/projects --out data
+  teich extract codex --sessions-dir /path/to/.codex --out data
+  teich extract codex --sessions-dir /path/to/.codex/sessions --out data
+  teich extract pi --sessions-dir /path/to/.pi --out data
+  teich extract pi --sessions-dir /path/to/.pi/agent/sessions --out data
+  teich extract pi --sessions-dir /path/to/.pi/sessions --out data
+  teich extract hermes --sessions-dir /path/to/.hermes --out data
+  teich extract hermes --sessions-dir /path/to/.hermes/state.db --out data
+
+Default stores:
+  claude  CLAUDE_CONFIG_DIR/projects, CLAUDE_HOME/projects, ~/.claude/projects
+  codex   CODEX_HOME/sessions, ~/.codex/sessions
+  pi      PI_SESSION_DIR, PI_CODING_AGENT_DIR/sessions, ~/.pi/agent/sessions, ~/.pi/sessions
+  hermes  HERMES_STATE_DB, HERMES_HOME/state.db, ~/.hermes/state.db
+
+After extraction:
+  teich convert data --out teich-training.jsonl
+  This writes normalized Teich JSONL rows with prompt, messages, tools, and metadata for trainers that do not import Teich.
+"""
+GENERATE_EXTRA_HELP = """\
+Typical generated project flow:
+  teich init my-project
+  cd my-project
+  edit prompts.jsonl and config.yaml
+  teich generate -c config.yaml
+  teich generate -c config.yaml --resume
+
+Outputs:
+  output/    raw traces, converted JSONL rows, and README.md
+  sandbox/   workspace snapshots for agent providers
+  failures/  failed or interrupted traces excluded from resume/upload
+
+Use teich extract instead when you already have local Claude, Codex, Pi, or Hermes sessions.
+"""
+CONVERT_EXTRA_HELP = """\
+Examples:
+  teich convert data --out teich-training.jsonl
+  teich convert output/session.jsonl --out session.training.jsonl
+
+Output format:
+  Newline-delimited JSON rows with prompt, messages, tools, and metadata.
+  This is useful when your trainer can consume OpenAI-style message rows without importing Teich.
+
+Use prepare_data() and mask_data() when you want tokenizer-specific rendering and exact response-only labels.
+"""
+ANONYMIZE_EXTRA_HELP = """\
+Examples:
+  teich anonymize output --output output_anonymized
+  teich anonymize data --in-place
+
+What is scrubbed:
+  API keys, email addresses, and home-directory usernames.
+  Embedded base64 media payloads are preserved for conversation context.
+
+This is a best-effort safety pass. Review data before publishing or uploading.
+"""
+INIT_EXTRA_HELP = """\
+Creates:
+  config.yaml    generation settings
+  prompts.jsonl  starter prompt rows
+
+Next:
+  edit config.yaml and prompts.jsonl
+  set TEICH_API_KEY, OPENROUTER_API_KEY, or OPENAI_API_KEY
+  teich generate -c config.yaml
+"""
+STUDIO_EXTRA_HELP = """\
+Examples:
+  teich studio
+  teich studio ./my-project
+  teich studio --host 127.0.0.1 --port 8420 --no-open
+
+Studio edits the same config.yaml and prompts.jsonl files used by teich generate.
+"""
+POOL_EXTRA_HELP = """\
+This namespace is reserved for a future Teich community pool upload backend.
+For Hugging Face dataset uploads today, use teich generate or teich extract and confirm the upload prompt.
+"""
+
+
+class ExtraHelpCommand(TyperCommand):
+    extra_help = ""
+
+    def format_help(self, ctx: typer.Context, formatter: typer.HelpFormatter) -> None:
+        super().format_help(ctx, formatter)
+        if self.extra_help:
+            formatter.write("\n" + self.extra_help)
+
+
+class ExtraHelpGroup(TyperGroup):
+    extra_help = ""
+
+    def format_help(self, ctx: typer.Context, formatter: typer.HelpFormatter) -> None:
+        super().format_help(ctx, formatter)
+        if self.extra_help:
+            formatter.write("\n" + self.extra_help)
+
+
+def _help_command(name: str, extra_help: str) -> type[ExtraHelpCommand]:
+    return type(name, (ExtraHelpCommand,), {"extra_help": extra_help})
+
+
+def _help_group(name: str, extra_help: str) -> type[ExtraHelpGroup]:
+    return type(name, (ExtraHelpGroup,), {"extra_help": extra_help})
+
+
 app = typer.Typer(
     name="teich",
-    help="Generate agent training data using Codex, Pi, Claude Code, Hermes, or chat",
+    help="Generate, extract, convert, prepare, and inspect agent training data.",
     no_args_is_help=True,
+    cls=_help_group("TeichHelpGroup", ROOT_EXTRA_HELP),
 )
-extract_app = typer.Typer(
-    help=(
-        "Extract local agent sessions into Teich output folders. Use a provider subcommand with "
-        "--sessions-dir PATH to read a .claude, .codex, .pi, or .hermes folder outside the default location."
-    )
+pool_app = typer.Typer(
+    help="Reserved Teich community pool commands.",
+    cls=_help_group("PoolHelpGroup", POOL_EXTRA_HELP),
 )
-pool_app = typer.Typer(help="Upload anonymized traces to the Teich community pool.")
-app.add_typer(extract_app, name="extract")
 app.add_typer(pool_app, name="pool")
 NON_DATA_TRACE_DIR_NAMES = {"partials", "failures"}
 UPLOAD_IGNORE_PATTERNS = ["partials/**", "failures/**"]
@@ -356,8 +479,9 @@ def _extract_sources_option() -> list[Path] | None:
         "--sessions-dir",
         "-s",
         help=(
-            "Explicit agent data folder or file. Examples: .claude, .claude/projects, "
-            ".codex, .codex/sessions, .pi, .hermes, or .hermes/state.db. Can be passed more than once."
+            "Explicit agent root, native session folder, state.db file, or JSONL file. "
+            "Examples: .claude, .claude/projects, .codex, .codex/sessions, .pi, "
+            ".pi/agent/sessions, .pi/sessions, .hermes, .hermes/state.db. Can be passed more than once."
         ),
     )
 
@@ -374,55 +498,33 @@ def _extract_no_anonymize_option() -> bool:
     return typer.Option(False, "--no-anon", "--no-anonymize", help="Skip automatic anonymization of extracted traces.")
 
 
-@extract_app.command()
-def codex(
+@app.command(
+    help=EXTRACT_HELP,
+    short_help="Extract existing local agent sessions.",
+    no_args_is_help=True,
+    cls=_help_command("ExtractHelpCommand", EXTRACT_EXTRA_HELP),
+)
+def extract(
+    provider: ExtractProvider = typer.Argument(
+        ...,
+        metavar="PROVIDER",
+        help="Provider to extract: claude, codex, pi, or hermes.",
+    ),
     output: Path = _extract_output_option(),
     sessions_dir: list[Path] | None = _extract_sources_option(),
     model: str | None = _extract_model_option(),
     no_anon: bool = _extract_no_anonymize_option(),
     private: bool = typer.Option(False, "--private", help="Create the Hugging Face dataset as private if upload is confirmed."),
 ) -> None:
-    """Extract local Codex sessions."""
-    _run_extract_command("codex", output, sessions_dir, model_filter=model, skip_anonymize=no_anon, private=private)
+    """Extract local sessions for one provider."""
+    _run_extract_command(provider, output, sessions_dir, model_filter=model, skip_anonymize=no_anon, private=private)
 
 
-@extract_app.command()
-def claude(
-    output: Path = _extract_output_option(),
-    sessions_dir: list[Path] | None = _extract_sources_option(),
-    model: str | None = _extract_model_option(),
-    no_anon: bool = _extract_no_anonymize_option(),
-    private: bool = typer.Option(False, "--private", help="Create the Hugging Face dataset as private if upload is confirmed."),
-) -> None:
-    """Extract local Claude Code sessions."""
-    _run_extract_command("claude", output, sessions_dir, model_filter=model, skip_anonymize=no_anon, private=private)
-
-
-@extract_app.command()
-def pi(
-    output: Path = _extract_output_option(),
-    sessions_dir: list[Path] | None = _extract_sources_option(),
-    model: str | None = _extract_model_option(),
-    no_anon: bool = _extract_no_anonymize_option(),
-    private: bool = typer.Option(False, "--private", help="Create the Hugging Face dataset as private if upload is confirmed."),
-) -> None:
-    """Extract local Pi sessions."""
-    _run_extract_command("pi", output, sessions_dir, model_filter=model, skip_anonymize=no_anon, private=private)
-
-
-@extract_app.command()
-def hermes(
-    output: Path = _extract_output_option(),
-    sessions_dir: list[Path] | None = _extract_sources_option(),
-    model: str | None = _extract_model_option(),
-    no_anon: bool = _extract_no_anonymize_option(),
-    private: bool = typer.Option(False, "--private", help="Create the Hugging Face dataset as private if upload is confirmed."),
-) -> None:
-    """Extract local Hermes Agent state sessions."""
-    _run_extract_command("hermes", output, sessions_dir, model_filter=model, skip_anonymize=no_anon, private=private)
-
-
-@app.command()
+@app.command(
+    help="Copy trace files and scrub common secrets/user identifiers.",
+    short_help="Anonymize trace files.",
+    cls=_help_command("AnonymizeHelpCommand", ANONYMIZE_EXTRA_HELP),
+)
 def anonymize(
     input_path: Path = typer.Argument(Path("output"), help="Trace file or directory to anonymize"),
     output: Path = typer.Option(
@@ -452,7 +554,11 @@ def anonymize(
         console.print("[yellow]No emails, usernames, or API keys were detected.[/yellow]")
 
 
-@app.command()
+@app.command(
+    help="Convert raw or extracted traces into normalized Teich JSONL rows.",
+    short_help="Convert traces to Teich JSONL.",
+    cls=_help_command("ConvertHelpCommand", CONVERT_EXTRA_HELP),
+)
 def convert(
     input_path: Path = typer.Argument(..., help="Raw trace JSONL file or folder to convert"),
     output: Path = typer.Option(
@@ -485,7 +591,11 @@ def convert(
     console.print("[cyan]Output format:[/cyan] Teich JSONL with prompt, messages, tools, and metadata.")
 
 
-@pool_app.command("upload")
+@pool_app.command(
+    "upload",
+    help="Reserved placeholder for future Teich pool uploads.",
+    short_help="Reserved pool upload placeholder.",
+)
 def pool_upload(
     path: Path = typer.Argument(Path("output_anonymized"), help="Anonymized trace directory to upload later"),
 ) -> None:
@@ -496,7 +606,11 @@ def pool_upload(
     raise typer.Exit(1)
 
 
-@app.command()
+@app.command(
+    help="Run a configured prompt batch and write trace/data artifacts.",
+    short_help="Generate traces from config.",
+    cls=_help_command("GenerateHelpCommand", GENERATE_EXTRA_HELP),
+)
 def generate(
     config: Path = typer.Option(
         Path("config.yaml"),
@@ -835,7 +949,11 @@ class BatchProgressReporter:
             return Group(Panel.fit(summary, title="Batch Summary"), table)
 
 
-@app.command()
+@app.command(
+    help="Create a starter config.yaml and prompts.jsonl project.",
+    short_help="Initialize a Teich project.",
+    cls=_help_command("InitHelpCommand", INIT_EXTRA_HELP),
+)
 def init(
     path: Path = typer.Argument(Path("."), help="Directory to initialize"),
 ) -> None:
@@ -1016,7 +1134,11 @@ def _configure_studio_event_loop_policy(
     return True
 
 
-@app.command()
+@app.command(
+    help="Launch the local Teich Studio browser UI.",
+    short_help="Launch Teich Studio.",
+    cls=_help_command("StudioHelpCommand", STUDIO_EXTRA_HELP),
+)
 def studio(
     path: Path = typer.Argument(Path("."), help="Project directory (created/initialized if needed)"),
     host: str = typer.Option("127.0.0.1", "--host", help="Host to bind the studio server to"),

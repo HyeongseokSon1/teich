@@ -37,16 +37,40 @@ def _write_minimal_hermes_state_db(state_db: Path, *, session_id: str = "session
         connection.close()
 
 
-def test_extract_subcommands_exist():
+def test_extract_help_covers_providers_options_defaults_and_examples():
+    root_help = runner.invoke(app, ["--help"])
+
+    assert root_help.exit_code == 0
+    root_output = _plain_cli_output(root_help.output)
+    assert "Extract existing local agent sessions" in root_output
+    assert "teich extract claude --model fable-5 --out data" in root_output
+
     group_help = runner.invoke(app, ["extract", "--help"])
 
     assert group_help.exit_code == 0
     group_output = _plain_cli_output(group_help.output)
-    assert "--sessions-dir PATH" in group_output
+    assert "PROVIDER" in group_output
+    for provider in ("claude", "codex", "pi", "hermes"):
+        assert provider in group_output
+    assert "--sessions-dir" in group_output
+    assert "--output,--out" in group_output
+    assert "--model" in group_output
+    assert "--no-anon" in group_output
+    assert "--no-anonymize" in group_output
     assert ".claude" in group_output
+    assert ".claude/projects" in group_output
     assert ".codex" in group_output
+    assert ".codex/sessions" in group_output
     assert ".pi" in group_output
+    assert ".pi/agent/sessions" in group_output
+    assert ".pi/sessions" in group_output
     assert ".hermes" in group_output
+    assert ".hermes/state.db" in group_output
+    assert "CLAUDE_CONFIG_DIR/projects" in group_output
+    assert "CODEX_HOME/sessions" in group_output
+    assert "HERMES_STATE_DB" in group_output
+    assert "fable-5" in group_output
+    assert "teich convert data --out teich-training.jsonl" in group_output
 
     for provider in ("claude", "codex", "hermes", "pi"):
         result = runner.invoke(app, ["extract", provider, "--help"])

@@ -2,6 +2,12 @@
 
 Teich normalizes supported sources into structured training examples.
 
+To write this normalized format as standalone JSONL from raw or extracted traces, run:
+
+```bash
+teich convert data --out teich-training.jsonl
+```
+
 Core fields:
 
 - `prompt`: initial task description
