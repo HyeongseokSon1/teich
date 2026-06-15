@@ -43,6 +43,7 @@ Studio gives you browser controls for the same files and runners used by the CLI
 - edit `config.yaml`
 - add, edit, import, and validate `prompts.jsonl`
 - start and resume batch generation
+- extract existing local agent sessions from browser-selected source paths
 - watch generation progress and provider/model usage
 - inspect generated traces
 - open interactive agent sessions
@@ -80,6 +81,23 @@ teich generate -c config.yaml
 ```
 
 Use it to start a batch, monitor status, and resume a run without leaving the browser.
+
+## Browser Extraction
+
+The Extract tab is a UI wrapper over:
+
+```bash
+teich extract PROVIDER --sessions-dir PATH --out ./output
+```
+
+Use it to stage existing local sessions from `claude`, `codex`, `pi`, or `hermes` without leaving the browser. The source box accepts either the provider home folder or the provider's direct data path:
+
+- Claude: `.claude` or `.claude/projects`
+- Codex: `.codex` or `.codex/sessions`
+- Pi: `.pi`, `.pi/agent/sessions`, or `.pi/sessions`
+- Hermes: `.hermes` or `.hermes/state.db`
+
+Studio can fill in detected default paths for the selected provider. Extraction writes into the configured output folder, generates a dataset `README.md`, and anonymizes staged traces by default. Check **Skip anonymization** only when you are intentionally keeping raw local values.
 
 ## Requirements
 

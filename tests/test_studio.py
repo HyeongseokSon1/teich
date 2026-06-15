@@ -374,6 +374,88 @@ def test_trace_listing_and_preview(client):
     assert escape.status_code in {400, 404}
 
 
+def _wait_for_extract_job(client) -> dict:
+    delay = threading.Event()
+    for _ in range(200):
+        job = client.get("/api/extract").json()["job"]
+        if job and job["status"] in {"completed", "failed"}:
+            return job
+        delay.wait(timeout=0.01)
+    raise AssertionError("extraction job did not finish")
+
+
+def test_extract_endpoint_accepts_provider_home_and_anonymizes(client):
+    source_home = client.project_dir / ".codex"
+    sessions_dir = source_home / "sessions"
+    sessions_dir.mkdir(parents=True)
+    trace = sessions_dir / "trace.jsonl"
+    events = [
+        {"type": "session_meta", "payload": {"model": "claude-fable-5"}},
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "email arin@company.ai"}],
+            },
+        },
+    ]
+    trace.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+
+    response = client.post(
+        "/api/extract",
+        json={
+            "provider": "codex",
+            "output": "staged",
+            "sessions_dirs": [str(source_home)],
+            "model": "fable-5",
+        },
+    )
+
+    assert response.status_code == 200
+    job = _wait_for_extract_job(client)
+    assert job["status"] == "completed"
+    assert job["result_files"] == ["trace.jsonl"]
+    output_trace = client.project_dir / "staged" / "trace.jsonl"
+    assert output_trace.exists()
+    text = output_trace.read_text(encoding="utf-8")
+    assert "arin@company.ai" not in text
+    assert (client.project_dir / "staged" / "README.md").exists()
+    listing = client.get("/api/traces").json()["traces"]
+    assert [trace["name"] for trace in listing] == ["trace.jsonl"]
+
+
+def test_extract_endpoint_can_skip_anonymization(client):
+    sessions_dir = client.project_dir / ".codex" / "sessions"
+    sessions_dir.mkdir(parents=True)
+    (sessions_dir / "raw.jsonl").write_text(
+        json.dumps({"type": "session_meta", "payload": {"model": "test-model", "email": "raw@company.ai"}}) + "\n",
+        encoding="utf-8",
+    )
+
+    response = client.post(
+        "/api/extract",
+        json={
+            "provider": "codex",
+            "output": "raw-staged",
+            "sessions_dirs": [str(sessions_dir)],
+            "skip_anonymize": True,
+        },
+    )
+
+    assert response.status_code == 200
+    job = _wait_for_extract_job(client)
+    assert job["status"] == "completed"
+    assert "raw@company.ai" in (client.project_dir / "raw-staged" / "raw.jsonl").read_text(encoding="utf-8")
+
+
+def test_extract_sources_rejects_unknown_provider(client):
+    response = client.get("/api/extract/sources", params={"provider": "unknown"})
+
+    assert response.status_code == 400
+    assert "Provider must be one of" in response.json()["detail"]
+
+
 def test_index_served(client):
     response = client.get("/")
     assert response.status_code == 200

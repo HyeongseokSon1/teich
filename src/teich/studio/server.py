@@ -8,7 +8,7 @@ import subprocess
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import asyncio
 
@@ -17,7 +17,9 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from ..extract import ExtractProvider, default_session_sources
 from .events import summarize_chat_row, summarize_trace_events
+from .extraction import ExtractionManager
 from .generation import GenerationManager
 from .interactive import EventLog, SessionManager
 from .project import ProjectState, validate_chat_api_compatibility
@@ -76,6 +78,14 @@ class GenerateRequest(BaseModel):
     resume: bool = False
 
 
+class ExtractRequest(BaseModel):
+    provider: str = "claude"
+    output: str = "./output"
+    sessions_dirs: list[str] = Field(default_factory=list)
+    model: str | None = None
+    skip_anonymize: bool = False
+
+
 class SessionCreate(BaseModel):
     provider: str | None = None
     model: str | None = None
@@ -90,6 +100,16 @@ class SessionMessage(BaseModel):
 _docker_cache: dict[str, Any] = {"checked_at": 0.0, "available": False, "detail": None}
 TERMINAL_READY_STATUSES = {"ready", "live", "exited", "error"}
 TERMINAL_STARTUP_NOTICE_SECONDS = 15.0
+EXTRACT_PROVIDERS = {"claude", "codex", "hermes", "pi"}
+
+
+def _normalize_extract_provider(provider: str) -> ExtractProvider:
+    normalized = provider.strip().lower().replace("_", "-")
+    if normalized == "claude-code":
+        normalized = "claude"
+    if normalized not in EXTRACT_PROVIDERS:
+        raise ValueError("Provider must be one of: claude, codex, pi, hermes.")
+    return cast(ExtractProvider, normalized)
 
 
 async def _settle_terminal_tasks(
@@ -218,6 +238,7 @@ def create_app(project_dir: Path) -> FastAPI:
     state.ensure_initialized()
     sessions = SessionManager()
     generation = GenerationManager()
+    extraction = ExtractionManager()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -226,11 +247,13 @@ def create_app(project_dir: Path) -> FastAPI:
         finally:
             sessions.shutdown()
             generation.shutdown()
+            extraction.shutdown()
 
     app = FastAPI(title="Teich Studio", docs_url=None, redoc_url=None, lifespan=lifespan)
     app.state.project = state
     app.state.sessions = sessions
     app.state.generation = generation
+    app.state.extraction = extraction
 
     # ------------------------------------------------------------------
     # Status / config
@@ -349,6 +372,68 @@ def create_app(project_dir: Path) -> FastAPI:
         job = generation.current()
         if job is None:
             raise HTTPException(status_code=404, detail="No generation run")
+        return _sse(job.events, after)
+
+    # ------------------------------------------------------------------
+    # Local extraction
+    # ------------------------------------------------------------------
+
+    def _resolve_studio_path(value: str) -> Path:
+        return state.resolve_path(Path(value).expanduser())
+
+    @app.get("/api/extract/sources")
+    def extract_sources(provider: str = "claude") -> dict[str, Any]:
+        try:
+            normalized = _normalize_extract_provider(provider)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {
+            "provider": normalized,
+            "sources": [str(path) for path in default_session_sources(normalized)],
+        }
+
+    @app.post("/api/extract")
+    def start_extraction(payload: ExtractRequest) -> dict[str, Any]:
+        try:
+            provider = _normalize_extract_provider(payload.provider)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+        output_value = payload.output.strip() or "./output"
+        output_dir = _resolve_studio_path(output_value)
+        source_paths = [
+            _resolve_studio_path(path.strip())
+            for path in payload.sessions_dirs
+            if isinstance(path, str) and path.strip()
+        ]
+        model_filter = (payload.model or "").strip() or None
+        config_output = str(output_dir) if Path(output_value).expanduser().is_absolute() else output_value
+        try:
+            state.write_config_data({"output": {"traces_dir": config_output}})
+        except Exception:
+            pass
+        try:
+            job = extraction.start(
+                provider,
+                output_dir=output_dir,
+                source_paths=source_paths,
+                model_filter=model_filter,
+                skip_anonymize=payload.skip_anonymize,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        return job.to_dict()
+
+    @app.get("/api/extract")
+    def get_extraction() -> dict[str, Any]:
+        job = extraction.current()
+        return {"job": job.to_dict() if job else None}
+
+    @app.get("/api/extract/events")
+    def extraction_events(after: int = 0) -> StreamingResponse:
+        job = extraction.current()
+        if job is None:
+            raise HTTPException(status_code=404, detail="No extraction run")
         return _sse(job.events, after)
 
     # ------------------------------------------------------------------

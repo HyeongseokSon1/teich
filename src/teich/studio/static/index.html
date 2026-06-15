@@ -33,6 +33,10 @@
           <svg viewBox="0 0 24 24"><polygon points="6 3 20 12 6 21 6 3"/></svg>
           <span class="nav-label">Generate</span>
         </button>
+        <button class="nav-item" data-view="extract" title="Extract">
+          <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          <span class="nav-label">Extract</span>
+        </button>
         <button class="nav-item" data-view="interactive" title="Interactive">
           <svg viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
           <span class="nav-label">Interactive</span>
@@ -193,6 +197,54 @@
         <div class="card" id="run-progress-card" hidden>
           <div class="run-status" id="run-status"></div>
           <div class="run-rows" id="run-rows"></div>
+        </div>
+      </section>
+
+      <!-- ============================== EXTRACT ============================== -->
+      <section class="view" id="view-extract">
+        <header class="view-header">
+          <h1>Extract</h1>
+          <p>Stage existing local Claude, Codex, Pi, or Hermes sessions into the Studio output folder.</p>
+        </header>
+
+        <div class="card">
+          <div class="form-grid">
+            <label class="field">
+              <span>Provider</span>
+              <select id="extract-provider">
+                <option value="claude">Claude</option>
+                <option value="codex">Codex</option>
+                <option value="pi">Pi</option>
+                <option value="hermes">Hermes</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Output folder</span>
+              <input type="text" id="extract-output" value="./output" />
+            </label>
+            <label class="field">
+              <span>Model filter <em>optional</em></span>
+              <input type="text" id="extract-model" placeholder="fable-5" />
+            </label>
+            <label class="field checkbox-field">
+              <span>&nbsp;</span>
+              <label class="checkbox"><input type="checkbox" id="extract-no-anon" /> Skip anonymization</label>
+            </label>
+            <label class="field span-2">
+              <span>Session sources</span>
+              <textarea id="extract-sources" rows="5" placeholder="/path/to/.claude&#10;/path/to/.claude/projects&#10;/path/to/.hermes/state.db"></textarea>
+              <small id="extract-source-hint"></small>
+            </label>
+          </div>
+          <div class="row-actions">
+            <button class="btn" id="btn-detect-sources">Use detected paths</button>
+            <button class="btn primary" id="btn-start-extract">Extract sessions</button>
+          </div>
+        </div>
+
+        <div class="card" id="extract-progress-card" hidden>
+          <div class="run-status" id="extract-status"></div>
+          <div class="extract-events" id="extract-events"></div>
         </div>
       </section>
 

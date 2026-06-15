@@ -94,6 +94,9 @@ const state = {
   termSocket: null,
   jobSource: null,
   job: null,
+  extractSource: null,
+  extractJob: null,
+  extractEvents: [],
   traces: [],
   selectedTrace: null,
 };
@@ -107,6 +110,7 @@ function showView(name) {
   $$(".view").forEach((view) => view.classList.toggle("active", view.id === `view-${name}`));
   if (name === "output") loadTracesQuiet();
   if (name === "generate") refreshRunSummary();
+  if (name === "extract") loadCurrentExtraction();
   if (name === "interactive" && state.term) requestAnimationFrame(fitTerminal);
 }
 
@@ -219,6 +223,7 @@ function fillConfigForm() {
   $("#cfg-concurrency").value = get(c, "max_concurrency", 1);
   $("#cfg-timeout").value = get(c, "timeout_seconds", 600);
   $("#cfg-traces-dir").value = get(c, "output.traces_dir", "./output");
+  $("#extract-output").value = get(c, "output.traces_dir", "./output") || "./output";
   $("#cfg-pretty-name").value = get(c, "output.pretty_name", "");
   $("#cfg-dev-instructions").value = get(c, "developer_instructions", "") || "";
   $("#cfg-repo-id").value = get(c, "publish.repo_id", "") || "";
@@ -578,6 +583,125 @@ async function loadCurrentJob() {
       if (["running", "starting"].includes(result.job.status)) connectJobEvents();
     }
   } catch (err) { /* no job yet */ }
+}
+
+// ---------------------------------------------------------------------------
+// Extract view
+// ---------------------------------------------------------------------------
+
+function renderExtractJob() {
+  const card = $("#extract-progress-card");
+  const events = $("#extract-events");
+  const job = state.extractJob;
+  if (!job && !state.extractEvents.length) {
+    card.hidden = true;
+    return;
+  }
+  card.hidden = false;
+  const running = job && ["starting", "running"].includes(job.status);
+  $("#btn-start-extract").disabled = Boolean(running);
+
+  const statusEl = $("#extract-status");
+  statusEl.innerHTML = "";
+  const status = job ? job.status : "idle";
+  const chip = el("span", `chip ${status}`, status);
+  if (running) chip.classList.add("pulsing");
+  statusEl.appendChild(chip);
+  statusEl.appendChild(el("span", null, (job && (job.message || job.error)) || ""));
+
+  events.innerHTML = "";
+  for (const eventData of state.extractEvents) {
+    const row = el("div", `event-row ${eventData.kind || ""}`);
+    row.appendChild(el("span", "event-kind", eventData.status || eventData.kind || "event"));
+    row.appendChild(el("span", "event-text", eventData.text || eventData.error || ""));
+    events.appendChild(row);
+  }
+  if (job && job.result_files && job.result_files.length) {
+    const files = el("div", "source-list");
+    files.appendChild(el("div", "source-list-title", "Extracted files"));
+    files.appendChild(el("pre", null, job.result_files.join("\n")));
+    events.appendChild(files);
+  }
+}
+
+function connectExtractEvents() {
+  if (state.extractSource) state.extractSource.close();
+  const source = new EventSource("/api/extract/events?after=0");
+  state.extractSource = source;
+  state.extractEvents = [];
+  source.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+    state.extractEvents.push(data);
+    if (data.kind === "extract_status") {
+      state.extractJob = state.extractJob || {};
+      state.extractJob.status = data.status;
+      state.extractJob.message = data.text || "";
+      state.extractJob.error = data.error || null;
+      if (data.result_files) state.extractJob.result_files = data.result_files;
+      if (["completed", "failed"].includes(data.status)) {
+        loadTracesQuiet();
+        if (data.status === "completed") toast("Extraction complete", "success");
+      }
+    }
+    renderExtractJob();
+  };
+  source.addEventListener("end", () => source.close());
+}
+
+async function detectExtractSources({ apply = false } = {}) {
+  const provider = $("#extract-provider").value;
+  try {
+    const result = await api("GET", `/api/extract/sources?provider=${encodeURIComponent(provider)}`);
+    const sources = result.sources || [];
+    $("#extract-source-hint").textContent = sources.length
+      ? `${sources.length} default path${sources.length === 1 ? "" : "s"} found`
+      : "No default paths found. Paste a .claude/.codex/.pi/.hermes folder or provider data path.";
+    if (apply) $("#extract-sources").value = sources.join("\n");
+    return sources;
+  } catch (err) {
+    $("#extract-source-hint").textContent = err.message;
+    if (apply) toast(err.message, "error");
+    return [];
+  }
+}
+
+$("#extract-provider").addEventListener("change", () => detectExtractSources());
+$("#btn-detect-sources").addEventListener("click", () => detectExtractSources({ apply: true }));
+
+$("#btn-start-extract").addEventListener("click", async () => {
+  let sources = $("#extract-sources").value
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (!sources.length) sources = await detectExtractSources({ apply: true });
+  const body = {
+    provider: $("#extract-provider").value,
+    output: $("#extract-output").value.trim() || "./output",
+    sessions_dirs: sources,
+    model: $("#extract-model").value.trim() || null,
+    skip_anonymize: $("#extract-no-anon").checked,
+  };
+  try {
+    state.extractJob = await api("POST", "/api/extract", body);
+    state.extractEvents = [];
+    renderExtractJob();
+    connectExtractEvents();
+    loadConfig();
+  } catch (err) {
+    toast(err.message, "error");
+  }
+});
+
+async function loadCurrentExtraction() {
+  detectExtractSources();
+  try {
+    const result = await api("GET", "/api/extract");
+    if (result.job) {
+      state.extractJob = result.job;
+      renderExtractJob();
+      if (["running", "starting"].includes(result.job.status)) connectExtractEvents();
+    }
+  } catch (err) { /* no extraction yet */ }
 }
 
 // ---------------------------------------------------------------------------
