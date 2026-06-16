@@ -157,6 +157,37 @@ Multi-turn follow-up rows can also include:
 
 `system` is prompt-specific when provided. If a prompt row does not include `system`, Teich does not inject a default system prompt.
 
+## ms-swift Output Format
+
+To train with the [ms-swift](https://github.com/modelscope/ms-swift) framework (e.g. Qwen3-style
+reasoning models), convert the normalized Teich rows into ms-swift's native dataset shape:
+
+```bash
+teich convert data --format ms-swift --out qwen3-swift.jsonl
+```
+
+This runs the same `trace -> message` conversion and then applies a `message -> message2` step
+(`teich.swift.convert_to_ms_swift`). The differences from the Teich format are:
+
+- `reasoning_content` is inlined into assistant `content` as `<think>\n...\n</think>\n\n<answer>`,
+  matching the Qwen3 best-practice format. Pair this with `--loss_scale ignore_empty_think` in
+  ms-swift so assistant turns without reasoning are not penalized.
+- assistant `tool_calls` become standalone `tool_call` role messages whose `content` is a JSON
+  string `{"name": ..., "arguments": {...}}` (`arguments` is a JSON object).
+- `tool` role messages become `tool_response` role messages.
+- the `developer` role is mapped to `system`.
+- `tools` is serialized to a JSON string (OpenAI-style function schemas, unchanged).
+- only `messages` and `tools` are emitted; `prompt`, `follow_up_prompts`, and `metadata` are dropped.
+
+```json
+{"messages": [{"role": "user", "content": "Build a todo app"}, {"role": "assistant", "content": "<think>\nCheck the README first.\n</think>\n\nI will inspect the project."}, {"role": "tool_call", "content": "{\"name\": \"Read\", \"arguments\": {\"file_path\": \"README.md\"}}"}, {"role": "tool_response", "content": "..."}, {"role": "assistant", "content": "Done."}], "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"Read\", \"parameters\": {\"type\": \"object\"}}}]"}
+```
+
+By default `<think>` is kept only on the final assistant turn, mirroring how Qwen3 drops historical
+reasoning at inference. Agent traces often carry their reasoning on the intermediate (tool-deciding)
+turns rather than the final answer, so pass `--keep-intermediate-thinking` to retain `<think>` on
+every assistant turn when that reasoning is the signal you want to train on.
+
 ## Incomplete Traces
 
 Rows ending on a tool result are incomplete without a follow-up assistant turn.

@@ -13,6 +13,7 @@ from .converter import (
 from .formatter import PrepareReport, RowContextFit, mask_data, preview_sft_example, row_fits_context
 from .loader import load_traces, trace_is_complete
 from .prepare import prepare_data
+from .swift import convert_to_ms_swift, to_ms_swift_messages, to_ms_swift_row
 from .tool_schema import ToolCallValidationReport, validate_tool_calls
 
 __all__ = [
@@ -23,9 +24,12 @@ __all__ = [
     "Config",
     "TrainingExample",
     "audit_sft_dataset",
+    "convert_to_ms_swift",
     "convert_trace_to_training_example",
     "convert_traces_to_training_data",
     "detect_trace_type",
+    "to_ms_swift_messages",
+    "to_ms_swift_row",
     "load_traces",
     "load_config",
     "mask_data",
