@@ -1,0 +1,134 @@
+import json
+
+from teich import convert_to_ms_swift, to_ms_swift_messages, to_ms_swift_row
+
+
+def test_basic_roles_passthrough_and_developer_maps_to_system():
+    messages = [
+        {"role": "developer", "content": "dev context"},
+        {"role": "system", "content": "you are helpful"},
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"},
+    ]
+    result = to_ms_swift_messages(messages)
+    assert result == [
+        {"role": "system", "content": "dev context"},
+        {"role": "system", "content": "you are helpful"},
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"},
+    ]
+
+
+def test_reasoning_is_inlined_as_think_on_final_assistant_turn():
+    messages = [
+        {"role": "user", "content": "where is the capital of Zhejiang?"},
+        {"role": "assistant", "content": "Hangzhou.", "reasoning_content": "Zhejiang's capital is Hangzhou."},
+    ]
+    result = to_ms_swift_messages(messages)
+    assert result == [
+        {"role": "user", "content": "where is the capital of Zhejiang?"},
+        {"role": "assistant", "content": "<think>\nZhejiang's capital is Hangzhou.\n</think>\n\nHangzhou."},
+    ]
+
+
+def test_intermediate_thinking_dropped_by_default_but_kept_with_flag():
+    messages = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1", "reasoning_content": "r1"},
+        {"role": "user", "content": "q2"},
+        {"role": "assistant", "content": "a2", "reasoning_content": "r2"},
+    ]
+
+    default = to_ms_swift_messages(messages)
+    assert default[1] == {"role": "assistant", "content": "a1"}
+    assert default[3] == {"role": "assistant", "content": "<think>\nr2\n</think>\n\na2"}
+
+    kept = to_ms_swift_messages(messages, keep_intermediate_thinking=True)
+    assert kept[1] == {"role": "assistant", "content": "<think>\nr1\n</think>\n\na1"}
+    assert kept[3] == {"role": "assistant", "content": "<think>\nr2\n</think>\n\na2"}
+
+
+def test_tool_calls_become_tool_call_role_messages_with_json_string_content():
+    messages = [
+        {"role": "user", "content": "read the file"},
+        {
+            "role": "assistant",
+            "content": "I'll read it.",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "Read", "arguments": {"file_path": "README.md"}},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "name": "Read", "content": "# Title"},
+        {"role": "assistant", "content": "Done."},
+    ]
+    result = to_ms_swift_messages(messages)
+    assert result[1] == {"role": "assistant", "content": "I'll read it."}
+    assert result[2]["role"] == "tool_call"
+    assert json.loads(result[2]["content"]) == {"name": "Read", "arguments": {"file_path": "README.md"}}
+    assert result[3] == {"role": "tool_response", "content": "# Title"}
+    assert result[4] == {"role": "assistant", "content": "Done."}
+
+
+def test_string_tool_arguments_are_parsed_into_objects():
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"type": "function", "function": {"name": "Bash", "arguments": '{"command": "ls"}'}}
+            ],
+        }
+    ]
+    result = to_ms_swift_messages(messages)
+    assert len(result) == 1
+    assert result[0]["role"] == "tool_call"
+    assert json.loads(result[0]["content"]) == {"name": "Bash", "arguments": {"command": "ls"}}
+
+
+def test_assistant_with_only_tool_calls_emits_no_empty_assistant_message():
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"type": "function", "function": {"name": "LS", "arguments": {}}}],
+        }
+    ]
+    result = to_ms_swift_messages(messages)
+    assert [message["role"] for message in result] == ["tool_call"]
+
+
+def test_to_ms_swift_row_serializes_tools_to_json_string_and_drops_extra_fields():
+    row = {
+        "prompt": "hi",
+        "follow_up_prompts": ["more"],
+        "messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}],
+        "tools": [
+            {"type": "function", "function": {"name": "Read", "description": "Read a file.", "parameters": {"type": "object"}}}
+        ],
+        "metadata": {"model": "qwen3"},
+    }
+    swift_row = to_ms_swift_row(row)
+    assert set(swift_row) == {"messages", "tools"}
+    assert isinstance(swift_row["tools"], str)
+    assert json.loads(swift_row["tools"]) == row["tools"]
+    assert swift_row["messages"][-1] == {"role": "assistant", "content": "hello"}
+
+
+def test_to_ms_swift_row_omits_tools_when_absent_or_empty():
+    assert "tools" not in to_ms_swift_row({"messages": [{"role": "user", "content": "hi"}], "tools": []})
+    assert "tools" not in to_ms_swift_row({"messages": [{"role": "user", "content": "hi"}]})
+
+
+def test_convert_to_ms_swift_maps_each_row():
+    rows = [
+        {"messages": [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}]},
+        {"messages": [{"role": "user", "content": "c"}, {"role": "assistant", "content": "d"}]},
+    ]
+    converted = convert_to_ms_swift(rows)
+    assert len(converted) == 2
+    assert converted[0]["messages"][0] == {"role": "user", "content": "a"}
+    assert converted[1]["messages"][-1] == {"role": "assistant", "content": "d"}
