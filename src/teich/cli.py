@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 import sys
 from threading import Event, RLock, Thread
-from typing import Any
+from typing import Any, Optional
 
 import typer
 from huggingface_hub import HfApi
@@ -585,12 +585,25 @@ def convert(
         "--clean/--no-clean",
         help="For --format ms-swift: normalize rows for ms-swift trainability (merge system/user, drop orphan tool results and unanswered tool rounds, end on assistant). Drops rows left untrainable.",
     ),
+    progressive: bool = typer.Option(
+        False,
+        "--progressive",
+        help="For --format ms-swift: expand each conversation into accumulating prefixes (one per user round, each ending on its final assistant turn) for on-policy distillation / last-turn training.",
+    ),
+    max_content_length: Optional[int] = typer.Option(
+        None,
+        "--max-content-length",
+        help="For --format ms-swift: drop rows whose total message-content character length exceeds this (applied after --progressive expansion).",
+    ),
 ) -> None:
     """Convert raw or extracted traces into normalized Teich JSONL rows."""
     normalized_format = output_format.strip().lower()
     ms_swift_aliases = {"ms-swift", "ms_swift", "swift"}
     if normalized_format not in {"teich", *ms_swift_aliases}:
         console.print(f"[red]Unknown --format {output_format!r}. Use 'teich' or 'ms-swift'.[/red]")
+        raise typer.Exit(1)
+    if max_content_length is not None and max_content_length <= 0:
+        console.print("[red]--max-content-length must be a positive integer.[/red]")
         raise typer.Exit(1)
     if not input_path.exists():
         console.print(f"[red]Input path not found: {input_path}[/red]")
@@ -607,12 +620,27 @@ def convert(
     is_ms_swift = normalized_format in ms_swift_aliases
     if is_ms_swift:
         source_count = len(rows)
-        rows = convert_to_ms_swift(rows, keep_intermediate_thinking=keep_intermediate_thinking, clean=clean)
-        dropped = source_count - len(rows)
-        if clean and dropped:
-            console.print(f"[yellow]Dropped {dropped} untrainable row{'s' if dropped != 1 else ''} during ms-swift cleanup.[/yellow]")
+        rows = convert_to_ms_swift(
+            rows,
+            keep_intermediate_thinking=keep_intermediate_thinking,
+            clean=clean,
+            progressive=progressive,
+            max_content_length=max_content_length,
+        )
+        transforms = []
+        if clean:
+            transforms.append("cleaned")
+        if progressive:
+            transforms.append("progressive prefixes")
+        if max_content_length is not None:
+            transforms.append(f"max_content_length={max_content_length}")
+        console.print(
+            f"[cyan]ms-swift:[/cyan] {source_count} conversation{'s' if source_count != 1 else ''}"
+            f" -> {len(rows)} row{'s' if len(rows) != 1 else ''}"
+            f"{' (' + ', '.join(transforms) + ')' if transforms else ''}."
+        )
         if not rows:
-            console.print("[red]No trainable ms-swift rows remain after cleanup.[/red]")
+            console.print("[red]No trainable ms-swift rows remain after conversion.[/red]")
             raise typer.Exit(1)
 
     output.parent.mkdir(parents=True, exist_ok=True)

@@ -263,12 +263,49 @@ def to_ms_swift_row(
     return swift_row
 
 
+def ms_swift_content_length(messages: list[dict[str, Any]]) -> int:
+    """Total character length of all message ``content`` strings in a row."""
+    return sum(len(message.get("content") or "") for message in messages)
+
+
+def _progressive_cut_indices(messages: list[dict[str, Any]]) -> list[int]:
+    cuts: list[int] = []
+    total = len(messages)
+    for index, message in enumerate(messages):
+        if message.get("role") != "assistant":
+            continue
+        next_role = messages[index + 1].get("role") if index + 1 < total else None
+        if next_role is None or next_role == "user":
+            cuts.append(index)
+    return cuts
+
+
+def progressive_prefixes(messages: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Split a (cleaned) ms-swift message list into accumulating prefixes.
+
+    Each prefix ends on a final-answer ``assistant`` turn -- the assistant turn
+    right before the next ``user`` turn, or the last turn of the conversation --
+    and includes the leading ``system`` message. The prefixes accumulate, so the
+    last one is the full conversation::
+
+        input -> output -> input -> output -> input -> output
+        => [in->out,  in->out->in->out,  in->out->in->out->in->out]
+
+    This is for on-policy distillation where each example trains only its final
+    turn. Tool ``tool_call``/``tool_response`` cycles within a round stay inside
+    that round's prefix; cuts only happen at user-round boundaries.
+    """
+    return [messages[: cut + 1] for cut in _progressive_cut_indices(messages)]
+
+
 def convert_to_ms_swift(
     rows: list[dict[str, Any]],
     *,
     keep_intermediate_thinking: bool = False,
     clean: bool = True,
     drop_untrainable: bool = True,
+    progressive: bool = False,
+    max_content_length: int | None = None,
     include_tools: bool = True,
     tools_as_json_string: bool = True,
 ) -> list[dict[str, Any]]:
@@ -277,6 +314,13 @@ def convert_to_ms_swift(
     With ``clean=True`` (default) each row is normalized for ms-swift trainability
     and, when ``drop_untrainable=True``, rows left without any trainable turn are
     dropped from the output.
+
+    With ``progressive=True`` each conversation is expanded into accumulating
+    prefixes (see ``progressive_prefixes``), one per user round, for on-policy
+    distillation that trains only the final turn of each example.
+
+    With ``max_content_length`` set, any output row whose total message-content
+    character length exceeds it is dropped (applied after progressive expansion).
     """
     converted: list[dict[str, Any]] = []
     for row in rows:
@@ -287,7 +331,18 @@ def convert_to_ms_swift(
             include_tools=include_tools,
             tools_as_json_string=tools_as_json_string,
         )
-        if clean and drop_untrainable and not swift_row["messages"]:
+        messages = swift_row["messages"]
+        if clean and drop_untrainable and not messages:
             continue
-        converted.append(swift_row)
+        tools = swift_row.get("tools")
+        variants = progressive_prefixes(messages) if progressive else [messages]
+        for variant in variants:
+            if not variant:
+                continue
+            if max_content_length is not None and ms_swift_content_length(variant) > max_content_length:
+                continue
+            new_row: dict[str, Any] = {"messages": variant}
+            if tools is not None:
+                new_row["tools"] = tools
+            converted.append(new_row)
     return converted

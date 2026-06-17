@@ -2,6 +2,8 @@ import json
 
 from teich import (
     convert_to_ms_swift,
+    ms_swift_content_length,
+    progressive_prefixes,
     to_ms_swift_messages,
     to_ms_swift_row,
     validate_ms_swift_messages,
@@ -231,3 +233,81 @@ def test_validate_ms_swift_messages_flags_problems_and_passes_clean():
     assert any("consecutive user" in issue for issue in consecutive_user)
     ends_on_user = validate_ms_swift_messages([{"role": "user", "content": "q"}])
     assert any("end" in issue or "assistant" in issue for issue in ends_on_user)
+
+
+def test_progressive_prefixes_accumulate_each_round():
+    messages = [
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "u2"},
+        {"role": "assistant", "content": "a2"},
+        {"role": "user", "content": "u3"},
+        {"role": "assistant", "content": "a3"},
+    ]
+    prefixes = progressive_prefixes(messages)
+    assert [[m["content"] for m in p] for p in prefixes] == [
+        ["u1", "a1"],
+        ["u1", "a1", "u2", "a2"],
+        ["u1", "a1", "u2", "a2", "u3", "a3"],
+    ]
+    assert prefixes[-1] == messages  # last prefix is the full conversation
+
+
+def test_progressive_prefixes_cut_only_at_round_boundaries_and_keep_system():
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "thinking"},
+        {"role": "tool_call", "content": '{"name": "T", "arguments": {}}'},
+        {"role": "tool_response", "content": "res"},
+        {"role": "assistant", "content": "answer1"},
+        {"role": "user", "content": "u2"},
+        {"role": "assistant", "content": "answer2"},
+    ]
+    prefixes = progressive_prefixes(messages)
+    assert len(prefixes) == 2  # two user rounds; mid-round tool_call is not a cut
+    assert [m["role"] for m in prefixes[0]] == ["system", "user", "assistant", "tool_call", "tool_response", "assistant"]
+    assert prefixes[0][-1]["content"] == "answer1"
+    for prefix in prefixes:
+        assert prefix[0]["role"] == "system"  # leading system carried into every prefix
+        assert validate_ms_swift_messages(prefix) == []  # each prefix is a valid ms-swift conversation
+
+
+def test_ms_swift_content_length_sums_content_chars():
+    assert ms_swift_content_length([{"role": "user", "content": "aa"}, {"role": "assistant", "content": "bbb"}]) == 5
+
+
+def test_convert_to_ms_swift_progressive_expands_rows():
+    rows = [
+        {
+            "messages": [
+                {"role": "user", "content": "u1"},
+                {"role": "assistant", "content": "a1"},
+                {"role": "user", "content": "u2"},
+                {"role": "assistant", "content": "a2"},
+            ],
+            "tools": [{"type": "function", "function": {"name": "T", "parameters": {"type": "object"}}}],
+        }
+    ]
+    converted = convert_to_ms_swift(rows, progressive=True)
+    assert len(converted) == 2
+    assert [m["content"] for m in converted[0]["messages"]] == ["u1", "a1"]
+    assert [m["content"] for m in converted[1]["messages"]] == ["u1", "a1", "u2", "a2"]
+    assert all("tools" in row for row in converted)  # tools copied into each prefix row
+
+
+def test_convert_to_ms_swift_max_content_length_drops_long_rows():
+    rows = [
+        {
+            "messages": [
+                {"role": "user", "content": "x" * 10},
+                {"role": "assistant", "content": "y" * 10},
+                {"role": "user", "content": "z" * 100},
+                {"role": "assistant", "content": "w" * 100},
+            ]
+        }
+    ]
+    # progressive yields prefix1 (20 chars) and prefix2 (220 chars); cap keeps only prefix1.
+    converted = convert_to_ms_swift(rows, progressive=True, max_content_length=50)
+    assert len(converted) == 1
+    assert [m["content"] for m in converted[0]["messages"]] == ["x" * 10, "y" * 10]

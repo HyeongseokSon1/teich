@@ -206,6 +206,32 @@ Valid parallel (`tool_call` x N then `tool_response` x N) and sequential (`tool_
 `tool_call`) tool patterns are preserved. `teich.swift.validate_ms_swift_messages(messages)` returns
 the list of remaining trainability problems for a row (empty means OK).
 
+### Progressive prefixes (on-policy distillation)
+
+For on-policy distillation that trains only the final turn of each example, pass `--progressive`
+(or `convert_to_ms_swift(..., progressive=True)`) to expand each conversation into accumulating
+prefixes, one per user round, each ending on that round's final `assistant` turn:
+
+```text
+input -> output -> input -> output -> input -> output
+=> 1) input -> output
+   2) input -> output -> input -> output
+   3) input -> output -> input -> output -> input -> output
+```
+
+Cuts only happen at user-round boundaries, so `tool_call`/`tool_response` cycles stay inside their
+round's prefix, the leading `system` message is carried into every prefix, and each prefix is itself
+a valid ms-swift conversation ending on an `assistant` turn. (In ms-swift, configure the loss so only
+the last turn is supervised.)
+
+### Content-length filter
+
+Pass `--max-content-length N` (or `convert_to_ms_swift(..., max_content_length=N)`) to drop any row
+whose total message-content character length exceeds `N`. It is applied after progressive expansion,
+so over-budget prefixes are dropped while shorter ones are kept. Length is character count of message
+`content` (use `teich.swift.ms_swift_content_length(messages)` to compute it); tool schemas are not
+counted.
+
 ## Incomplete Traces
 
 Rows ending on a tool result are incomplete without a follow-up assistant turn.

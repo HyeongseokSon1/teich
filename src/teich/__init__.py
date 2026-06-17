@@ -13,7 +13,14 @@ from .converter import (
 from .formatter import PrepareReport, RowContextFit, mask_data, preview_sft_example, row_fits_context
 from .loader import load_traces, trace_is_complete
 from .prepare import prepare_data
-from .swift import convert_to_ms_swift, to_ms_swift_messages, to_ms_swift_row, validate_ms_swift_messages
+from .swift import (
+    convert_to_ms_swift,
+    ms_swift_content_length,
+    progressive_prefixes,
+    to_ms_swift_messages,
+    to_ms_swift_row,
+    validate_ms_swift_messages,
+)
 from .tool_schema import ToolCallValidationReport, validate_tool_calls
 
 __all__ = [
@@ -34,6 +41,8 @@ __all__ = [
     "load_traces",
     "load_config",
     "mask_data",
+    "ms_swift_content_length",
+    "progressive_prefixes",
     "prepare_data",
     "preview_sft_example",
     "row_fits_context",
