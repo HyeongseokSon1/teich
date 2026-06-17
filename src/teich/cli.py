@@ -580,6 +580,11 @@ def convert(
         "--keep-intermediate-thinking",
         help="For --format ms-swift: keep <think> blocks on every assistant turn instead of only the final turn.",
     ),
+    clean: bool = typer.Option(
+        True,
+        "--clean/--no-clean",
+        help="For --format ms-swift: normalize rows for ms-swift trainability (merge system/user, drop orphan tool results and unanswered tool rounds, end on assistant). Drops rows left untrainable.",
+    ),
 ) -> None:
     """Convert raw or extracted traces into normalized Teich JSONL rows."""
     normalized_format = output_format.strip().lower()
@@ -601,7 +606,14 @@ def convert(
 
     is_ms_swift = normalized_format in ms_swift_aliases
     if is_ms_swift:
-        rows = convert_to_ms_swift(rows, keep_intermediate_thinking=keep_intermediate_thinking)
+        source_count = len(rows)
+        rows = convert_to_ms_swift(rows, keep_intermediate_thinking=keep_intermediate_thinking, clean=clean)
+        dropped = source_count - len(rows)
+        if clean and dropped:
+            console.print(f"[yellow]Dropped {dropped} untrainable row{'s' if dropped != 1 else ''} during ms-swift cleanup.[/yellow]")
+        if not rows:
+            console.print("[red]No trainable ms-swift rows remain after cleanup.[/red]")
+            raise typer.Exit(1)
 
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", encoding="utf-8") as handle:
@@ -610,7 +622,8 @@ def convert(
 
     console.print(f"[green]Converted {len(rows)} trace row{'s' if len(rows) != 1 else ''} to {output}[/green]")
     if is_ms_swift:
-        console.print("[cyan]Output format:[/cyan] ms-swift JSONL (messages with inline <think> + tool_call/tool_response roles, tools as JSON string) for Qwen3 SFT.")
+        cleanup = "cleaned" if clean else "not cleaned"
+        console.print(f"[cyan]Output format:[/cyan] ms-swift JSONL (inline <think> + tool_call/tool_response roles, tools as JSON string) for Qwen3 SFT; {cleanup}.")
     else:
         console.print("[cyan]Output format:[/cyan] Teich JSONL with prompt, messages, tools, and metadata.")
 

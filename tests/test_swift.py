@@ -1,6 +1,11 @@
 import json
 
-from teich import convert_to_ms_swift, to_ms_swift_messages, to_ms_swift_row
+from teich import (
+    convert_to_ms_swift,
+    to_ms_swift_messages,
+    to_ms_swift_row,
+    validate_ms_swift_messages,
+)
 
 
 def test_basic_roles_passthrough_and_developer_maps_to_system():
@@ -10,7 +15,7 @@ def test_basic_roles_passthrough_and_developer_maps_to_system():
         {"role": "user", "content": "hi"},
         {"role": "assistant", "content": "hello"},
     ]
-    result = to_ms_swift_messages(messages)
+    result = to_ms_swift_messages(messages, clean=False)
     assert result == [
         {"role": "system", "content": "dev context"},
         {"role": "system", "content": "you are helpful"},
@@ -83,7 +88,7 @@ def test_string_tool_arguments_are_parsed_into_objects():
             ],
         }
     ]
-    result = to_ms_swift_messages(messages)
+    result = to_ms_swift_messages(messages, clean=False)
     assert len(result) == 1
     assert result[0]["role"] == "tool_call"
     assert json.loads(result[0]["content"]) == {"name": "Bash", "arguments": {"command": "ls"}}
@@ -97,7 +102,7 @@ def test_assistant_with_only_tool_calls_emits_no_empty_assistant_message():
             "tool_calls": [{"type": "function", "function": {"name": "LS", "arguments": {}}}],
         }
     ]
-    result = to_ms_swift_messages(messages)
+    result = to_ms_swift_messages(messages, clean=False)
     assert [message["role"] for message in result] == ["tool_call"]
 
 
@@ -132,3 +137,97 @@ def test_convert_to_ms_swift_maps_each_row():
     assert len(converted) == 2
     assert converted[0]["messages"][0] == {"role": "user", "content": "a"}
     assert converted[1]["messages"][-1] == {"role": "assistant", "content": "d"}
+
+
+def test_clean_merges_system_and_consecutive_user():
+    messages = [
+        {"role": "system", "content": "s1"},
+        {"role": "user", "content": "u1"},
+        {"role": "developer", "content": "s2"},  # mid-conversation system after developer mapping
+        {"role": "user", "content": "u2"},
+        {"role": "assistant", "content": "a"},
+    ]
+    result = to_ms_swift_messages(messages, clean=True)
+    assert result == [
+        {"role": "system", "content": "s1\n\ns2"},
+        {"role": "user", "content": "u1\n\nu2"},
+        {"role": "assistant", "content": "a"},
+    ]
+
+
+def test_clean_drops_orphan_tool_response():
+    messages = [
+        {"role": "user", "content": "q"},
+        {"role": "tool", "content": "orphan result"},
+        {"role": "assistant", "content": "a"},
+    ]
+    result = to_ms_swift_messages(messages, clean=True)
+    assert [m["role"] for m in result] == ["user", "assistant"]
+
+
+def test_clean_drops_unanswered_tool_round_before_user():
+    messages = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "", "tool_calls": [{"type": "function", "function": {"name": "T", "arguments": {}}}]},
+        {"role": "tool", "content": "res"},
+        {"role": "user", "content": "q2"},
+        {"role": "assistant", "content": "answer"},
+    ]
+    result = to_ms_swift_messages(messages, clean=True)
+    assert result == [
+        {"role": "user", "content": "q1\n\nq2"},
+        {"role": "assistant", "content": "answer"},
+    ]
+
+
+def test_clean_trims_trailing_incomplete_to_end_on_assistant():
+    messages = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "a", "tool_calls": [{"type": "function", "function": {"name": "T", "arguments": {}}}]},
+        {"role": "tool", "content": "res"},
+    ]
+    result = to_ms_swift_messages(messages, clean=True)
+    assert [m["role"] for m in result] == ["user", "assistant"]
+    assert result[-1] == {"role": "assistant", "content": "a"}
+
+
+def test_clean_preserves_parallel_tool_calls():
+    messages = [
+        {"role": "user", "content": "q"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"type": "function", "function": {"name": "A", "arguments": {}}},
+                {"type": "function", "function": {"name": "B", "arguments": {}}},
+            ],
+        },
+        {"role": "tool", "content": "ra"},
+        {"role": "tool", "content": "rb"},
+        {"role": "assistant", "content": "done"},
+    ]
+    result = to_ms_swift_messages(messages, clean=True)
+    assert [m["role"] for m in result] == ["user", "tool_call", "tool_call", "tool_response", "tool_response", "assistant"]
+    assert validate_ms_swift_messages(result) == []
+
+
+def test_convert_drops_untrainable_rows_after_cleaning():
+    rows = [
+        {"messages": [{"role": "user", "content": "only a user, nothing to train"}]},
+        {"messages": [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}]},
+    ]
+    converted = convert_to_ms_swift(rows, clean=True)
+    assert len(converted) == 1
+    assert converted[0]["messages"][-1] == {"role": "assistant", "content": "a"}
+
+
+def test_validate_ms_swift_messages_flags_problems_and_passes_clean():
+    assert validate_ms_swift_messages(
+        [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}]
+    ) == []
+    consecutive_user = validate_ms_swift_messages(
+        [{"role": "user", "content": "a"}, {"role": "user", "content": "b"}, {"role": "assistant", "content": "c"}]
+    )
+    assert any("consecutive user" in issue for issue in consecutive_user)
+    ends_on_user = validate_ms_swift_messages([{"role": "user", "content": "q"}])
+    assert any("end" in issue or "assistant" in issue for issue in ends_on_user)

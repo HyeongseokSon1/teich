@@ -188,6 +188,24 @@ reasoning at inference. Agent traces often carry their reasoning on the intermed
 turns rather than the final answer, so pass `--keep-intermediate-thinking` to retain `<think>` on
 every assistant turn when that reasoning is the signal you want to train on.
 
+### Trainability cleanup
+
+ms-swift requires user-side (`user`/`tool_response`) and assistant-side (`assistant`/`tool_call`)
+turns to alternate, with at most one leading `system` message, ending on an `assistant` turn. Real
+agent traces violate this (multiple runtime `system` messages, back-to-back user turns, tool results
+with no answer before the user speaks again, conversations ending mid tool call). Cleanup is on by
+default (`--no-clean` to disable) and normalizes each row:
+
+- all `system` messages are merged into one leading `system`;
+- consecutive `user` (and consecutive `assistant`) messages are merged;
+- orphan `tool_response` messages and unanswered tool rounds before a new `user` turn are dropped;
+- trailing incomplete turns are trimmed so the row ends on the assistant target;
+- rows left with no trainable assistant turn are dropped from the output.
+
+Valid parallel (`tool_call` x N then `tool_response` x N) and sequential (`tool_response` then
+`tool_call`) tool patterns are preserved. `teich.swift.validate_ms_swift_messages(messages)` returns
+the list of remaining trainability problems for a row (empty means OK).
+
 ## Incomplete Traces
 
 Rows ending on a tool result are incomplete without a follow-up assistant turn.
