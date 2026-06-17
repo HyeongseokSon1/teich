@@ -188,6 +188,61 @@ reasoning at inference. Agent traces often carry their reasoning on the intermed
 turns rather than the final answer, so pass `--keep-intermediate-thinking` to retain `<think>` on
 every assistant turn when that reasoning is the signal you want to train on.
 
+### Trainability cleanup
+
+ms-swift requires user-side (`user`/`tool_response`) and assistant-side (`assistant`/`tool_call`)
+turns to alternate, with at most one leading `system` message, ending on an `assistant` turn. Real
+agent traces violate this (multiple runtime `system` messages, back-to-back user turns, tool results
+with no answer before the user speaks again, conversations ending mid tool call). Cleanup is on by
+default (`--no-clean` to disable) and normalizes each row:
+
+- all `system` messages are merged into one leading `system`;
+- consecutive `user` (and consecutive `assistant`) messages are merged;
+- orphan `tool_response` messages and unanswered tool rounds before a new `user` turn are dropped;
+- trailing incomplete turns are trimmed so the row ends on the assistant target;
+- rows left with no trainable assistant turn are dropped from the output.
+
+Valid parallel (`tool_call` x N then `tool_response` x N) and sequential (`tool_response` then
+`tool_call`) tool patterns are preserved. `teich.swift.validate_ms_swift_messages(messages)` returns
+the list of remaining trainability problems for a row (empty means OK).
+
+### Progressive prefixes (on-policy distillation)
+
+For on-policy distillation that trains only the final turn of each example, pass `--progressive`
+(or `convert_to_ms_swift(..., progressive=True)`) to expand each conversation into accumulating
+prefixes, one per user round, each ending on that round's final `assistant` turn:
+
+```text
+input -> output -> input -> output -> input -> output
+=> 1) input -> output
+   2) input -> output -> input -> output
+   3) input -> output -> input -> output -> input -> output
+```
+
+The leading `system` message is carried into every prefix, and `--granularity` controls the cut
+points:
+
+- `--granularity round` (default): one example per user round, each ending on that round's final
+  answer. `tool_call`/`tool_response` cycles stay inside their round, so intermediate tool calls are
+  not separate targets.
+- `--granularity step`: one example per model action — each prefix ends on an assistant-side run (a
+  `tool_call` step or a final `assistant` answer), so intermediate tool calls become last-turn
+  targets too. Parallel tool calls in one step stay together. This yields prefixes like
+  `previous turns -> user -> tool_call -> tool_response -> tool_call` (ending on the next tool call
+  to train).
+
+Each prefix is itself a valid ms-swift conversation; with `step` granularity a prefix may end on a
+`tool_call` (the action to train). (In ms-swift, configure the loss so only the last turn is
+supervised.)
+
+### Content-length filter
+
+Pass `--max-content-length N` (or `convert_to_ms_swift(..., max_content_length=N)`) to drop any row
+whose total message-content character length exceeds `N`. It is applied after progressive expansion,
+so over-budget prefixes are dropped while shorter ones are kept. Length is character count of message
+`content` (use `teich.swift.ms_swift_content_length(messages)` to compute it); tool schemas are not
+counted.
+
 ## Incomplete Traces
 
 Rows ending on a tool result are incomplete without a follow-up assistant turn.

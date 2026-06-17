@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 import sys
 from threading import Event, RLock, Thread
-from typing import Any
+from typing import Any, Optional
 
 import typer
 from huggingface_hub import HfApi
@@ -580,12 +580,39 @@ def convert(
         "--keep-intermediate-thinking",
         help="For --format ms-swift: keep <think> blocks on every assistant turn instead of only the final turn.",
     ),
+    clean: bool = typer.Option(
+        True,
+        "--clean/--no-clean",
+        help="For --format ms-swift: normalize rows for ms-swift trainability (merge system/user, drop orphan tool results and unanswered tool rounds, end on assistant). Drops rows left untrainable.",
+    ),
+    progressive: bool = typer.Option(
+        False,
+        "--progressive",
+        help="For --format ms-swift: expand each conversation into accumulating prefixes for on-policy distillation / last-turn training.",
+    ),
+    granularity: str = typer.Option(
+        "round",
+        "--granularity",
+        help="For --progressive: 'round' (one example per user round, ending on the final answer) or 'step' (one example per model action, so intermediate tool_call steps become last-turn targets too).",
+    ),
+    max_content_length: Optional[int] = typer.Option(
+        None,
+        "--max-content-length",
+        help="For --format ms-swift: drop rows whose total message-content character length exceeds this (applied after --progressive expansion).",
+    ),
 ) -> None:
     """Convert raw or extracted traces into normalized Teich JSONL rows."""
     normalized_format = output_format.strip().lower()
     ms_swift_aliases = {"ms-swift", "ms_swift", "swift"}
     if normalized_format not in {"teich", *ms_swift_aliases}:
         console.print(f"[red]Unknown --format {output_format!r}. Use 'teich' or 'ms-swift'.[/red]")
+        raise typer.Exit(1)
+    if max_content_length is not None and max_content_length <= 0:
+        console.print("[red]--max-content-length must be a positive integer.[/red]")
+        raise typer.Exit(1)
+    granularity = granularity.strip().lower()
+    if granularity not in {"round", "step"}:
+        console.print(f"[red]--granularity must be 'round' or 'step'; got {granularity!r}.[/red]")
         raise typer.Exit(1)
     if not input_path.exists():
         console.print(f"[red]Input path not found: {input_path}[/red]")
@@ -601,7 +628,30 @@ def convert(
 
     is_ms_swift = normalized_format in ms_swift_aliases
     if is_ms_swift:
-        rows = convert_to_ms_swift(rows, keep_intermediate_thinking=keep_intermediate_thinking)
+        source_count = len(rows)
+        rows = convert_to_ms_swift(
+            rows,
+            keep_intermediate_thinking=keep_intermediate_thinking,
+            clean=clean,
+            progressive=progressive,
+            granularity=granularity,
+            max_content_length=max_content_length,
+        )
+        transforms = []
+        if clean:
+            transforms.append("cleaned")
+        if progressive:
+            transforms.append(f"progressive prefixes ({granularity})")
+        if max_content_length is not None:
+            transforms.append(f"max_content_length={max_content_length}")
+        console.print(
+            f"[cyan]ms-swift:[/cyan] {source_count} conversation{'s' if source_count != 1 else ''}"
+            f" -> {len(rows)} row{'s' if len(rows) != 1 else ''}"
+            f"{' (' + ', '.join(transforms) + ')' if transforms else ''}."
+        )
+        if not rows:
+            console.print("[red]No trainable ms-swift rows remain after conversion.[/red]")
+            raise typer.Exit(1)
 
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", encoding="utf-8") as handle:
@@ -610,7 +660,8 @@ def convert(
 
     console.print(f"[green]Converted {len(rows)} trace row{'s' if len(rows) != 1 else ''} to {output}[/green]")
     if is_ms_swift:
-        console.print("[cyan]Output format:[/cyan] ms-swift JSONL (messages with inline <think> + tool_call/tool_response roles, tools as JSON string) for Qwen3 SFT.")
+        cleanup = "cleaned" if clean else "not cleaned"
+        console.print(f"[cyan]Output format:[/cyan] ms-swift JSONL (inline <think> + tool_call/tool_response roles, tools as JSON string) for Qwen3 SFT; {cleanup}.")
     else:
         console.print("[cyan]Output format:[/cyan] Teich JSONL with prompt, messages, tools, and metadata.")
 
