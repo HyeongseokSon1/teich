@@ -588,7 +588,12 @@ def convert(
     progressive: bool = typer.Option(
         False,
         "--progressive",
-        help="For --format ms-swift: expand each conversation into accumulating prefixes (one per user round, each ending on its final assistant turn) for on-policy distillation / last-turn training.",
+        help="For --format ms-swift: expand each conversation into accumulating prefixes for on-policy distillation / last-turn training.",
+    ),
+    granularity: str = typer.Option(
+        "round",
+        "--granularity",
+        help="For --progressive: 'round' (one example per user round, ending on the final answer) or 'step' (one example per model action, so intermediate tool_call steps become last-turn targets too).",
     ),
     max_content_length: Optional[int] = typer.Option(
         None,
@@ -604,6 +609,10 @@ def convert(
         raise typer.Exit(1)
     if max_content_length is not None and max_content_length <= 0:
         console.print("[red]--max-content-length must be a positive integer.[/red]")
+        raise typer.Exit(1)
+    granularity = granularity.strip().lower()
+    if granularity not in {"round", "step"}:
+        console.print(f"[red]--granularity must be 'round' or 'step'; got {granularity!r}.[/red]")
         raise typer.Exit(1)
     if not input_path.exists():
         console.print(f"[red]Input path not found: {input_path}[/red]")
@@ -625,13 +634,14 @@ def convert(
             keep_intermediate_thinking=keep_intermediate_thinking,
             clean=clean,
             progressive=progressive,
+            granularity=granularity,
             max_content_length=max_content_length,
         )
         transforms = []
         if clean:
             transforms.append("cleaned")
         if progressive:
-            transforms.append("progressive prefixes")
+            transforms.append(f"progressive prefixes ({granularity})")
         if max_content_length is not None:
             transforms.append(f"max_content_length={max_content_length}")
         console.print(

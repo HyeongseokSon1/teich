@@ -173,10 +173,10 @@ def validate_ms_swift_messages(messages: list[dict[str, Any]]) -> list[str]:
     answerable = [role for role in roles if role != "system"]
     if not answerable:
         issues.append("no conversation turns")
-    elif answerable[-1] != "assistant":
-        issues.append(f"conversation ends on '{answerable[-1]}' (must end on assistant)")
-    if "assistant" not in roles:
-        issues.append("no assistant turn to train on")
+    elif answerable[-1] not in _OUTPUT_ROLES:
+        issues.append(f"conversation ends on '{answerable[-1]}' (must end on an assistant-side turn)")
+    if not any(role in _OUTPUT_ROLES for role in roles):
+        issues.append("no assistant-side turn to train on")
     return issues
 
 
@@ -268,7 +268,8 @@ def ms_swift_content_length(messages: list[dict[str, Any]]) -> int:
     return sum(len(message.get("content") or "") for message in messages)
 
 
-def _progressive_cut_indices(messages: list[dict[str, Any]]) -> list[int]:
+def _round_cut_indices(messages: list[dict[str, Any]]) -> list[int]:
+    # End of each user round: an assistant turn whose next turn is a user turn or end.
     cuts: list[int] = []
     total = len(messages)
     for index, message in enumerate(messages):
@@ -280,22 +281,55 @@ def _progressive_cut_indices(messages: list[dict[str, Any]]) -> list[int]:
     return cuts
 
 
-def progressive_prefixes(messages: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+def _step_cut_indices(messages: list[dict[str, Any]]) -> list[int]:
+    # End of each assistant-side run = each model action (a tool_call step or a final answer).
+    cuts: list[int] = []
+    total = len(messages)
+    for index, message in enumerate(messages):
+        if message.get("role") not in _OUTPUT_ROLES:
+            continue
+        next_role = messages[index + 1].get("role") if index + 1 < total else None
+        if next_role not in _OUTPUT_ROLES:
+            cuts.append(index)
+    return cuts
+
+
+_GRANULARITY_CUTS = {"round": _round_cut_indices, "step": _step_cut_indices}
+
+
+def progressive_prefixes(
+    messages: list[dict[str, Any]],
+    granularity: str = "round",
+) -> list[list[dict[str, Any]]]:
     """Split a (cleaned) ms-swift message list into accumulating prefixes.
 
-    Each prefix ends on a final-answer ``assistant`` turn -- the assistant turn
-    right before the next ``user`` turn, or the last turn of the conversation --
-    and includes the leading ``system`` message. The prefixes accumulate, so the
-    last one is the full conversation::
+    The prefixes accumulate and include the leading ``system`` message, so the
+    last one is always the full conversation. This is for on-policy distillation
+    where each example trains only its final turn. The cut points depend on
+    ``granularity``:
 
-        input -> output -> input -> output -> input -> output
-        => [in->out,  in->out->in->out,  in->out->in->out->in->out]
+    - ``"round"`` (default): one prefix per user round, each ending on that
+      round's final-answer ``assistant`` turn. ``tool_call``/``tool_response``
+      cycles stay inside their round::
 
-    This is for on-policy distillation where each example trains only its final
-    turn. Tool ``tool_call``/``tool_response`` cycles within a round stay inside
-    that round's prefix; cuts only happen at user-round boundaries.
+          user -> output -> user -> output -> user -> output
+          => [u->o,  u->o->u->o,  u->o->u->o->u->o]
+
+    - ``"step"``: one prefix per model action -- each ending on an assistant-side
+      run (a ``tool_call`` step or a final ``assistant`` answer), so intermediate
+      tool calls become last-turn targets too. Parallel tool calls in one step
+      stay together::
+
+          user, tool_call, tool_response, tool_call, tool_response, assistant
+          => [user..tool_call,
+              user..tool_call->tool_response->tool_call,
+              full]
     """
-    return [messages[: cut + 1] for cut in _progressive_cut_indices(messages)]
+    try:
+        cut_fn = _GRANULARITY_CUTS[granularity]
+    except KeyError:
+        raise ValueError(f"granularity must be one of {sorted(_GRANULARITY_CUTS)}; got {granularity!r}")
+    return [messages[: cut + 1] for cut in cut_fn(messages)]
 
 
 def convert_to_ms_swift(
@@ -305,6 +339,7 @@ def convert_to_ms_swift(
     clean: bool = True,
     drop_untrainable: bool = True,
     progressive: bool = False,
+    granularity: str = "round",
     max_content_length: int | None = None,
     include_tools: bool = True,
     tools_as_json_string: bool = True,
@@ -316,12 +351,17 @@ def convert_to_ms_swift(
     dropped from the output.
 
     With ``progressive=True`` each conversation is expanded into accumulating
-    prefixes (see ``progressive_prefixes``), one per user round, for on-policy
-    distillation that trains only the final turn of each example.
+    prefixes (see ``progressive_prefixes``) for on-policy distillation that trains
+    only the final turn of each example. ``granularity`` controls the cut points:
+    ``"round"`` (one example per user round, ending on the final answer) or
+    ``"step"`` (one example per model action, so intermediate ``tool_call`` steps
+    become last-turn targets too).
 
     With ``max_content_length`` set, any output row whose total message-content
     character length exceeds it is dropped (applied after progressive expansion).
     """
+    if progressive and granularity not in _GRANULARITY_CUTS:
+        raise ValueError(f"granularity must be one of {sorted(_GRANULARITY_CUTS)}; got {granularity!r}")
     converted: list[dict[str, Any]] = []
     for row in rows:
         swift_row = to_ms_swift_row(
@@ -335,7 +375,7 @@ def convert_to_ms_swift(
         if clean and drop_untrainable and not messages:
             continue
         tools = swift_row.get("tools")
-        variants = progressive_prefixes(messages) if progressive else [messages]
+        variants = progressive_prefixes(messages, granularity=granularity) if progressive else [messages]
         for variant in variants:
             if not variant:
                 continue

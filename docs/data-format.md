@@ -219,10 +219,21 @@ input -> output -> input -> output -> input -> output
    3) input -> output -> input -> output -> input -> output
 ```
 
-Cuts only happen at user-round boundaries, so `tool_call`/`tool_response` cycles stay inside their
-round's prefix, the leading `system` message is carried into every prefix, and each prefix is itself
-a valid ms-swift conversation ending on an `assistant` turn. (In ms-swift, configure the loss so only
-the last turn is supervised.)
+The leading `system` message is carried into every prefix, and `--granularity` controls the cut
+points:
+
+- `--granularity round` (default): one example per user round, each ending on that round's final
+  answer. `tool_call`/`tool_response` cycles stay inside their round, so intermediate tool calls are
+  not separate targets.
+- `--granularity step`: one example per model action — each prefix ends on an assistant-side run (a
+  `tool_call` step or a final `assistant` answer), so intermediate tool calls become last-turn
+  targets too. Parallel tool calls in one step stay together. This yields prefixes like
+  `previous turns -> user -> tool_call -> tool_response -> tool_call` (ending on the next tool call
+  to train).
+
+Each prefix is itself a valid ms-swift conversation; with `step` granularity a prefix may end on a
+`tool_call` (the action to train). (In ms-swift, configure the loss so only the last turn is
+supervised.)
 
 ### Content-length filter
 

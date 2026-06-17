@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from teich import (
     convert_to_ms_swift,
     ms_swift_content_length,
@@ -294,6 +296,64 @@ def test_convert_to_ms_swift_progressive_expands_rows():
     assert [m["content"] for m in converted[0]["messages"]] == ["u1", "a1"]
     assert [m["content"] for m in converted[1]["messages"]] == ["u1", "a1", "u2", "a2"]
     assert all("tools" in row for row in converted)  # tools copied into each prefix row
+
+
+def test_progressive_step_granularity_targets_each_tool_call():
+    messages = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "let me check"},
+        {"role": "tool_call", "content": '{"name": "A", "arguments": {}}'},
+        {"role": "tool_response", "content": "r1"},
+        {"role": "tool_call", "content": '{"name": "B", "arguments": {}}'},
+        {"role": "tool_response", "content": "r2"},
+        {"role": "assistant", "content": "answer"},
+    ]
+    step = progressive_prefixes(messages, "step")
+    assert len(step) == 3
+    # second prefix ends on a tool_call: previous - user - tool_call - tool_result - tool_call
+    assert [m["role"] for m in step[1]] == ["user", "assistant", "tool_call", "tool_response", "tool_call"]
+    assert step[1][-1]["role"] == "tool_call"
+    assert validate_ms_swift_messages(step[1]) == []  # ending on a tool_call is a valid last-turn target
+    assert step[-1] == messages
+
+    # round granularity keeps the whole tool sequence as one example (single user round)
+    rounds = progressive_prefixes(messages, "round")
+    assert len(rounds) == 1
+    assert rounds[0] == messages
+
+
+def test_progressive_step_keeps_parallel_calls_in_one_step():
+    messages = [
+        {"role": "user", "content": "q"},
+        {"role": "tool_call", "content": '{"name": "A", "arguments": {}}'},
+        {"role": "tool_call", "content": '{"name": "B", "arguments": {}}'},
+        {"role": "tool_response", "content": "ra"},
+        {"role": "tool_response", "content": "rb"},
+        {"role": "assistant", "content": "done"},
+    ]
+    step = progressive_prefixes(messages, "step")
+    assert [m["role"] for m in step[0]] == ["user", "tool_call", "tool_call"]  # parallel calls not split
+    assert len(step) == 2
+
+
+def test_convert_to_ms_swift_step_granularity_and_invalid_value():
+    rows = [
+        {
+            "messages": [
+                {"role": "user", "content": "q"},
+                {"role": "tool_call", "content": '{"name": "A", "arguments": {}}'},
+                {"role": "tool_response", "content": "r"},
+                {"role": "assistant", "content": "done"},
+            ]
+        }
+    ]
+    converted = convert_to_ms_swift(rows, progressive=True, granularity="step")
+    assert len(converted) == 2
+    assert converted[0]["messages"][-1]["role"] == "tool_call"
+    assert converted[1]["messages"][-1]["role"] == "assistant"
+
+    with pytest.raises(ValueError):
+        convert_to_ms_swift(rows, progressive=True, granularity="bogus")
 
 
 def test_convert_to_ms_swift_max_content_length_drops_long_rows():
